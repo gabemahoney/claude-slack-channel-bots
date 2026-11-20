@@ -39,11 +39,15 @@ import {
   ErrTemplateMalformed,
   ErrTemplateNameUnsafe,
   ErrUnknownErrorName,
+  ErrSubmissionUnconfirmed,
 } from 'agent-director'
 import type { UnreachableReason } from 'agent-director'
 import { ErrCantSend } from '../../src/agent-director-errors.ts'
 import type {
   ClientOptions,
+  Confirmation,
+  Confirmations,
+  ContextReading,
   DecideParams,
   DecideResult,
   FindMissingParams,
@@ -184,9 +188,10 @@ export function cannedFindMissing(
     const entries = Object.entries(arg.rows)
     const ids = entries.filter(([, where]) => where === 'ids').map(([id]) => id).sort()
     const unverifiedIds = entries.filter(([, where]) => where === 'unverified_ids').map(([id]) => id).sort()
-    return { count: ids.length, ids, unverified: unverifiedIds.length, unverified_ids: unverifiedIds }
+    return { checks: [], count: ids.length, ids, unverified: unverifiedIds.length, unverified_ids: unverifiedIds }
   }
   return {
+    checks: [],
     count: 0,
     ids: [],
     unverified: 0,
@@ -342,7 +347,26 @@ function omitUndefined<T extends object>(row: T, keys: readonly string[]): T {
  * given as `null` it is shown as `null`.
  */
 export function cannedStatusResult(overrides: Partial<StatusResult> = {}): StatusResult {
-  return omitUndefined(withDefaultLaunchStart({ state: 'waiting', ...overrides }, overrides), ['launch_started_at'])
+  return omitUndefined(withDefaultLaunchStart({
+    ...cannedRowEvidence(), context: cannedContextReading(), failure_reason: null,
+    state: 'waiting', ...overrides,
+  }, overrides), ['launch_started_at'])
+}
+
+/** Unavailable context carries no estimated usage, window or measurement time. */
+export function cannedContextReading(): ContextReading {
+  return { used_tokens: null, window_tokens: null, fraction: null, source: null, as_of: null }
+}
+
+/** Independent unknown readings: no fixture fabricates confirmation evidence. */
+export function cannedConfirmations(): Confirmations {
+  const unknown = (): Confirmation => ({ status: 'unknown', confirmed_at: null, source: null, checked_at: null, reason: 'no_evidence' })
+  return { state: unknown(), process_liveness: unknown(), displayed_state: unknown() }
+}
+
+/** Report-only defaults; callers override the row's actual lifecycle separately. */
+function cannedRowEvidence(): Pick<ListRow, 'idle_screen_availability' | 'family_state' | 'process_liveness' | 'confirmations'> {
+  return { idle_screen_availability: 'available', family_state: 'waiting', process_liveness: 'unknown', confirmations: cannedConfirmations() }
 }
 
 /**
@@ -425,6 +449,11 @@ export function errTemplateNameUnsafe(): ErrTemplateNameUnsafe {
 /** Build a plain AgentDirectorError (catch-all path). */
 export function errGeneric(verb: string, errName: string, message: string = 'oops'): AgentDirectorError {
   return new AgentDirectorError(verb, errName, message)
+}
+
+/** Native 0.18.8 error; generic details intentionally include invalid wire cases. */
+export function errSubmissionUnconfirmed(details: unknown): ErrSubmissionUnconfirmed {
+  return new ErrSubmissionUnconfirmed('send-keys', 'ErrSubmissionUnconfirmed', 'submission evidence unavailable', details as Readonly<Record<string, unknown>> | null)
 }
 
 /** Build an ErrSpawnNotFound (spawn/get/decide on missing row). */
@@ -1378,6 +1407,8 @@ export function cannedListRow(overrides: Partial<ListRow>, persona?: CannedRowPe
   if (persona) {
     if (home === undefined) throw new Error('cannedListRow: the persona form needs a home')
     return omitUndefined(withDefaultLaunchStart({
+      ...cannedRowEvidence(),
+      state_changed_at: '1970-01-01T00:00:00Z',
       parent_id: undefined,
       state: 'waiting',
       agent: 'claude',
@@ -1391,6 +1422,8 @@ export function cannedListRow(overrides: Partial<ListRow>, persona?: CannedRowPe
     }, overrides), PHASE1_ROW_FIELDS)
   }
   return omitUndefined(withDefaultLaunchStart({
+    ...cannedRowEvidence(),
+    state_changed_at: '1970-01-01T00:00:00Z',
     parent_id: undefined,
     state: 'waiting',
     agent: 'claude',
@@ -1502,6 +1535,8 @@ export function cannedGetResult(
   if (persona) {
     if (home === undefined) throw new Error('cannedGetResult: the persona form needs a home')
     return omitUndefined(withDefaultLaunchStart({
+      ...cannedRowEvidence(), context: cannedContextReading(), failure_reason: null,
+      state_changed_at: '1970-01-01T00:00:00Z',
       parent_id: '',
       state: 'waiting',
       agent: 'claude',
@@ -1519,6 +1554,8 @@ export function cannedGetResult(
     } as CannedGetResult, overrides), PHASE1_ROW_FIELDS)
   }
   return omitUndefined(withDefaultLaunchStart({
+    ...cannedRowEvidence(), context: cannedContextReading(), failure_reason: null,
+    state_changed_at: '1970-01-01T00:00:00Z',
     parent_id: '',
     state: 'waiting',
     agent: 'claude',

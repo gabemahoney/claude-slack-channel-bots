@@ -14,6 +14,9 @@ export type TypingOwner = 'delivery' | 'reconnect'
 export interface DeliveryRowObservation { state: string; session_id?: string; launch_started_at?: string | null }
 export interface ReconnectInput { session: string; launchStartedAt?: string | null }
 export interface DeliveryLifecycle {
+  inputHeld(key: string): boolean
+  holdInput(key: string): void
+  releaseInput(key: string): void
   active(key?: string): boolean
   pause(ms: number): Promise<void>
   activate(key: string): void
@@ -43,7 +46,7 @@ export function createDeliveryLifecycle(options: {
   onError?: (error: unknown) => void
 }): DeliveryLifecycle {
   const clock = options.clock ?? systemDeliveryClock
-  interface State { state?: string; session?: string; launchStartedAt?: string | null; waited: boolean; owner: TypingOwner | 'free'; lease?: object; running: boolean; disabled?: boolean; deferred?: { dueAt: number }; timer?: unknown; reconnecting?: Promise<void>; reconnectInput?: ReconnectInput }
+  interface State { inputHeld?: boolean; state?: string; session?: string; launchStartedAt?: string | null; waited: boolean; owner: TypingOwner | 'free'; lease?: object; running: boolean; disabled?: boolean; deferred?: { dueAt: number }; timer?: unknown; reconnecting?: Promise<void>; reconnectInput?: ReconnectInput }
   const states = new Map<string, State>()
   let stopped = false, reconnect: ((key: string) => Promise<void>) | undefined, recovery: ((key: string) => Promise<boolean>) | undefined
   let relaunchObserver: ((key: string, row: DeliveryRowObservation) => void) | undefined
@@ -55,10 +58,13 @@ export function createDeliveryLifecycle(options: {
     cancel(s)
     // A retained control draft owns its continuation even if MCP connects
     // before Enter. The engine cannot append delivery text to that draft.
-    if (stopped || s.disabled || !s.deferred || (s.running && !s.reconnectInput) || !reconnect) return
+    if (stopped || s.disabled || s.inputHeld || !s.deferred || (s.running && !s.reconnectInput) || !reconnect) return
     s.timer = clock.setTimeout(() => { s.timer = undefined; void api.retryReconnect(key).catch(error => options.onError?.(error)).finally(() => arm(key, s)) }, Math.max(1, s.deferred.dueAt - clock.now()))
   }
   const api: DeliveryLifecycle = {
+    inputHeld: key => state(key).inputHeld === true,
+    holdInput(key) { const s = state(key); s.inputHeld = true; cancel(s) },
+    releaseInput(key) { const s = state(key); s.inputHeld = false; arm(key, s) },
     active: key => !stopped && (key === undefined || !state(key).disabled),
     pause(ms) { return new Promise<void>(resolve => { if (stopped) { resolve(); return }; const timer = clock.setTimeout(() => { pauses.delete(timer); resolve() }, ms); pauses.set(timer, resolve) }) },
     activate(key) { state(key).disabled = false },
@@ -90,7 +96,7 @@ export function createDeliveryLifecycle(options: {
     owner: key => state(key).owner,
     acquire(key, owner) {
       const s = state(key)
-      if (stopped || s.disabled || s.owner !== 'free' || (owner === 'delivery' && s.reconnectInput)) return undefined
+      if (stopped || s.disabled || s.inputHeld || s.owner !== 'free' || (owner === 'delivery' && s.reconnectInput)) return undefined
       const lease = {}; s.owner = owner; s.lease = lease
       return () => { if (s.lease === lease) { s.owner = 'free'; s.lease = undefined } }
     },
@@ -109,7 +115,7 @@ export function createDeliveryLifecycle(options: {
     setReconnect(callback) { reconnect = callback; for (const [key, s] of states) arm(key, s) },
     async retryReconnect(key) {
       const s = state(key)
-      if (stopped || s.disabled || !s.deferred || s.deferred.dueAt > clock.now() || !reconnect) return
+      if (stopped || s.disabled || s.inputHeld || !s.deferred || s.deferred.dueAt > clock.now() || !reconnect) return
       if (s.reconnecting) return s.reconnecting
       s.deferred.dueAt = clock.now() + NOT_NOW_RETRY_MS[0]
       s.reconnecting = Promise.resolve().then(() => reconnect!(key)).finally(() => { s.reconnecting = undefined })

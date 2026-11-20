@@ -125,7 +125,7 @@ A leftover that cannot be ended this way means no Phase 1 install: take step 8's
 2. On an existing-persona host (0.11.0 or later), retain its current persona configuration and paths. On a pre-persona host (0.10.x), put the persona configuration in place as `config.json`, in the old state directory, `~/.claude/channels/slack`, which the new CLI keeps using until the new CSCB's first start.
 3. On an existing-persona host, retain its credentials files and paths. On a pre-persona host (0.10.x), write each persona's credentials file with the new CLI (see [`claude-slack-channel-bots credentials`](cli.md#claude-slack-channel-bots-credentials)), into the same directory: each `credentials_file` in the staged configuration names a path there.
 4. On an existing-persona host, retain the current crontable and `/interject` callers. On a pre-persona host (0.10.x), rewrite crontable targets and `/interject` callers to name personas, in the crontable in the same directory.
-5. Run the new install check (see [Checking your agent-director install](agent-director.md#checking-your-agent-director-install)). An older CLI is refused by the 0.12.0 client; do not start CSCB until step 8 installs the required CLI.
+5. Run the new install check (see [Checking your agent-director install](agent-director.md#checking-your-agent-director-install)). An older CLI is refused by the 0.12.0 client minimum, retained by the installed 0.18.8 client; do not start CSCB until step 8 installs the required CLI.
 
 On a pre-persona host (0.10.x), steps 4, 7 and 8 of [Upgrading to personas](#upgrading-to-personas) belong here. From this step the new CSCB is deployed but not started.
 

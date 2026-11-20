@@ -117,7 +117,7 @@ Replace the channel ID and paths with your own. [Configuration](docs/configurati
 
 Talk to a persona in its channels or, when its `dm.enabled` is `true`, by direct message. When its Claude instance needs a tool approved, an **Allow** / **Deny** prompt is posted to its destination, its `permission_prompts` (see [Permission Relay](docs/bots.md#permission-relay)).
 
-CSCB durably queues accepted messages and types them into the persona’s terminal. Delivery is ordered and at-least-once: the next item waits for transcript confirmation of the previous one, and an unconfirmed item may appear again. The bot answers with `reply`; see [How a persona receives messages](docs/bots.md#how-a-persona-receives-messages).
+CSCB durably queues accepted messages and types them into the persona’s terminal. Delivery is ordered and at-least-once: the next item waits for transcript confirmation of the previous one, and an unconfirmed item may appear again. For retained input, see [delivery recovery](docs/troubleshooting.md#troubleshooting). The bot answers with `reply`; see [How a persona receives messages](docs/bots.md#how-a-persona-receives-messages).
 
 ### Changing the configuration
 

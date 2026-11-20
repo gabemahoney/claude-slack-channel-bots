@@ -1,3 +1,6 @@
+import { submissionUnconfirmedFactsOf, type SubmissionUnconfirmedFacts } from './ad-error-class.ts'
+import type { AdInputHoldStore } from './ad-input-holds.ts'
+import { buildAdInputHoldNotice, buildAdInputOutcomeLine, buildAdInputHoldClearedLine } from './ad-input-notices.ts'
 /**
  * session-manager.ts — Library-backed startup orchestration for CSCB.
  *
@@ -2847,7 +2850,45 @@ function ownRowActGoes(key: string, at: OwnRowReadSite): boolean {
 /** Shared gate, installed by main before any launch. */
 let deliveryLifecycle: DeliveryLifecycle | undefined
 const standaloneReconnectInputs = new Map<string, ReconnectInput>()
-export function setDeliveryLifecycle(value: DeliveryLifecycle | undefined): void { deliveryLifecycle = value; standaloneReconnectInputs.clear() }
+export interface SubmissionInputServices {
+  readonly holds: AdInputHoldStore
+  /** Load newly configured personas before any input or connected shortcut. */
+  readonly prepare?: (key: string) => void
+  readonly released?: (key: string) => void
+  readonly notify: (key: string, text: string) => void
+  readonly log: (line: string) => void
+}
+let submissionInputServices: SubmissionInputServices | undefined
+const submissionHolds = new Map<string, SubmissionUnconfirmedFacts>()
+export function setSubmissionInputServices(value: SubmissionInputServices | undefined): void { submissionInputServices = value; submissionHolds.clear() }
+export function prepareSubmissionInput(key: string): void { submissionInputServices?.prepare?.(key) }
+const unknownInputFacts = (): SubmissionUnconfirmedFacts => ({ kind: 'unknown', step: 'text', keysSent: 'unknown', issue: 'missing-details', next: 'hold-and-read' })
+function observeSubmissionLaunch(key: string, row: Pick<GetResult, 'instance_id' | 'started_at' | 'session_id' | 'state' | 'launch_started_at'>): void {
+  const services = submissionInputServices
+  if (!services) return
+  const launchHoldObservation = services.holds.observeLaunch(key, { instanceId: row.instance_id, state: row.state, rowStartedAt: row.started_at, sessionId: row.session_id, launchStartedAt: row.launch_started_at })
+  if (launchHoldObservation.ok && launchHoldObservation.value === 'cleared') {
+    submissionHolds.delete(key); deliveryLifecycle?.releaseInput(key); deliveryLifecycle?.clearReconnectInput(key)
+    services.released?.(key)
+    services.log(buildAdInputHoldClearedLine(keyRef(key), 'new-launch'))
+  }
+}
+function heldInputAnswer(key: string): ReconnectResult | undefined {
+  const reading = submissionInputServices?.holds.get(key)
+  if (reading && reading.kind !== 'clear' && !(reading.kind === 'record' && reading.record.step === 'text-ready')) {
+    deliveryLifecycle?.holdInput(key)
+    return { outcome: 'input-unconfirmed', facts: submissionHolds.get(key) ?? unknownInputFacts() }
+  }
+  if (submissionHolds.has(key) || deliveryLifecycle?.inputHeld(key)) return { outcome: 'input-unconfirmed', facts: submissionHolds.get(key) ?? unknownInputFacts() }
+}
+function holdSubmissionInput(key: string, facts: SubmissionUnconfirmedFacts): ReconnectResult {
+  submissionHolds.set(key, facts); deliveryLifecycle?.holdInput(key)
+  const services = submissionInputServices
+  if (services) services.notify(key, buildAdInputHoldNotice(oldLifeAppliedPersona(key) ?? { key }, services.holds.path(key)))
+  return { outcome: 'input-unconfirmed', facts }
+}
+
+export function setDeliveryLifecycle(value: DeliveryLifecycle | undefined): void { deliveryLifecycle = value; standaloneReconnectInputs.clear(); if (!value) submissionHolds.clear() }
 
 /** Delivery reads retain row/pane classification without opening a recovery episode. */
 export async function handleDeliveryReadError(key: string, error: unknown, verb: 'get' | 'read-pane'): Promise<void> {
@@ -2861,6 +2902,7 @@ export async function handleDeliveryReadError(key: string, error: unknown, verb:
 
 /** Apply own-row rules and record upgrade provenance from a fresh delivery-client reading. */
 export function applyDeliveryOwnRowRead(key: string, row: GetResult): boolean {
+  observeSubmissionLaunch(key, row)
   busySendNoticeCoverage.set(key, isCoveredRow(row))
   const at = { site: 'delivery engine', what: 'get' }
   endKillFailureEpisodeOnRead(key, { state: row.state })
@@ -2932,6 +2974,7 @@ export async function readPersonaOwnRow(key: string, at: OwnRowReadSite): Promis
   }
   // a row that settles after the caller stopped is not acted on.
   if (!ownRowActGoes(key, at)) return { kind: OWN_ROW_READ_ROW, row, latched: false }
+  observeSubmissionLaunch(key, row)
   busySendNoticeCoverage.set(key, isCoveredRow(row))
   // a row read `ended` or `missing` ends the kill-failure episode.
   endKillFailureEpisodeOnRead(key, { state: row.state })
@@ -3164,7 +3207,17 @@ export type OwnRowStatusAnswer =
 
 export function applyOwnRowStatusStep(key: string, answer: OwnRowStatusAnswer, at: OwnRowReadSite): boolean {
   try {
-    if (!('thrown' in answer)) deliveryLifecycle?.observeRow(key, answer.result)
+    if (!('thrown' in answer)) {
+      // Status has no row/session identity, but its pending launch stamp is
+      // authoritative for this queried instance. Retain the stored binding.
+      const held = submissionInputServices?.holds.get(key)
+      if (held?.kind === 'record') observeSubmissionLaunch(key, {
+        instance_id: personaInstanceId(key), started_at: held.record.binding.rowStartedAt,
+        session_id: held.record.binding.sessionId, state: answer.result.state,
+        launch_started_at: answer.result.launch_started_at,
+      })
+      deliveryLifecycle?.observeRow(key, answer.result)
+    }
     // a row read `ended` or `missing`, or gone, ends
     // the persona's kill-failure episode, whoever made the call.
     endKillFailureEpisodeOnRead(key, 'thrown' in answer ? { thrown: answer.thrown } : { state: answer.result.state })
@@ -3528,7 +3581,11 @@ function remediationHint(error: AgentDirectorError): string {
  *     recovery's resume or spawn decides what holds the persona's name
  *     (agent-director classifies any leftover session, and a CONFLICT there
  * latches the persona);
- *   - `transient`: nothing was typed and nothing is concluded about the
+ *   - `input-unconfirmed`: automatic input is held; the attempted call may
+ *     have reached the agent (or its gateway explicitly refused submission).
+ *     It is never a successful reconnect, death evidence or a counted failure.
+ *     Only validated launch evidence or reviewed operator recovery releases it.
+ *   - `transient`: nothing was typed by the refused call and nothing is concluded about the
  *     session: the persona latched at the reconnect (CONFLICT, UNUSABLE
  *     NAME) or was latched already, or agent-director could not act on the
  *     keystrokes (UNAVAILABLE, timeouts included, ENVIRONMENT, CONFIG,
@@ -3537,7 +3594,7 @@ function remediationHint(error: AgentDirectorError): string {
  *     it to `latched` for a latched persona and otherwise to `retrying`
  * (uncounted), and the restart adapter to `transient`.
  */
-export type ReconnectOutcome = 'ok' | 'dead-session' | 'transient'
+export type ReconnectOutcome = 'ok' | 'dead-session' | 'transient' | 'input-unconfirmed'
 
 /**
  * `waitForWaitingAndReconnect`'s outcome: a reconnect outcome (`ok`
@@ -3679,6 +3736,7 @@ export type ReconnectDeadSessionCause =
  * `dead-session` always carries its cause.
  */
 export type ReconnectResult =
+  | { outcome: 'input-unconfirmed'; facts: SubmissionUnconfirmedFacts }
   | { outcome: 'ok' }
   | {
       outcome: 'dead-session'
@@ -3727,6 +3785,7 @@ export async function reconnectMcpWithCause(
   lastRead: LatchRowState,
   ref: string = keyRef(key),
 ): Promise<ReconnectResult> {
+  prepareSubmissionInput(key)
   const life = deliveryLifecycle
   const getInput = () => life ? life.reconnectInput(key) : standaloneReconnectInputs.get(key)
   const clearInput = () => { if (life) life.clearReconnectInput(key); else standaloneReconnectInputs.delete(key) }
@@ -3753,6 +3812,15 @@ export async function reconnectMcpWithCause(
   if (read.kind !== OWN_ROW_READ_ROW || read.latched) return defer()
   const row = read.row
   busySendNoticeCoverage.set(key, isCoveredRow(row))
+  const heldInput = heldInputAnswer(key)
+  if (heldInput) return heldInput
+  const stored = submissionInputServices?.holds.get(key)
+  if (stored?.kind === 'record' && stored.record.step === 'text-ready') {
+    const b = stored.record.binding
+    if (b.instanceId !== row.instance_id || b.rowStartedAt !== row.started_at || b.sessionId !== row.session_id) return holdSubmissionInput(key, unknownInputFacts())
+    const draft = { session: b.sessionId, launchStartedAt: row.launch_started_at }
+    if (life) life.rememberReconnectInput(key, draft); else standaloneReconnectInputs.set(key, draft)
+  }
   const priorInput = getInput()
   if (priorInput && (priorInput.session !== row.session_id || priorInput.launchStartedAt !== row.launch_started_at)) clearInput()
   if (noteTagPromptReading(key, row) && !AGENT_DIRECTOR_DEAD_STATES.has(row.state)) {
@@ -3803,6 +3871,15 @@ export async function reconnectMcpWithCause(
   const release = life?.acquire(key, 'reconnect')
   if (life && !release) return defer()
   let input = getInput(), textCall = false
+  const holds = submissionInputServices?.holds
+  let holdRevision = stored?.kind === 'record' ? stored.record.revision : undefined
+  const saveStep = (step: 'text-ready' | 'enter-intent' | 'uncertain', outcome?: SubmissionUnconfirmedFacts['kind']): boolean => {
+    if (!holds || holdRevision === undefined) return !holds
+    const inputHoldAdvance = holds.advance(key, holdRevision, step, outcome)
+    if (inputHoldAdvance.ok) holdRevision = inputHoldAdvance.value.revision
+    return inputHoldAdvance.ok
+  }
+  const clearRecord = (): boolean => !holds || (holdRevision !== undefined && holds.clear(key, holdRevision).ok)
   try {
     const textRow = await readPersonaOwnRow(key, { site: 'reconnect', what: 'before text' })
     if (textRow.kind !== OWN_ROW_READ_ROW || textRow.latched || textRow.row.labels?.tag_prompt !== '1' || textRow.row.relay_mode !== 'on' ||
@@ -3810,8 +3887,13 @@ export async function reconnectMcpWithCause(
         textRow.row.session_id !== row.session_id || textRow.row.launch_started_at !== row.launch_started_at ||
         textRow.row.state !== 'waiting' || personaLatchedNow(key) ||
         isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key) ||
-        (life && (!life.active(key) || life.owner(key) !== 'reconnect'))) return defer()
+        (life && (!life.active(key) || life.inputHeld(key) || life.owner(key) !== 'reconnect'))) return defer()
     if (!input) {
+      if (holds) {
+        const saved = holds.begin(key, { instanceId: row.instance_id, rowStartedAt: row.started_at, sessionId: row.session_id, launchStartedAt: row.launch_started_at ?? null })
+        if (!saved.ok) return holdSubmissionInput(key, unknownInputFacts())
+        holdRevision = saved.value.revision
+      }
       // Save intent before the call: an uncertain result may have left text
       // in AD's input. Every retry of this launch must finish with Enter.
       input = { session: row.session_id, launchStartedAt: row.launch_started_at }
@@ -3821,6 +3903,7 @@ export async function reconnectMcpWithCause(
       textCall = true
       await withOutageDetection(key, undefined, 'send-keys', client => client.sendKeys({ instance_id: personaInstanceId(key), text: `/mcp reconnect ${MCP_SERVER_NAME}`, no_enter: true }))
       textCall = false
+      if (!saveStep('text-ready')) return holdSubmissionInput(key, unknownInputFacts())
       if (life) await life.pause(ENTER_DELAY_MS)
       else await new Promise(resolve => setTimeout(resolve, ENTER_DELAY_MS))
     }
@@ -3834,12 +3917,26 @@ export async function reconnectMcpWithCause(
         enterRow.row.session_id !== row.session_id || enterRow.row.launch_started_at !== row.launch_started_at ||
         enterRow.row.state !== 'waiting' || personaLatchedNow(key) ||
         isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key) ||
-        (life && (!life.active(key) || life.owner(key) !== 'reconnect' || getInput() !== input))) return defer()
+        (life && (!life.active(key) || life.inputHeld(key) || life.owner(key) !== 'reconnect' || getInput() !== input))) return defer()
+    if (!saveStep('enter-intent')) return holdSubmissionInput(key, unknownInputFacts())
     await withOutageDetection(key, undefined, 'send-keys', client => client.sendKeys({ instance_id: personaInstanceId(key), key: 'Enter' }))
+    if (!clearRecord()) return holdSubmissionInput(key, unknownInputFacts())
     if (getInput() === input) clearInput()
     life?.clearDeferred(key)
     return { outcome: 'ok' }
   } catch (err) {
+    const facts = submissionUnconfirmedFactsOf(err, textCall ? 'text' : 'enter')
+    if (facts) {
+      if (facts.kind !== 'not_started') { saveStep('uncertain', facts.kind); holdSubmissionInput(key, facts) }
+      const fresh = await readPersonaOwnRow(key, { site: 'reconnect', what: 'submission outcome' })
+      const submissionOutcomeLine = redactSlackLogText(buildAdInputOutcomeLine({ personaRef: ref, site: 'reconnect', facts, state: fresh.kind === OWN_ROW_READ_ROW ? fresh.row.state : undefined }))
+      if (submissionInputServices) submissionInputServices.log(submissionOutcomeLine); else console.error(submissionOutcomeLine)
+      if (facts.kind !== 'not_started') return { outcome: 'input-unconfirmed', facts }
+      if (textCall) { if (!clearRecord()) return holdSubmissionInput(key, unknownInputFacts()); if (getInput() === input) clearInput() }
+      else if (!saveStep('text-ready')) return holdSubmissionInput(key, unknownInputFacts())
+      return defer()
+    }
+    if (textCall && deliveryTextWasRefused(err) && !clearRecord()) return holdSubmissionInput(key, unknownInputFacts())
     if (textCall && deliveryTextWasRefused(err) && getInput() === input) clearInput()
     const deliveryKeyFailureOutcome = await reconnectAnswerTo(key, lastRead, ref, err)
     if (deliveryKeyFailureOutcome.outcome === 'dead-session') { if (getInput() === input) clearInput(); life?.clearDeferred(key) }
@@ -3854,6 +3951,7 @@ export async function reconnectMcpWithCause(
  * for the table). Logs its one line. Never throws.
  */
 async function reconnectAnswerTo(key: string, lastRead: LatchRowState, ref: string, err: unknown): Promise<ReconnectResult> {
+  if (submissionUnconfirmedFactsOf(err, 'text')) return { outcome: 'input-unconfirmed', facts: submissionUnconfirmedFactsOf(err, 'text')! }
   if (isInvalidFlagsError(err)) return reconnectInvalidFlagsAnswer(key, ref, err)
   const { errorClass } = classifyAdError(err)
   // The reported name, as the launch sites' refusal lines give it.
@@ -11566,6 +11664,7 @@ async function ladderGetThenAct(run: LadderRun): Promise<SpawnPersonaResult> {
     // nothing and counts nothing.
     const result = await reconnectMcpWithCause(key, lastRead, ref)
     if (result.outcome === 'dead-session') return deadSessionRoute(run, row, state, result.deadCause, result.finishedState, lastRead)
+    if (result.outcome === 'input-unconfirmed') return { key, action: SPAWN_ACTION_RETRYING }
     if (result.outcome === 'transient') return transientReconnectResult(key, ref, state, result)
     return { key, action: 'reconnected' }
   }
@@ -11607,6 +11706,7 @@ async function ladderGetThenAct(run: LadderRun): Promise<SpawnPersonaResult> {
     // a 'transient' wait (its reconnect's, or a refused
     // findMissing sweep's) types nothing and counts nothing. A `status`
     // error in the wait never gets here.
+    if (outcome === 'input-unconfirmed') return { key, action: SPAWN_ACTION_RETRYING }
     if (outcome === 'transient') return transientReconnectResult(key, ref, state, waited.latched ? { latched: true } : {})
     return { key, action: 'reconnected' }
   }

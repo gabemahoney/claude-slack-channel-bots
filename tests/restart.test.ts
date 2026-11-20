@@ -2185,7 +2185,7 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
 
     // A's row is gone (a restart would kill and relaunch it); B's is live and
     // idle (a restart reconnects it).
-    rowStatus = (p) => (p.instance_id === personaInstanceId(a.key) ? errSpawnNotFound() : { state: 'waiting' })
+    rowStatus = (p) => (p.instance_id === personaInstanceId(a.key) ? errSpawnNotFound() : cannedStatusResult({ state: 'waiting' }))
     const stub = makeStubClient({
       statusFn: (p) => rowStatus(p),
       statusCalls,
@@ -2363,7 +2363,7 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
     const idsFor = <T extends { instance_id?: unknown }>(list: T[], p: Persona): T[] =>
       list.filter((c) => c.instance_id === instanceOf(p))
     // Each row reads ended (a clean exit) until its persona is spawned again.
-    rowStatus = (p) => (spawnCalls.some((s) => s.instance_id === p.instance_id) ? { state: 'waiting' } : { state: 'ended' })
+    rowStatus = (p) => (spawnCalls.some((s) => s.instance_id === p.instance_id) ? cannedStatusResult({ state: 'waiting' }) : cannedStatusResult({ state: 'ended' }))
     mkdirSync(b.working_directory, { recursive: true })
     _setSpawnHomeDir(dir)
 
@@ -2592,7 +2592,7 @@ describe('escalate-dead internal recovery via real adapter', () => {
     // ErrTmuxSendKeys on send-keys → 'dead-session' (`tmux-gone`) at once →
     // adapter maps to 'escalate-dead' and fires the internal sweep.
     const stub = makeStubClient({
-      statusFn: () => ({ state: 'waiting' }),
+      statusFn: () => (cannedStatusResult({ state: 'waiting' })),
       statusCalls,
       sendKeysError: errTmuxSendKeys(),
       sendKeysCalls,
@@ -2779,7 +2779,7 @@ describe('a row the escalate-dead sweep leaves in unverified_ids for several tic
     const log = makeStubCallLog()
     const stub = makeStubClient({
       ...log,
-      statusFn: () => ({ state: 'working' }),
+      statusFn: () => (cannedStatusResult({ state: 'working' })),
       sendKeysError: errTmuxSendKeys(),
       findMissingResult: cannedFindMissing({ rows: { [instanceId]: 'unverified_ids' } }),
       getFn: () => cannedGetResult({ instance_id: instanceId, state: log.findMissingCalls.length > sweepsBeforeRun ? 'working' : 'waiting', liveness_note: log.findMissingCalls.length > sweepsBeforeRun ? noteOfRun(run) : nonLatchingNotes[0] }),
@@ -2968,7 +2968,7 @@ describe('a working persona whose tmux session is gone is relaunched in the same
     const persona = config.personas[0]!
     const instanceId = personaInstanceId(persona.key)
     const log = makeStubCallLog()
-    const stub = makeStubClient({ ...log, statusFn: () => row(log.findMissingCalls.length > 0), readPaneError, ...(refusedSend ? { sendKeysError: errTmuxSendKeys() } : {}) })
+    const stub = makeStubClient({ ...log, statusFn: () => { const answer = row(log.findMissingCalls.length > 0); return answer instanceof Error ? answer : cannedStatusResult(answer) }, readPaneError, ...(refusedSend ? { sendKeysError: errTmuxSendKeys() } : {}) })
     _resetOutageState()
     initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
     setClientForTests(stub as unknown as Client)
@@ -4053,7 +4053,7 @@ describe('restart: one in-flight launch per persona', () => {
     origConsoleError = console.error
     console.error = (...args: unknown[]) => { errLines.push(args.map(String).join(' ')) }
 
-    const stub = makeStubClient({ statusFn: () => ({ state: 'waiting' }), killCalls })
+    const stub = makeStubClient({ statusFn: () => (cannedStatusResult({ state: 'waiting' })), killCalls })
     hold = holdSpawns(stub, (id) => holdIds.has(id))
     _resetOutageState()
     initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
@@ -4269,7 +4269,7 @@ describe('restart: the real launch adapter uses the applied configuration', () =
     const [a] = config.personas as [Persona]
     mkdirSync(a.working_directory, { recursive: true })
     const stub = observeLaunchCalls(makeStubClient({
-      statusFn: () => ({ state: 'waiting' }),
+      statusFn: () => (cannedStatusResult({ state: 'waiting' })),
       spawnCalls,
       resumeCalls,
       sendKeysCalls,
@@ -4350,7 +4350,7 @@ describe('restart: the real launch adapter uses the applied configuration', () =
     const oldRow = cannedGetResult({ state: 'ended' }, a, dir)
     const deleteCalls: StubDeleteParams[] = []
     const stub = makeStubClient({
-      statusFn: () => ({ state: 'waiting' }),
+      statusFn: () => (cannedStatusResult({ state: 'waiting' })),
       spawnCalls,
       resumeCalls,
       deleteCalls,
@@ -4489,9 +4489,9 @@ describe('a restart with an unresolvable claude_config_dir', () => {
       getResult: cannedGetResult({ state: 'ended' }, a, dir),
       statusFn: (p) => {
         const persona = p.instance_id === personaInstanceId(a.key) ? a : b
-        if (persona === a && calls.resumeCalls.length > 0) return { state: 'waiting' }
-        if (persona === a) return { state: 'ended' }
-        return launched(b) ? { state: 'waiting' } : errSpawnNotFound()
+        if (persona === a && calls.resumeCalls.length > 0) return cannedStatusResult({ state: 'waiting' })
+        if (persona === a) return cannedStatusResult({ state: 'ended' })
+        return launched(b) ? cannedStatusResult({ state: 'waiting' }) : errSpawnNotFound()
       },
     })
     const realSpawn = stub.spawn.bind(stub)
@@ -4849,7 +4849,7 @@ describe('the restart run arms the UNAVAILABLE retry timer, and a refused relaun
 
   /** Install a stub AD client built from `opts` (status answers `waiting` unless overridden), with the controller as the trigger sink. */
   function installStub(opts: Parameters<typeof makeStubClient>[0]): void {
-    const stub = makeStubClient({ statusFn: () => ({ state: 'waiting' }), ...opts })
+    const stub = makeStubClient({ statusFn: () => (cannedStatusResult({ state: 'waiting' })), ...opts })
     _resetOutageState()
     initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client, triggerSink: retry })
     setClientForTests(stub as unknown as Client)
@@ -5697,7 +5697,7 @@ describe('runRestartRetry reruns the restart decision without the delay gate or 
       config = makeMultiPersonaConfig([{ name: 'alpha_bot' }], dir)
       ;[a] = config.personas as [Persona]
       log = makeStubCallLog()
-      const stub = makeStubClient({ ...log, statusFn: () => ({ state: 'waiting' }) })
+      const stub = makeStubClient({ ...log, statusFn: () => (cannedStatusResult({ state: 'waiting' })) })
       hold = holdSpawns(stub)
       _resetOutageState()
       initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
@@ -8480,7 +8480,7 @@ describe('the latch re-check\'s own run of the restart path\'s decision (runRest
       const stub = makeStubClient({
         statusFn: () => {
           onStatus()
-          return { state: 'waiting' }
+          return cannedStatusResult({ state: 'waiting' })
         },
         statusCalls,
         readPaneCalls,

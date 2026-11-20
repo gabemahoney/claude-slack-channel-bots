@@ -1707,7 +1707,7 @@ function tagScriptText(requires: string | null): string {
 }
 
 /** What the kit loads at run time, copied into the scratch repository; prepare.sh is the fake's. */
-const KIT_COPY = ['scripts/ad-gate/ad-gate.ts', 'scripts/ad-gate/template', 'scripts/ci-run.ts', 'scripts/codex-login.ts', 'scripts/non-reclaimable-memory.ts', 'scripts/safe-docker-inspect.ts', 'src/codex-config-keys.ts']
+const KIT_COPY = ['scripts/ad-gate/ad-gate.ts', 'scripts/ad-gate/template', 'scripts/ci-run.ts', 'scripts/lib/ad-latest.ts', 'scripts/codex-login.ts', 'scripts/non-reclaimable-memory.ts', 'scripts/safe-docker-inspect.ts', 'src/codex-config-keys.ts']
 
 /**
  * One command-line run's limit. A run with a reference launches about 25

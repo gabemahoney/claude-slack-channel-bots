@@ -6,7 +6,7 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
 
 ## Images
 
-- **`cscb-ci-base:v10`** (built from `docker/Dockerfile.test.base`) — slow base
+- **`cscb-ci-base:v11`** (built from `docker/Dockerfile.test.base`) — slow base
   layers (apt deps incl. tmux, bun, nodejs, cozempic, agent-director and native
   Claude/Codex versions). Built lazily once per host. No checkout source
   inside; published CSCB tarballs are fixtures. From the repo build context
@@ -14,7 +14,7 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
   `docker/install-real-codex.sh`, and no `package.json`. What it holds is in
   [What the base holds](#what-the-base-holds).
 - **The run's test image** (built from `docker/Dockerfile.test`,
-  `FROM cscb-ci-base:v10`) — adds `docker/entrypoint.sh`, `tests/`,
+  `FROM cscb-ci-base:v11`) — adds `docker/entrypoint.sh`, `tests/`,
   `testplans/`, the `testuser` account, and the `ENTRYPOINT`. It also copies
   the current tree's `docker/ad-client-check.sh` with mode `0755` over
   `/opt/agent-director/check/ad-client-check.sh`, refreshing the checker even
@@ -23,7 +23,7 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
   tags it only `cscb-ci-run:<RUN_ID>-<PID>-test`, and removes it at the run's
   end (see [The run's images and tags](#the-runs-images-and-tags)). The build
   should complete in under 10 s on a warm base.
-- **`cscb-ci-live:v2`** (built from `docker/Dockerfile.live`, `FROM cscb-ci-base:v10`)
+- **`cscb-ci-live:v2`** (built from `docker/Dockerfile.live`, `FROM cscb-ci-base:v11`)
   — the `/ci-live` image (see [/ci-live](#ci-live-the-live-slack-acceptance-run)
   below). It adds Claude Code at a pinned version with auto-update off, the
   agent-director binary the runner stages, checked against the base's
@@ -34,8 +34,13 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
   The package under test is not in the image; the runner mounts its tarball.
   Built on every `/ci-live` run.
 
+- **The candidate test image** (`docker/Dockerfile.test.candidate`,
+  `FROM cscb-ci-base:v11`) — the explicit `/ci --ad-candidate-dist` overlay.
+  Its base passes the same strict latest/provenance gate before the candidate
+  is installed; its verdict remains selective and cannot satisfy a release gate.
+
 - **The heavy run's image** (`docker/Dockerfile.real-agent`,
-  `FROM cscb-ci-base:v10`) — a self-contained packed `package.tgz`, tests and
+  `FROM cscb-ci-base:v11`) — a self-contained packed `package.tgz`, tests and
   `docker/real-agent-job.sh` and `docker/real-agent-codex-job.sh`, tagged `cscb-real-agent:<run-id>` and removed
   by `scripts/real-agent-matrix.ts`. Jobs select native Claude through
   agent-director, install runtime latest inside the container when needed,
@@ -59,11 +64,11 @@ build is a one-time per-host cost per version tag. `/ci` builds no
 not build the base: it stops (exit 2) and asks for one `/ci` run when the base
 is missing.
 
-The images run agent-director `0.17.1` (commit `c794af38`), pinned in
+The images run agent-director `0.18.8` (commit `f2c9ce525e3c37e41e4884818354ffe8e793c8fb`), pinned in
 `docker/Dockerfile.test.base` by `AD_VERSION` and `AD_COMMIT`. The npm client
-is independently pinned by `AD_CLIENT_VERSION` to `0.12.0`, matching CSCB's
-unchanged shipped client and minimum CLI version; updating the CI runtime
-does not raise that minimum. A separate off-PATH `0.17.0` fixture exercises
+is independently pinned by `AD_CLIENT_VERSION` to `0.18.8`, matching CSCB's
+exact package and lockfile dependency. The host compatibility floor remains
+`0.12.0`; the client version is independent of that floor. A separate off-PATH `0.17.0` fixture exercises
 legacy displayed states, alongside the retained `0.10.0` migration fixtures.
 
 The runtime binaries come from agent-director's GitHub release. The build
@@ -95,13 +100,13 @@ Every path is readable by every user, `testuser` included, except the global cli
 
 | Path | What it is |
 |---|---|
-| `/opt/agent-director/bin/agent-director` | The current release's binary (agent-director `0.17.1`, commit `AD_COMMIT`), the image's default agent-director. Its directory holds nothing else and is first on the default `PATH` (`/opt/agent-director/bin:/usr/local/sbin:/usr/local/bin:…`). An fmk script (test-0, and every script whose name carries `-fmk-`) drops this directory from its `PATH` and installs its selected runtime into its own HOME; bun stays available. `/usr/local/bin` holds no agent-director. In the live image the runner's staged binary takes this path (see [The live image's agent-director](#the-live-images-agent-director)), and `docker/live/`'s scripts put this directory first on their `PATH` |
+| `/opt/agent-director/bin/agent-director` | The current release's binary (agent-director `0.18.8`, commit `AD_COMMIT`), the image's default agent-director. Its directory holds nothing else and is first on the default `PATH` (`/opt/agent-director/bin:/usr/local/sbin:/usr/local/bin:…`). An fmk script (test-0, and every script whose name carries `-fmk-`) drops this directory from its `PATH` and installs its selected runtime into its own HOME; bun stays available. `/usr/local/bin` holds no agent-director. In the live image the runner's staged binary takes this path (see [The live image's agent-director](#the-live-images-agent-director)), and `docker/live/`'s scripts put this directory first on their `PATH` |
 | `/opt/agent-director/admin/agent-director-admin` | The release's operator tool (`delete`, `kill-finished`), from the same install. It and its directory are mode 0755, so a scenario harness running as `testuser` can run it by this path; `install.sh --binary` takes it as `--admin-binary`, as the fmk harness's install does (`install_ad_release` in `tests/integration/lib/scenario.sh`). Never on `PATH`: the build fails if `command -v agent-director-admin` finds one |
-| `/opt/agent-director/install/install.sh` | The runtime release's install script (mode 0755), from agent-director's source tree at `v0.17.1`, checked against `AD_INSTALL_SH_SHA256`. Off `PATH`; its directory holds nothing else |
-| `/opt/agent-director/client/agent-director-0.12.0.tgz` | The independently pinned TypeScript client tarball (`AD_CLIENT_VERSION`), from npm, checked against `AD_CLIENT_TGZ_SHA256` |
+| `/opt/agent-director/install/install.sh` | The runtime release's install script (mode 0755), from agent-director's source tree at `v0.18.8`, checked against `AD_INSTALL_SH_SHA256`. Off `PATH`; its directory holds nothing else |
+| `/opt/agent-director/client/agent-director-0.18.8.tgz` | The independently pinned TypeScript client tarball (`AD_CLIENT_VERSION`), from npm, checked against `AD_CLIENT_TGZ_SHA256` |
 | `/opt/agent-director/client/release.json` | Runtime provenance: `version`, `commit`, `binary_sha256`, `admin_sha256`, `installer_sha256`; independent client provenance: `client_version`, `client_tarball` (the path above), `client_tarball_sha256` |
 | `/opt/agent-director/check/ad-client-check.sh` | The client-under-test check (`docker/ad-client-check.sh`, mode 0755; `ci-live/lib/ad-client-check.ts` exports the path as `AD_CLIENT_CHECK`). Off `PATH`, outside the binary's directory. See [The client under test](#the-client-under-test) |
-| `/root/.bun/install/global/node_modules/agent-director` | The global agent-director client: installed with `bun add -g --ignore-scripts agent-director@0.12.0` from npm at `AD_CLIENT_VERSION` (it has no dependencies), then checked against the current runtime with `ad-client-check.sh --client`. Root-only (`/root` is 0700): this base build and `docker/Dockerfile.live` read it, both as root; `testuser` cannot |
+| `/root/.bun/install/global/node_modules/agent-director` | The global agent-director client: installed with `bun add -g --ignore-scripts agent-director@0.18.8` from npm at `AD_CLIENT_VERSION` (it has no dependencies), then checked against the current runtime with `ad-client-check.sh --client`. Root-only (`/root` is 0700): this base build and `docker/Dockerfile.live` read it, both as root; `testuser` cannot |
 | `/opt/agent-director-0.17.0/` | Separate legacy displayed-state fixture: `bin/agent-director`, `admin/agent-director-admin`, `install/install.sh` and `release.json`. All off `PATH`. Its record holds `version`, `commit`, `binary_sha256`, `admin_sha256` and `installer_sha256`; no separate npm client. Test 43 installs it only into a fresh scenario HOME/store/socket |
 | `/opt/agent-director-0.10.0/bin/agent-director` | agent-director 0.10.0's binary, off `PATH` |
 | `/opt/agent-director-0.10.0/agent-director-0.10.0.tgz` | The published agent-director 0.10.0 client, from npm |
@@ -149,19 +154,23 @@ release record in [What the base holds](#what-the-base-holds)):
 2. **version**: the client's package version is `release.json`'s
    `client_version`; both it and the runtime `version` must be plain
    `major.minor.patch` releases (no pre-release). With `--package`, the
-   package's `agent-director` dependency is exactly that version, and so is
-   its `PHASE1_FLOOR_VERSION` (`src/ad-version-gate.ts`);
+   package's `agent-director` dependency is exactly that version. Its
+   `PHASE1_FLOOR_VERSION` (`src/ad-version-gate.ts`) remains a separate runtime
+   minimum, currently `0.12.0`;
 3. **content**: the client's files equal a fresh unpack of that tarball,
    except entries with the exact basename `.bun-tag` (Bun install metadata),
    excluded recursively. Changed, missing or extra substantive files,
    including other hidden files, still fail; symlinks are not dereferenced;
 4. **exports**: the client exports `ErrTmuxKillFailed`, `ErrTmuxUnresponsive`
-   and `ErrTmuxSessionConflict`, each an `AgentDirectorError` subclass;
+   and `ErrTmuxSessionConflict`, plus `ErrExperimentalAgentDisabled`,
+   `ErrAgentCapabilityUnsupported`, `ErrModelMissing`, `ErrHostCredentialMissing`,
+   `ErrSubmissionUnconfirmed` and `ErrTooManyIds`, each an `AgentDirectorError` subclass;
 5. **binary**: the first agent-director on `PATH` matches `release.json`'s
    runtime `version`, `commit` and `binary_sha256`, independently of the
    client's version;
 6. **floor**: that version is at or above the client's
-   `dist/version-floor.json` minimum;
+   `dist/version-floor.json` minimum and, with `--package`, CSCB's
+   independent `PHASE1_FLOOR_VERSION`;
 7. **client-create**: `Client.create()`, imported from the client's entry
    point, reports a `binaryVersion` equal to that version.
 
@@ -213,9 +222,10 @@ it stop with an `ERROR:` line naming the missing context.
 - **The legacy displayed-state fixture.** The build fetches both `0.17.0`
   binaries from its GitHub release, checks `AD_LEGACY_SHA256` and
   `AD_LEGACY_ADMIN_SHA256`, and verifies both report `AD_LEGACY_VERSION` and
-  `AD_LEGACY_COMMIT`. Its installer is byte-identical to `0.17.1`'s: the
-  build checks `AD_LEGACY_INSTALL_SH_SHA256` before copying the staged
-  installer to the fixture's own directory and writing its own release record.
+  `AD_LEGACY_COMMIT`. It downloads `install.sh` from that fixture's own
+  `v0.17.0` source tag into `/opt/agent-director-0.17.0/install/install.sh`
+  and checks that file against `AD_LEGACY_INSTALL_SH_SHA256`. It never copies
+  the current runtime's installer; its release record and hashes are independent.
 
 `CSCB_AD_SRC_DIR` is not read when the base already exists. `/ci` stops as
 not runnable when it must build the base and `docker/Dockerfile.test.base`
@@ -249,7 +259,7 @@ git -C "$CSCB_AD_SRC_DIR" show "v$AD_VERSION:skills/install-agent-director/insta
 GH_TOKEN="$(gh auth token)" docker build --network=host \
   --secret id=gh_token,env=GH_TOKEN --progress=quiet \
   --build-context agent-director-install="$AD_INSTALL_CTX" \
-  -f docker/Dockerfile.test.base -t cscb-ci-base:v10 .
+  -f docker/Dockerfile.test.base -t cscb-ci-base:v11 .
 rm -rf "$AD_INSTALL_CTX"
 ```
 
@@ -269,7 +279,7 @@ rm -rf "$AD_INSTALL_CTX"
   that message, and every other check's `ERROR:` line: rerun with
   `--progress=plain` to see which step failed and why.
 - **Check an image by counts only**, never by printing its history:
-  `docker history --no-trunc cscb-ci-base:v10 | grep -c GH_TOKEN=` prints `0`.
+  `docker history --no-trunc cscb-ci-base:v11 | grep -c GH_TOKEN=` prints `0`.
 - **Earlier tags are retired.** Nothing names `v4` or an earlier tag. Tags
   before `v4` took the token as a build-arg, so their image history held its
   value, as did every image built on them; they are removed from the hosts
@@ -317,9 +327,48 @@ against Anthropic's direct endpoint.
 `/ci-live` never reads the host's `ANTHROPIC_*`: its container gets them from
 `CI_ANTHROPIC_*` (see [Secrets](#secrets) below).
 
+## Strict latest agent-director check
+
+Every `/ci` admission validates the tree's literal runtime and client pins,
+even with a cached base, for full, selective and candidate runs. It compares
+`AD_VERSION` with GitHub Latest and `AD_CLIENT_VERSION` with npm `latest`,
+peels the release tag to `AD_COMMIT`, compares the binary/admin asset digests,
+hashes the installer at that commit, and verifies the npm tarball's registry
+and lockfile integrity and pinned SHA-256. The seven Docker ARGs, exact
+`package.json` dependency and `bun.lock` must agree. These unauthenticated
+public lookups have bounded requests; no cross-run cache, warning, offline
+path or override can turn failure into PASS.
+
+A present base must also match every identity field in
+`/opt/agent-director/client/release.json`. The runner reads it in an isolated,
+network-disabled container by the safely inspected immutable image ID. A base
+that appears during admission or has just been built is checked before the
+test image builds. A mismatched existing base FAILs; it is not silently rebuilt.
+
+`/publish prepare` runs the same fresh lookup and present-base check after
+preflight and before any version change, pack, commit, tag or manifest.
+`SR-2.8 (latest agent-director)`, exit **16**, is fatal even after a passing
+`/ci`. It does not change the host compatibility floor or install AD on the host.
+
+| Failure code | Meaning | Operator recovery |
+|---|---|---|
+| `PINS_UNREADABLE`, `PINS_INVALID` | Missing, unreadable or malformed pin sources. | Restore the Dockerfile, package and lockfile; use exact released versions and complete digests. |
+| `PACKAGE_PIN_MISMATCH`, `LOCK_PIN_MISMATCH` | Docker, package or lockfile client identity disagrees. | Update and commit the exact client dependency, lock entry/integrity and Docker client pins together. |
+| `RUNTIME_NOT_LATEST`, `CLIENT_NOT_LATEST` | The pinned release differs from GitHub Latest or npm `latest`, including a pin ahead of latest. | Update and verify the runtime/client pins together, bump the base tag, commit and rebuild. |
+| `COMMIT_MISMATCH` | The peeled release tag differs from `AD_COMMIT`. | Verify the release tag's commit and update the complete pin set before rebuilding. |
+| `RELEASE_DIGEST_MISMATCH`, `INSTALLER_DIGEST_MISMATCH` | Release asset metadata or installer bytes disagree with a runtime pin. | Verify provenance and update the affected pins together; rebuild the base. |
+| `CLIENT_INTEGRITY_MISMATCH`, `CLIENT_DIGEST_MISMATCH` | npm tarball bytes disagree with registry/lock integrity or the client SHA-256 pin. | Verify the published client and update the exact package, lock and Docker pins; rebuild. |
+| `HTTP_FAILED`, `HTTP_STATUS`, `HTTP_TIMEOUT`, `HTTP_BODY_TOO_LARGE`, `METADATA_INVALID` | A required public lookup failed or its answer could not be validated. | Restore GitHub/npm access or wait for service/rate-limit recovery, then retry. Do not bypass validation or accept unverified bytes. |
+| `BASE_RECORD_READ_FAILED`, `BASE_RECORD_INVALID`, `BASE_RECORD_MISMATCH` | The cached, appearing or just-built base has missing, unreadable, malformed or mismatched provenance. | Restore Docker access if needed and rebuild the pinned base through `scripts/ci-base-build.sh`; rerun only once it matches the tree. |
+
+On each AD release, CI stays blocked until the updated pins and base are
+ready. Follow [the base bump procedure](#when-to-bump-the-base-image-version);
+retry lookup failures after their cause clears. The driving publish skill
+relays the diagnostic verbatim and leaves recovery to the operator.
+
 ## When to bump the base image version
 
-Bump `cscb-ci-base`'s version tag (next, `v10` → `v11`) whenever you change
+Bump `cscb-ci-base`'s version tag (next, `v11` → `v12`) whenever you change
 `docker/Dockerfile.test.base`, its pins included: the release's
 `AD_VERSION`, `AD_COMMIT`, `AD_SHA256`, `AD_ADMIN_SHA256`,
 `AD_INSTALL_SH_SHA256`, independent `AD_CLIENT_VERSION` and
@@ -335,12 +384,13 @@ or standalone `Dockerfile.real-agent`; delivering checker changes to those
 consumers still requires the coordinated base bump below.
 
 `/ci` builds a base only when its
-tag is missing, so without a bump every host keeps testing the base it
-already has. The base reads no `package.json`, so a change there needs no
-bump. There is **no** automatic version derivation — bump it manually in
+tag is missing. A present base must match the tree's AD provenance or the
+run FAILs; it is never silently refreshed. The base reads no `package.json`,
+but a change to its exact AD client dependency requires matching Docker and
+lockfile pins and a base bump. There is **no** automatic version derivation — bump it manually in
 every place that names it:
 
-1. The `FROM` line in `docker/Dockerfile.test`.
+1. The `FROM` lines in `docker/Dockerfile.test` and `docker/Dockerfile.test.candidate`.
 2. The `BASE_TAG` variable in `scripts/ci-base-build.sh`, the base-build
    step, and the tag wherever `.claude/skills/ci/SKILL.md` names it.
 3. The `FROM` lines in `docker/Dockerfile.live` and `docker/Dockerfile.real-agent`, and the base inspection tag in `scripts/real-agent-matrix.ts`.
@@ -352,16 +402,19 @@ every place that names it:
    `docker history` check, the commands under the two "Verifying" sections
    below, and the tags the sweep never touches under
    [/ci: the sharded run](#ci-the-sharded-run).
-8. Active commands in `tests/README.md`, `CONTRIBUTING.md` and test
+8. Active commands in `tests/README.md`, `CONTRIBUTING.md`, `docs/testing-guide.md` and test
    expectations. Preserve historical provenance captures and intentional
    stale-base negative controls.
 
 The source audit in `tests/ci-live-docker.test.ts` fails when a tag in
-`docker/Dockerfile.test`, `docker/Dockerfile.live`,
+`docker/Dockerfile.test`, `docker/Dockerfile.test.candidate`,
+`docker/Dockerfile.live`, `docker/Dockerfile.real-agent`,
 `docker/Dockerfile.test.base`, `scripts/ci-base-build.sh` or either skill
 differs from `BASE_IMAGE`, and when the base-build step has other than one
 `BASE_TAG` or does not build `docker/Dockerfile.test.base` under it. The
-`/ci` skill stays among those files only while it names a base tag.
+`/ci` skill stays among those files only while it names a base tag. The audit
+also discovers every `FROM cscb-ci-base` in the image Dockerfiles, so a newly
+added consumer with a stale tag fails. Historical v9 and v10 negative fixtures stay unchanged.
 
 The release is set in one place only, the Dockerfile's `ARG AD_VERSION`. The
 base-build step and the hand build above read it from there (with `sed`) to
@@ -401,7 +454,7 @@ the pin revision. A live-only pin change leaves `cscb-ci-base`'s tag alone.
 To simulate a fresh host, remove the base tag by its name, and nothing else:
 
 ```sh
-docker rmi cscb-ci-base:v10
+docker rmi cscb-ci-base:v11
 /ci   # with CSCB_AD_SRC_DIR set; or run the hand build above
 ```
 
@@ -416,7 +469,7 @@ build comes near it, raise an issue.
 After a `/ci` run, confirm the base layers are intact:
 
 ```sh
-docker history cscb-ci-base:v10
+docker history cscb-ci-base:v11
 ```
 
 Then edit a comment in (e.g.) `tests/integration/test-1-install-startup.sh`
@@ -429,7 +482,7 @@ docker build -f docker/Dockerfile.test -t "$WARM_TAG" .
 ```
 
 This should complete in seconds, and needs neither build context nor the
-token. `docker history cscb-ci-base:v10` should show the same layer IDs as
+token. `docker history cscb-ci-base:v11` should show the same layer IDs as
 before — proof the source edit didn't invalidate the base. Then remove the
 tag by its name:
 
@@ -842,7 +895,7 @@ The sweep never touches:
 
 - anything whose owner is alive;
 - any `cscb-live=1` container, or any container without `cscb-ci=1`;
-- any other tag shape, such as `cscb-ci:latest`, `cscb-ci-base:v10`,
+- any other tag shape, such as `cscb-ci:latest`, `cscb-ci-base:v11`,
   `cscb-ci-live:v2` or a lane tag like `cscb-ci-l5:m5`;
 - an image that still has a tag, or an image with no owner label;
 - any file beside the lock but a dead owner's reservation;
@@ -2012,8 +2065,8 @@ sampled. `results.json` has them under
 
 ### The live image's agent-director
 
-The live image pairs the base's independently pinned npm client (`0.12.0`)
-with the current runtime (`0.17.1`): the build checks the staged binary
+The live image pairs the base's independently pinned npm client (`0.18.8`)
+with the current runtime (`0.18.8`): the build checks the staged binary
 against the runtime record and proves the client accepts it.
 
 - **The client.** The live image installs no agent-director client and reads
@@ -2057,7 +2110,7 @@ against the runtime record and proves the client accepts it.
   - Anything else (a missing or malformed release record, steps 1
     (tarball) to 4 (exports), a missing check script, the check's refusal or
     usage error):
-    `ERROR: the base image's global agent-director client or its ad-client check failed (the line above names what failed): the base image cscb-ci-base:v10 predates this tree's docker/Dockerfile.test.base or docker/ad-client-check.sh; bump the base image version as the When to bump the base image version section of docker/README.md describes`.
+    `ERROR: the base image's global agent-director client or its ad-client check failed (the line above names what failed): the base image cscb-ci-base:v11 predates this tree's docker/Dockerfile.test.base or docker/ad-client-check.sh; bump the base image version as the When to bump the base image version section of docker/README.md describes`.
 
   Whichever line it is, the run reports a `container` FAIL row for the failed
   build, `docker build of the live image failed (exit N)`, followed by what

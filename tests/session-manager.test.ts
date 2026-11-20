@@ -5815,7 +5815,7 @@ describe('collision ladder: a directory-broken persona keeps its row', () => {
         getQueue: state === 'working' ? [cannedOk(personaRow(cfg, 'C', { state, cwd: broken.rowCwd }))] : undefined,
         getResult: personaRow(cfg, 'C', { state: state === 'working' ? 'waiting' : state, cwd: broken.rowCwd }),
         // A working row reaches waiting on the second poll.
-        statusQueue: state === 'working' ? [cannedOk<import('agent-director').StatusResult>({ state: 'working' })] : undefined,
+        statusQueue: state === 'working' ? [cannedOk(cannedStatusResult({ state: 'working' }))] : undefined,
       })
 
       let sweep!: Awaited<ReturnType<typeof reconcileOrphans>>
@@ -7656,8 +7656,8 @@ describe('waitForWaitingAndReconnect up-front findMissing sweep → fast dead-se
       findMissingCalls,
       findMissingError: errUnusableName(),
       statusQueue: [
-        cannedOk<import('agent-director').StatusResult>({ state: 'working' }),
-        cannedOk<import('agent-director').StatusResult>({ state: 'waiting' }),
+        cannedOk(cannedStatusResult({ state: 'working' })),
+        cannedOk(cannedStatusResult({ state: 'waiting' })),
       ],
     })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
@@ -7721,8 +7721,8 @@ describe('waitForWaitingAndReconnect up-front findMissing sweep → fast dead-se
       findMissingCalls,
       findMissingError: errUnusableName(),
       statusQueue: [
-        cannedOk<import('agent-director').StatusResult>({ state: 'working' }),
-        cannedOk<import('agent-director').StatusResult>({ state: 'waiting' }),
+        cannedOk(cannedStatusResult({ state: 'working' })),
+        cannedOk(cannedStatusResult({ state: 'waiting' })),
       ],
     })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
@@ -14409,7 +14409,7 @@ describe('after a run the server makes, one get of each configured persona\'s ow
     const { h, p, b } = buildRecoveryCase()
     const before = await latchBeforeRun(h, b)
     scriptNotedRows(h, new Map([[b, { liveness_note: provenanceNote }]]))
-    const result: import('agent-director').FindMissingResult = { count: 0, ids: [], unverified: 2, unverified_ids: [personaInstanceId(b), personaInstanceId(p)] }
+    const result = cannedFindMissing({ count: 0, ids: [], unverified: 2, unverified_ids: [personaInstanceId(b), personaInstanceId(p)] })
     h.script({ findMissingResult: result })
 
     expect(await bypassingFindMissingSweep(p, BYPASS_SITE)).toEqual(result)
@@ -14576,7 +14576,7 @@ describe('after a run the server makes, one get of each configured persona\'s ow
   test('the post-run gets run at once: with two listed rows whose gets are held, both gets are made before either answers, and the run\'s line lists the personas in unverified_ids order, not in the order their gets answered', async () => {
     const { h, p, b } = buildRecoveryCase()
     // unverified_ids lists B's row before P's.
-    const result: import('agent-director').FindMissingResult = { count: 0, ids: [], unverified: 2, unverified_ids: [personaInstanceId(b), personaInstanceId(p)] }
+    const result = cannedFindMissing({ count: 0, ids: [], unverified: 2, unverified_ids: [personaInstanceId(b), personaInstanceId(p)] })
     h.script({ findMissingResult: result })
     const gets = new Map<string, (row: CannedGetResult) => void>()
     h.stub.client.get = (params) =>

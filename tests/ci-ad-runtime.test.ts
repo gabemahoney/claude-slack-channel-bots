@@ -8,7 +8,7 @@ import { spawnSync } from 'node:child_process'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
-import { CI_AD_RUNTIME_COMMIT, CI_AD_RUNTIME_VERSION, OLD_AD_VERSION } from './test-helpers/agent-director-versions.ts'
+import { CI_AD_CLIENT_VERSION, CI_AD_RUNTIME_COMMIT, CI_AD_RUNTIME_VERSION, OLD_AD_VERSION } from './test-helpers/agent-director-versions.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 
 const repo = join(import.meta.dir, '..')
@@ -73,9 +73,10 @@ source scripts/ci-base-build.sh
   })
 
   test.each([
-    ['unchanged pinned client with a newer runtime', PHASE1_FLOOR_VERSION, 0],
-    ['client drift to the runtime release', CI_AD_RUNTIME_VERSION, 1],
-  ] as const)('client provenance: %s', (_label, clientVersion, exitCode) => {
+    ['latest client above the host floor', CI_AD_CLIENT_VERSION, CI_AD_CLIENT_VERSION, PHASE1_FLOOR_VERSION, 0],
+    ['client differs from its record', PHASE1_FLOOR_VERSION, CI_AD_CLIENT_VERSION, PHASE1_FLOOR_VERSION, 1],
+    ['package pin differs from its client', CI_AD_CLIENT_VERSION, PHASE1_FLOOR_VERSION, PHASE1_FLOOR_VERSION, 1],
+  ] as const)('client provenance: %s', (_label, clientVersion, packagePin, floor, exitCode) => {
     const check = source('docker/ad-client-check.sh')
     const result = shell(`
 SCRATCH="$HOME"
@@ -91,9 +92,9 @@ bun() { printf '%s' "$PACKAGE_FLOOR"; }
 ${block(check, '# --- 2 version', '# --- 3 content')}
 `, {
       AD_VERSION: CI_AD_RUNTIME_VERSION,
-      AD_CLIENT_VERSION: PHASE1_FLOOR_VERSION,
-      PACKAGE_FLOOR: PHASE1_FLOOR_VERSION,
-    }, { 'package.json': JSON.stringify({ version: clientVersion, dependencies: { 'agent-director': PHASE1_FLOOR_VERSION } }) })
+      AD_CLIENT_VERSION: CI_AD_CLIENT_VERSION,
+      PACKAGE_FLOOR: floor,
+    }, { 'package.json': JSON.stringify({ version: clientVersion, dependencies: { 'agent-director': packagePin } }) })
     expect(result.status).toBe(exitCode)
     if (exitCode === 0) expect(result.stderr).toBe('')
     else expect(result.stderr).toContain('2 (version)')

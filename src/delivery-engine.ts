@@ -6,7 +6,7 @@ import { createQueueItemReader, isOpenItem, isQueueItemClosed, itemOpenedAt } fr
 import { createQueueDeliveryReceiptReader, effectiveSends, type DeliveryReceiptReader, type ReceiptObservation } from './delivery-receipt.ts'
 import { type DeliveryLifecycle, type DeliveryClock, systemDeliveryClock, NOT_NOW_RETRY_MS } from './delivery-lifecycle.ts'
 import { decideEngine, decideGate, firstSendGate, recoveryEnterGate, latestDeliveryAttempt, retypeGate, selectDeliveryTarget, NO_DELIVERY_PAIR, createDeliveryReading, createDeliveryPolicyState, type DeliveryPair, type DeliveryPolicyEngine, type DeliveryPolicyKnowledge, type DeliveryReading, type DeliveryTimer } from './delivery-policy.ts'
-import { classifyAdError, isAdErrorInstance, classifyWithInvalidFlagsRecheck, type AdCall } from './ad-error-class.ts'
+import { submissionUnconfirmedFactsOf, type SubmissionUnconfirmedFacts, classifyAdError, isAdErrorInstance, classifyWithInvalidFlagsRecheck, type AdCall } from './ad-error-class.ts'
 import { ErrInvalidFlags, ErrSpawnNotFound, ErrSpawnNotInteractive, ErrSendKeysWhileRelayed, ErrRelayFallenBack, ErrDialogMaybeOpen, ErrPaneChanged, ErrSystemInstallDisappeared } from './agent-director-errors.ts'
 import { ENTER_DELAY_MS, RECEIPT_WAIT_MS, RETYPE_BACKOFF_MS, DELIVERY_MAX_AD_CALLS_PER_S, DELIVERY_ROW_POLL_MS } from './delivery-constants.ts'
 import type { DeliveryAgent } from './delivery-receipt.ts'
@@ -60,6 +60,7 @@ export interface DeliveryEngineDeps {
   onInfo?(key: string, message: string): void
   onCoveredBlocked?(key: string, reason: string): void
   onEvent?(event: DeliveryEngineEvent): void
+  onSubmissionUnconfirmed?(key: string, facts: SubmissionUnconfirmedFacts, row: GetResult): void
   onKeyError?(key: string, error: unknown, row: GetResult): Promise<void>
   isRestartPendingOrActive(key: string): boolean
   scheduleRestart(key: string, cwd: string): void
@@ -104,6 +105,8 @@ const KEY_STEP_CALLS = 2 // revalidation get, key
 const GATE_STEP_CALLS = 3 // gate observation get, then a key step
 /** A definite refusal of the *text* call; Enter never removes an earlier text. */
 export function deliveryTextWasRefused(error: unknown): boolean {
+  const facts = submissionUnconfirmedFactsOf(error, 'text')
+  if (facts) return facts.kind === 'not_started'
   const cls = classifyAdError(error).errorClass
   return ['CONFLICT', 'UNUSABLE_NAME', 'ENVIRONMENT', 'CONFIG', 'GONE'].includes(cls) || [ErrInvalidFlags, ErrSpawnNotFound, ErrSpawnNotInteractive, ErrSendKeysWhileRelayed, ErrRelayFallenBack, ErrDialogMaybeOpen, ErrPaneChanged, ErrSystemInstallDisappeared].some(c => isAdErrorInstance(error, c))
 }
@@ -200,6 +203,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
   const clock = deps.clock ?? systemDeliveryClock, life = deps.lifecycle, constants = deps.constants
   const ms = (name: 'ENTER_DELAY_MS' | 'RECEIPT_WAIT_MS', fallback: number): number => constants?.[name] ?? fallback
   interface State {
+    custody: Set<string>; notifiedCustody: Set<string>;
     queue: ReturnType<typeof createQueueSummary>; noticesInitialized: boolean
     e: DeliveryPolicyEngine; reading: DeliveryReading; row?: GetResult; receipt?: ReceiptObservation
     reader: DeliveryReceiptReader; receiptTarget?: DeliveryPair; receiptAttempt?: number; deadlines: Partial<Record<DeliveryTimer, number>>; budget: DeliveryCallBudget
@@ -227,8 +231,24 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     let queue = summaries.get(key)
     if (!queue) { queue = createQueueSummary(deps.queue, key); summaries.set(key, queue) }
     queue.receiptOffsets(undefined, 0, 0)
-    const s: State = { queue, noticesInitialized: false, e: createDeliveryPolicyState(), reading: createDeliveryReading(), reader: deps.receiptReader?.() ?? createQueueDeliveryReceiptReader(deps.queue, key), partialAfterAttempts: new Map(), deadlines: {}, budget: budget(key), rowAt: -Infinity, notNowStep: 0, retryStep: 0, appendRetryStep: 0, stopped: false, relaunch: true, receiptWorking: false, pollAfter: 0, dialogHold: false, dialogMaybeOpen: false }
+    const s: State = { custody: new Set(), notifiedCustody: new Set(), queue, noticesInitialized: false, e: createDeliveryPolicyState(), reading: createDeliveryReading(), reader: deps.receiptReader?.() ?? createQueueDeliveryReceiptReader(deps.queue, key), partialAfterAttempts: new Map(), deadlines: {}, budget: budget(key), rowAt: -Infinity, notNowStep: 0, retryStep: 0, appendRetryStep: 0, stopped: false, relaunch: true, receiptWorking: false, pollAfter: 0, dialogHold: false, dialogMaybeOpen: false }
+    // A recovered sent intent has no proof whether the process reached keys.
+    // Keep it receipt-only even if the error-to-block append was interrupted.
+    for (const item of deps.queue.items(key)) {
+      for (const send of item.records) if (send.kind === 'sent' && !item.records.some(r => r.kind === 'refused' && r.attempt === send.attempt)) {
+        s.custody.add(`${send.seq}:${'part' in send ? send.part : 1}`)
+      }
+    }
     states.set(key, s); life.engineRunning(key, true); return s
+  }
+  function receiptOnly(s: State, head: QueueItem, pair: DeliveryPair): boolean {
+    return s.custody.has(`${pair[0]}:${pair[1]}`) || head.records.some(r => r.kind === 'submission-blocked' && r.reason === 'ad-input-unconfirmed' && head.records.some(send => send.kind === 'sent' && send.attempt === r.attempt && (!('part' in send) || send.part === pair[1])))
+  }
+  function notifyCustody(key: string, s: State, facts: SubmissionUnconfirmedFacts): void {
+    const id = `${s.e.target[0]}:${s.e.target[1]}`
+    if (s.notifiedCustody.has(id) || !s.row) return
+    s.notifiedCustody.add(id)
+    deps.onSubmissionUnconfirmed?.(key, facts, s.row)
   }
   function release(s: State): void { s.lease?.(); s.lease = undefined; s.e.request = 'none' }
   function timers(s: State): void { for (const name of Object.keys(s.e.timers) as DeliveryTimer[]) s.e.timers[name] = Math.max(0, (s.deadlines[name] ?? 0) - clock.now()) }
@@ -386,7 +406,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     refreshQueue(s)
     s.queue.receiptOffsets(s.receiptTarget, s.receiptAttempt ?? 0, s.reading.records.length)
     if (deps.isConnected(key) && !life.reconnectInput(key)) life.clearDeferred(key)
-    s.reading = { ...s.reading, gate: life.owner(key), up: deps.isUp(key) && !!deps.persona(key), latched: deps.isLatched(key), held: deps.isHeld(key) || s.restarted === true, mcp: deps.isConnected(key), relaunch: s.relaunch }
+    s.reading = { ...s.reading, gate: life.owner(key), up: deps.isUp(key) && !!deps.persona(key), latched: deps.isLatched(key), held: deps.isHeld(key) || life.inputHeld(key) || s.restarted === true, mcp: deps.isConnected(key), relaunch: s.relaunch }
     const k = knowledge(key, s)
     s.snapshot = k; return k
   }
@@ -449,7 +469,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       !s.relaunch && row.session_id === s.e.sessionSeen &&
       (s.e.phase === 'recovery-enter' ? recoveryEnterGate : firstSendGate)({ ...s.reading, row: row.state, marker: row.labels?.tag_prompt === '1',
         relay: row.relay_mode === 'on', up: deps.isUp(key), mcp: deps.isConnected(key),
-        held: deps.isHeld(key), latched: deps.isLatched(key) }, s.e)
+        held: deps.isHeld(key) || life.inputHeld(key), latched: deps.isLatched(key) }, s.e)
     if (allowed) return true
     s.e.phase = 'receipt'; s.e.request = 'none'
     s.deadlines.receipt = clock.now() + ms('RECEIPT_WAIT_MS', RECEIPT_WAIT_MS)
@@ -476,6 +496,28 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
   async function keyError(key: string, s: State, error: unknown, textCall: boolean): Promise<void> {
     if (error instanceof DeliveryBudgetWait) throw error
     const row = s.row!
+    const facts = submissionUnconfirmedFactsOf(error, textCall ? 'text' : 'enter')
+    if (facts) {
+      if (facts.kind !== 'not_started') {
+        const [seq, part] = s.e.target
+        s.custody.add(`${seq}:${part}`)
+        queueWrite(s, { v: 1, kind: 'submission-blocked', seq, attempt: s.e.attempt, at: clock.now(), reason: 'ad-input-unconfirmed' }, () => {})
+        s.e.phase = 'receipt'; release(s)
+      }
+      await readRow(key, s, true)
+      if (facts.kind !== 'not_started') {
+        notifyCustody(key, s, facts)
+        return
+      }
+      const steps = constants?.NOT_NOW_RETRY_MS ?? NOT_NOW_RETRY_MS
+      s.deadlines.notNow = clock.now() + steps[Math.min(s.notNowStep++, steps.length - 1)]!
+      s.e.phase = textCall ? 'refused' : 'enter'
+      // A definite Enter refusal retains the known draft until its retry.
+      // Never retry within the same tick or turn it into a receipt timeout.
+      if (!textCall) s.deadlines.enterDelay = s.deadlines.notNow
+      s.e.request = 'none'
+      return
+    }
     await deps.onKeyError?.(key, error, row)
     if (isAdErrorInstance(error, ErrInvalidFlags) && !deps.onKeyError) await classifyWithInvalidFlagsRecheck(error)
     if (isAdErrorInstance(error, ErrSpawnNotInteractive) || isAdErrorInstance(error, ErrSpawnNotFound)) {
@@ -518,7 +560,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
         // held and writability gates, before any legacy observation. Typed
         // text keeps its Enter step; pressEnter refuses a covered row itself.
         const coveredHead = head
-        if (coveredHead && !s.pending && !coveredChecked && s.e.phase !== 'enter' && s.e.phase !== 'recovery-enter') {
+        if (coveredHead && !receiptOnly(s, coveredHead, pair) && !s.pending && !coveredChecked && s.e.phase !== 'enter' && s.e.phase !== 'recovery-enter') {
           coveredChecked = true
           if (!await readRow(key, s) || !s.row) { release(s); return }
           if (isCoveredRow(s.row) || hasUnresolvedCoveredCustody(coveredHead)) {
@@ -531,7 +573,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
               coveredAction = await covered.step({ key, item: coveredHead, row: s.row, part,
                 client: () => deps.clientFor(key),
                 readRow: async () => await readRow(key, s, true) ? s.row : undefined,
-                ready: () => !stopped && !s.stopped && life.active(key) && life.owner(key) === 'delivery' && deps.isUp(key) && !deps.isLatched(key) && !deps.isHeld(key) && deps.isConnected(key) && s.row?.labels?.tag_prompt === '1' && s.row.relay_mode === 'on' && !['ended', 'missing', 'pending'].includes(s.row.state),
+                ready: () => !stopped && !s.stopped && life.active(key) && life.owner(key) === 'delivery' && deps.isUp(key) && !deps.isLatched(key) && !deps.isHeld(key) && !life.inputHeld(key) && deps.isConnected(key) && s.row?.labels?.tag_prompt === '1' && s.row.relay_mode === 'on' && !['ended', 'missing', 'pending'].includes(s.row.state),
                 call: (verb, run) => ad(key, s, verb, run),
                 delivered: () => {
                   emit({ type: 'delivered', key, seq: coveredHead.accepted.seq, part })
@@ -564,7 +606,12 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           k = build(key, s)
           if (selectDeliveryTarget(k).some((value, i) => value !== pair[i])) { release(s); continue }
         }
-        const action = decideEngine(k)
+        // Legacy uncertainty retains observation and exact receipt settlement,
+        // but cannot acquire a typing lease or become recovery Enter/retype.
+        const retained = head && receiptOnly(s, head, pair)
+        if (retained && !s.pending && !s.receipt?.receipt) notifyCustody(key, s, { kind: 'unknown', step: 'text', keysSent: 'unknown', issue: 'missing-details', next: 'hold-and-read' })
+        if (!s.pending && (retained || life.inputHeld(key)) && !s.receipt?.receipt) { release(s); s.e.phase = 'receipt'; wait(key, s, 'held'); break }
+        const action = !s.pending && retained && s.receipt?.receipt ? 'readReceipt' : decideEngine(k)
         if (action === 'commitAppend') {
           const pending = s.pending!
           try {
@@ -666,7 +713,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
             // uncertain recovery retries Enter before it can append text.
             if (recovery) s.e.recoveryAttempt = s.e.attempt
           }
-          catch (error) { await keyError(key, s, error, false) }
+          catch (error) { await keyError(key, s, error, false); if (s.pending) continue; break }
           const sentItem = deps.queue.item(key, s.e.target[0]) ?? head!
           const sent = effectiveSends(sentItem, s.e.target[1]).at(-1)
           if (sent) afterSend(s, key, sent)
@@ -756,7 +803,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
         const attempt = latestDeliveryAttempt(k, pair)
         // A failed read can release the lease before the receipt wait ends.
         // Let the engine finish that wait, including a working-row extension.
-        return !s.pending && life.owner(key) !== 'delivery' && (attempt === undefined ||
+        return !s.pending && (life.owner(key) !== 'delivery' || life.inputHeld(key)) && (attempt === undefined ||
           (s.e.phase === 'ready' && !s.receiptWorking && !s.relaunch &&
             s.e.sessionSeen === s.row?.session_id && s.e.recoveryAttempt === attempt))
       }

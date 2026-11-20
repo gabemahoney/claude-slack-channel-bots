@@ -192,7 +192,7 @@ import { isLiveRunnerPid, lockHolder, lockPid, nodeLockDeps, RunLock, type LockD
 import { AD_CLIENT_CHECK, AD_CLIENT_CHECK_SOURCE } from '../ci-live/lib/ad-client-check.ts'
 import { NotRunnableError } from '../ci-live/lib/secrets.ts'
 import { DEBUG_SKILL_PATH, meetsPhase1Floor, PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
-import { LEGACY_DISPLAYED_STATE_AD_VERSION, LEGACY_DISPLAYED_STATE_AD_COMMIT, CI_AD_RUNTIME_COMMIT, CI_AD_RUNTIME_VERSION, LIVE_CLAUDE_CODE_VERSION, MIN_CLAUDE_CODE_VERSION, OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
+import { LEGACY_DISPLAYED_STATE_AD_VERSION, LEGACY_DISPLAYED_STATE_AD_COMMIT, CI_AD_CLIENT_VERSION, CI_AD_RUNTIME_COMMIT, CI_AD_RUNTIME_VERSION, LIVE_CLAUDE_CODE_VERSION, MIN_CLAUDE_CODE_VERSION, OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 import { balancedAfter, callArguments, callsOf, indicesOf, objectProperties, onlyCallArguments, splitTopLevel, stripComments } from './test-helpers/source-audit.ts'
 import { APP_TOKEN_PREFIX, assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL } from './test-helpers/credentials.ts'
 
@@ -2343,7 +2343,7 @@ function previousBaseTag(): string {
  * shape): empty when it reads only the client check and native agent installers from the repo context
  * and only the install script from its one named context (no
  * release-candidate context, no SHA256SUMS); pins the current runtime and
- * independently pins the client to CSCB's Phase 1 floor, with release hashes;
+ * independently pins the released client above CSCB's host floor, with release hashes;
  * checks install.sh against its pin before installing it off PATH; installs
  * the release's binaries with that install.sh's `--from-release` of the
  * pinned tag and both pinned SHA-256s (no hooks, no symlink, a throwaway
@@ -2384,8 +2384,8 @@ function baseLayoutProblems(text: string): string[] {
     problems.push(`AD_VERSION ${version} is not the release-gate runtime ${CI_AD_RUNTIME_VERSION}`)
   }
   const clientVersion = args.AD_CLIENT_VERSION ?? ''
-  if (clientVersion !== PHASE1_FLOOR_VERSION || clientVersion !== packageAdPin()) {
-    problems.push(`AD_CLIENT_VERSION ${clientVersion || '(none)'} is not the Phase 1 floor ${PHASE1_FLOOR_VERSION} that package.json pins (${packageAdPin()})`)
+  if (!PLAIN_RELEASE.test(clientVersion) || clientVersion !== packageAdPin() || !meetsPhase1Floor(clientVersion)) {
+    problems.push(`AD_CLIENT_VERSION ${clientVersion || '(none)'} is not the released package.json pin (${packageAdPin()}) at or above the host floor`)
   }
   if (!/^[0-9a-f]{40}$/.test(args.AD_COMMIT ?? '')) problems.push('AD_COMMIT is not a 40-hex commit')
   else if (args.AD_COMMIT !== CI_AD_RUNTIME_COMMIT) problems.push(`AD_COMMIT is not the release-gate runtime's commit ${CI_AD_RUNTIME_COMMIT}`)
@@ -2606,6 +2606,73 @@ function rcLayoutAuditFiles(): string[] {
 }
 
 describe('the /ci images (source audit)', () => {
+  const FROM_CONSUMERS = ['docker/Dockerfile.live', 'docker/Dockerfile.real-agent', 'docker/Dockerfile.test', 'docker/Dockerfile.test.candidate']
+
+  /** Discover actual FROM instructions throughout the source tree, not a hand-picked list. */
+  function discoverBaseConsumers(rel = ''): Map<string, string> {
+    const files = new Map<string, string>()
+    for (const entry of readdirSync(join(REPO, rel), { withFileTypes: true })) {
+      if (['.git', 'node_modules', '.scratch', 'artifacts', 'dist'].includes(entry.name)) continue
+      const path = join(rel, entry.name)
+      if (entry.isDirectory()) for (const [name, text] of discoverBaseConsumers(path)) files.set(name, text)
+      else if (entry.isFile()) {
+        const text = repoFile(path)
+        if (/^\s*FROM\s+(?:--\S+\s+)*cscb-ci-base:/im.test(text)) files.set(path, text)
+      }
+    }
+    return files
+  }
+
+  function consumerProblems(files: ReadonlyMap<string, string>): string[] {
+    return [...files].flatMap(([name, text]) => [
+      ...(!FROM_CONSUMERS.includes(name) ? [`unlisted base consumer: ${name}`] : []),
+      ...[...text.matchAll(/^\s*FROM\s+(?:--\S+\s+)*(cscb-ci-base:[\w.-]+)/gim)]
+        .filter(match => match[1] !== 'cscb-ci-base:v11').map(match => `${name}: ${match[1]}`),
+    ])
+  }
+
+  test('b.bvq: every FROM consumer is discovered, including candidate, and uses v11', () => {
+    const files = discoverBaseConsumers()
+    expect([...files.keys()].sort()).toEqual(FROM_CONSUMERS)
+    expect(consumerProblems(files)).toEqual([])
+    expect(BASE_IMAGE).toBe('cscb-ci-base:v11')
+  })
+
+  test('b.bvq: discovery rejects a new unlisted consumer even on v11', () => {
+    const files = discoverBaseConsumers()
+    files.set('docker/Dockerfile.unlisted', 'FROM cscb-ci-base:v11\n')
+    expect(consumerProblems(files)).toContain('unlisted base consumer: docker/Dockerfile.unlisted')
+  })
+
+  test.each(['v9', 'v10'])('b.bvq: an obsolete %s FROM is refused', tag => {
+    const file = FROM_CONSUMERS[0]!
+    expect(consumerProblems(new Map([[file, `FROM cscb-ci-base:${tag}\n`]]))).toContain(`${file}: cscb-ci-base:${tag}`)
+  })
+
+  /** The legacy installer must have a distinct, checked download before use. */
+  function legacyInstallerProblems(text: string): string[] {
+    const { instructions, args } = imageParts(text)
+    const legacy = instructions.find(line => /^RUN\s/.test(line) && line.includes('LEGACY_DIR=')) ?? ''
+    const expanded = expand(legacy, shellVars(legacy, args))
+    const problems: string[] = []
+    if (expanded.includes('/opt/agent-director/install/install.sh')) problems.push('runtime installer reused')
+    const download = [...expanded.matchAll(/curl\s[^;]*/g)].find(match =>
+      [args.AD_LEGACY_COMMIT, `v${args.AD_LEGACY_VERSION}`].some(identity =>
+        match[0].includes(`https://raw.githubusercontent.com/gabemahoney/agent-director/${identity}/skills/install-agent-director/install.sh`)))
+    const target = download?.[0].match(/(?:^|\s)-o\s+"?([^"\s;]+)/)?.[1]
+    if (target === undefined) problems.push('own legacy installer download missing')
+    const checked = target === undefined ? null : new RegExp(`${escapeRegExp(args.AD_LEGACY_INSTALL_SH_SHA256 ?? '')}"?\\s+"?${escapeRegExp(target)}"?[^;]*sha256sum\\s+--check`).exec(expanded)
+    if (checked === null || (download !== undefined && expanded.indexOf(checked[0]) < download.index!)) problems.push('own legacy installer digest check missing')
+    return problems
+  }
+
+  test('b.bvq: legacy downloads and verifies its own installer; planted runtime reuse fails', () => {
+    const text = repoFile(BASE_DOCKERFILE)
+    expect(legacyInstallerProblems(text)).toEqual([])
+    const copied = text.replace(/(LEGACY_DIR="[^\n]+\n)/, '$1    install -m 0755 /opt/agent-director/install/install.sh "${LEGACY_DIR}/install/install.sh"; \\\n')
+    expect(copied).not.toBe(text)
+    expect(legacyInstallerProblems(copied)).toContain('runtime installer reused')
+  })
   test('the per-run test image refreshes the client checker from the current tree over a cached base', () => {
     expect(dockerInstructions(join('docker', 'Dockerfile.test')))
       .toContain(`COPY --chmod=0755 ${AD_CLIENT_CHECK_SOURCE} ${AD_CLIENT_CHECK}`)
@@ -2613,6 +2680,7 @@ describe('the /ci images (source audit)', () => {
 
   const TAGGED = [
     join('docker', 'Dockerfile.test'),
+    join('docker', 'Dockerfile.test.candidate'),
     join('docker', 'Dockerfile.live'),
     join('docker', 'Dockerfile.real-agent'),
     BASE_DOCKERFILE,
@@ -2650,7 +2718,7 @@ describe('the /ci images (source audit)', () => {
     expect(/\bkey serves no model call\b/.test(credentials!)).toBe(false)
   })
 
-  test.each([join('docker', 'Dockerfile.test'), join('docker', 'Dockerfile.live'), join('docker', 'Dockerfile.real-agent')])('%s is built FROM BASE_IMAGE and nothing else', (rel) => {
+  test.each(FROM_CONSUMERS)('%s is built FROM BASE_IMAGE and nothing else', (rel) => {
     expect(dockerInstructions(rel).filter((i) => /^FROM\s/i.test(i))).toEqual([`FROM ${BASE_IMAGE}`])
   })
 
@@ -2660,12 +2728,13 @@ describe('the /ci images (source audit)', () => {
     expect(step).toContain('-f docker/Dockerfile.test.base -t "${BASE_TAG}" .')
   })
 
-  test("the base's layout: current release-gate runtime and commit independent of the unchanged npm client/floor, with checked binary, admin, installer and client provenance", () => {
+  test("the base's layout: latest runtime and client independent of the host floor, with checked provenance", () => {
     const { args } = baseImage()
     expect(args.AD_VERSION).toBe(CI_AD_RUNTIME_VERSION)
     expect(args.AD_COMMIT).toBe(CI_AD_RUNTIME_COMMIT)
-    expect(args.AD_CLIENT_VERSION).toBe(PHASE1_FLOOR_VERSION)
-    expect(packageAdPin()).toBe(PHASE1_FLOOR_VERSION)
+    expect(args.AD_CLIENT_VERSION).toBe(CI_AD_CLIENT_VERSION)
+    expect(packageAdPin()).toBe(CI_AD_CLIENT_VERSION)
+    expect(CI_AD_CLIENT_VERSION).not.toBe(PHASE1_FLOOR_VERSION)
     expect(baseLayoutProblems(repoFile(BASE_DOCKERFILE))).toEqual([])
   })
 

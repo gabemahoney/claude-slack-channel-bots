@@ -251,7 +251,7 @@ for thread_mode in strict open; do
     # Admission proves every reply candidate and accepted item has drained. Both
     # endpoint checks are harness AD reads, excluded by ad_cscb_calls.
     real_wait_latency_admission "${REAL_KEY}" 21
-    # AD 0.17.1 list omits unproven requests: CSCB needs one read on the final
+    # AD list rows omit unproven requests: CSCB needs one read on the final
     # turn-end transition to catch a hidden check_permission → waiting race.
     # Record AD's actual transition time, including reads before admission
     # noticed waiting. Give CSCB one poll interval plus a 1000 ms margin for

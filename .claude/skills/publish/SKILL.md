@@ -48,6 +48,11 @@ Equivalent two-step path:
 /publish promote
 ```
 
+Prepare freshly checks GitHub Latest, npm `latest`, release commit/digests,
+package/lock agreement and any present base's provenance after preflight and
+before any version change. `/ci` PASS does not replace this fatal SR-2.8
+check; its failure exits 16 without an override or offline path.
+
 ## Procedure
 
 1. **Validate the bump arg.** If missing or not one of `patch`/`minor`/`major`, print the usage line above and stop. Do not run any script.
@@ -72,6 +77,7 @@ Prepare-phase exit codes (script: `scripts/publish-prepare.sh`):
 | 13   | SR-2.2 / SR-2.3 | install/test/typecheck/no-test-files failed, OR `mktemp -d` could not make the suite's scratch HOME, OR the test preload guard refused to start `bun test` (its exit 78, with a `host-safety preload: refusing to start` line on stderr; commonly a `TMPDIR` inside the home directory) | operator: fix on `main`, commit, rerun /publish; for `mktemp -d`, make the temp directory (`TMPDIR`, else `/tmp`) exist and be writable, then rerun /publish; for the guard's refusal, point `TMPDIR` at a directory outside the home (or unset it to use `/tmp`), then rerun /publish |
 | 14   | SR-2.4 / SR-2.4a / SR-2.4b | not authenticated to npm, OR next version already on npm, OR npm registry is non-canonical (SR-2.4a), OR `bun pm whoami` did not succeed (SR-2.4b) | operator: `npm login` / `npm config set registry https://registry.npmjs.org/` / `bun pm login`, or pull/larger bump |
 | 15   | SR-2.5 | host's agent-director check failed: no binary found, OR its version cannot be read, OR it is below the installed agent-director client's minimum, OR that minimum cannot be read, OR `scripts/ad-version-check.ts` did not run to completion. Every SR-2.5 diagnostic names the README section "Switching over to agent-director Phase 1". A binary at or above the client's minimum but below CSCB's Phase 1 floor does not fail: it passes with an `SR-2.5 (preflight) NOTE` | operator: follow the diagnostic's operator recovery; the host's agent-director is changed only by the README section "Switching over to agent-director Phase 1"; then rerun /publish. When the client's minimum cannot be read or the check did not run to completion, the operator assesses before any rerun |
+| 16   | SR-2.8 (latest agent-director) | fresh latest lookup, runtime/client pins or cached-base provenance failed; no version or release mutation occurred | operator: follow [the strict-check failure codes and recovery](../../../docker/README.md#strict-latest-agent-director-check); verify/update and commit pins and rebuild the base, or restore lookup access and retry later. No override, warning or offline path; LLM relays stderr verbatim and stops |
 | 20   | SR-3.1 | `npm version <bump>` failed, OR `CHANGELOG.md` has no `## Unreleased` heading, OR its rewrite to the release's heading failed (`date -u` or `node` failed); the two `CHANGELOG.md` failures print `SR-3.1 (changelog)` | working tree rolled back (`package.json`, `bun.lock` and `CHANGELOG.md`); operator investigates, then reruns /publish; with no `## Unreleased` heading, operator puts this release's notes under an `## Unreleased` heading as `CHANGELOG.md`'s first `##` entry, commits that to main, then reruns /publish |
 | 21   | SR-4.1 | `bun pm pack` failed or tarball internal version mismatch | working tree rolled back; operator investigates |
 | 22   | SR-4.2 | scratch install failed or installed version mismatch | working tree rolled back; operator inspects bun install / tarball layout |

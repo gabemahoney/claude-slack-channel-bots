@@ -178,6 +178,7 @@ import {
 // Libc's flock for the lock probe (section 3).
 import { dlopen, FFIType } from 'bun:ffi'
 import { createHash } from 'node:crypto'
+import { makeAdLatestFixture } from './ad-latest.ts'
 // File writes and reads under a caller's root (sections 1, 4, 5 and 6).
 import {
   chmodSync,
@@ -2698,12 +2699,15 @@ export function buildWorktree(root: string, options: WorktreeOptions = {}): Buil
 
   const dockerfiles = options.dockerfiles ?? {}
   const real = repositoryDockerfileLines()
+  const ad = makeAdLatestFixture()
+  writeFileSync(join(worktree, 'package.json'), ad.sources.packageJson)
+  writeFileSync(join(worktree, 'bun.lock'), ad.sources.lockfile)
   const fileText = (lines: readonly string[]): string => lines.map((line) => `${line}\n`).join('')
   if ((dockerfiles.test ?? 'present') === 'present') writeFileSync(testDockerfilePath, fileText(real.testFrom))
   if ((dockerfiles.base ?? 'present') === 'present') {
     const adVersion = dockerfiles.adVersion ?? 'real'
-    const baseLines = real.baseLines.flatMap((line) => {
-      if (line !== real.adVersion || adVersion === 'real') return [line]
+    const baseLines = ad.sources.dockerfile.split('\n').filter((line: string) => /^FROM\s|^ARG AD_(?:VERSION|COMMIT|SHA256|ADMIN_SHA256|INSTALL_SH_SHA256|CLIENT_VERSION|CLIENT_TGZ_SHA256)=/.test(line)).flatMap((line: string) => {
+      if (!DOCKERFILE_AD_VERSION_LINE.test(line) || adVersion === 'real') return [line]
       return adVersion === 'empty' ? [line.slice(0, line.indexOf('=') + 1)] : []
     })
     writeFileSync(baseDockerfilePath, fileText(baseLines))

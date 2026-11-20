@@ -2652,6 +2652,20 @@ export function personaRow(h: RecoveryHarness, key: string, overrides: PersonaGe
   return cannedGetResult(overrides, personaOf(h, key), h.home)
 }
 
+/** Install the shared control-input store through the production service seam.
+ * The harness's existing episode sink captures deduplicated notices. */
+export async function installRecoverySubmissionInputServices(h: RecoveryHarness, holds: import('../../src/ad-input-holds.ts').AdInputHoldStore): Promise<() => void> {
+  const session = await import('../../src/session-manager.ts')
+  session.setSubmissionInputServices({ holds,
+    notify(key: string, text: string) {
+      h.episodes.begin(key, 'ad-input-unconfirmed')
+      h.episodes.post(key, 'ad-input-unconfirmed', text)
+    },
+    log: (line: string) => h.lines.push(line),
+  })
+  return () => session.setSubmissionInputServices(undefined)
+}
+
 /**
  * How the retired-key store's clear lines name the read that cleared: the state it read and the site's `<site>: <what>`, as the session
  * manager words it inline (no exported builder).

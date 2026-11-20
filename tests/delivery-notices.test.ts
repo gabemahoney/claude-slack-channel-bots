@@ -587,7 +587,7 @@ describe('Reaction Items: the queue store-failure path and delivered diagnostics
     expect(r.queue.item(r.alpha, withdrawn.accepted.seq)).toMatchObject({ withdrawn: { reason: 'conversation-unknown' }, delivered: false })
   })
 })
-test('the durable per-item not-taken-in notice survives server restart while retyping continues', async () => {
+test('the durable per-item not-taken-in notice survives receipt-only server replay without another send', async () => {
   let r: DeliveryNoticeHarness | undefined
   const e = await makeEngineHarness({ onEvent: event => r?.reporting.engineEvent(event) })
   r = await makeDeliveryNoticeHarness({ queue: e.queue }); runs.push(r)
@@ -604,13 +604,18 @@ test('the durable per-item not-taken-in notice survives server restart while ret
     expect(r.logs.filter(line => line.includes(MESSAGE_NOT_TAKEN_IN))).toEqual([buildDeliveryDiagnostic(MESSAGE_NOT_TAKEN_IN, r.ref(), deliveryIdentity(item.accepted))])
     expect(r.logs.filter(line => line.includes(MESSAGE_RETYPED))).toEqual(e.events.flatMap(event => event.type === 'retyped' ? [buildDeliveryDiagnostic(MESSAGE_RETYPED, r!.ref(), deliveryIdentity(item.accepted), `retype_count=${event.count}`)] : []))
     expect(JSON.stringify(r.logs)).not.toContain('not yet taken in')
-    const typedBefore = e.textCalls().length
+    const keysBefore = [...e.keyCalls()]
     await e.restartServer()
-    await e.until(() => e.textCalls().length > typedBefore)
+    await e.advance(DELIVERY_STUCK_AFTER_MS + DELIVERY_ROW_POLL_MS)
     await r.flush()
     expect(e.records().filter(record => record.kind === 'noticed')).toHaveLength(1)
     expect(r.h.posts(r.alpha)).toHaveLength(1)
     expect(r.h.posts(r.beta)).toEqual([])
+    expect(e.keyCalls()).toEqual(keysBefore)
+    expect(e.queue.openCount('alpha')).toBe(1)
+    appendTranscript(e.p().path, [promptEntry('not yet taken in')])
+    await e.until(() => e.queue.openCount('alpha') === 0)
+    expect(e.keyCalls()).toEqual(keysBefore)
   } finally { await e.cleanup() }
 })
 
@@ -696,7 +701,7 @@ describe('b.x4j transcript-to-notice partial receipt guard', () => {
       await e.tick(); await e.advance(ENTER_DELAY_MS + DELIVERY_ROW_POLL_MS)
       appendTranscript(e.p().path, [promptEntry(partialReceiptSuffix)])
       await e.advance(DELIVERY_ROW_POLL_MS)
-      const firstDiagnostics = partialLines(r).length
+      const initialDiagnostics = [...partialLines(r)], firstDiagnostics = initialDiagnostics.length
       if (scope === 'part' || scope === 'item') {
         appendTranscript(e.p().path, [promptEntry(partialReceiptText)])
       } else if (scope === 'launch') {
@@ -709,15 +714,32 @@ describe('b.x4j transcript-to-notice partial receipt guard', () => {
         e.p().row.launch_started_at = new Date(e.clock.now()).toISOString(); await e.advance(DELIVERY_ROW_POLL_MS)
       } else {
         if (scope === 'timestamped-replay') e.p().row.launch_started_at = new Date(e.clock.now()).toISOString()
+        const keys = [...e.keyCalls()]
         await e.restartServer() // Evidence is rebuilt from journal + transcript.
         r = await composition.resetReporting()
+        await e.advance(DELIVERY_STUCK_AFTER_MS + DELIVERY_ROW_POLL_MS - e.clock.now())
+        await r.flush()
+        // Replay retains custody rather than restarting partial/retype notices.
+        expect(r.h.posts(r.alpha)).toEqual([])
+        expect(r.h.posts(r.beta)).toEqual([])
+        expect(partialLines(r)).toEqual(scope === 'replay' ? initialDiagnostics : [])
+        expect(e.records().filter(record => record.kind === 'noticed')).toEqual([])
+        expect(e.queue.openCount('alpha')).toBe(1)
+        expect(e.keyCalls()).toEqual(keys)
+        expect(e.calls.filter(call => call.verb === 'read-pane')).toEqual([])
+        expect(e.errors).toEqual([])
+        expect(firstDiagnostics).toBe(1)
+        appendTranscript(e.p().path, [promptEntry(partialReceiptText)])
+        await e.until(() => e.queue.openCount('alpha') === 0)
+        expect(e.keyCalls()).toEqual(keys)
+        return
       }
       await e.until(() => e.records().some(record => record.kind === 'noticed'))
       await e.advance(DELIVERY_STUCK_AFTER_MS + DELIVERY_ROW_POLL_MS - e.clock.now())
       await r.flush()
       const notices = r.h.posts(r.alpha)
       expect(notices).toHaveLength(2)
-      expect(notices.map(post => /cut off/i.test(post.text))).toEqual(scope === 'replay' ? [true, true] : [false, false])
+      expect(notices.map(post => /cut off/i.test(post.text))).toEqual([false, false])
       expect(e.queue.openCount('alpha')).toBe(1)
       expect(e.calls.filter(call => call.verb === 'read-pane')).toEqual([])
       expect(e.errors).toEqual([])
@@ -725,7 +747,7 @@ describe('b.x4j transcript-to-notice partial receipt guard', () => {
     } finally { await e.cleanup() }
   })
 
-  test('b.x4j replay reconstructs a partial diagnostic once while retaining the durable not-taken-in notice', async () => {
+  test('b.x4j receipt-only replay reconstructs one partial diagnostic without resending or repeating the durable notice', async () => {
     const composition = await compose(), e = composition.e
     let r = composition.r
     try {
@@ -738,14 +760,21 @@ describe('b.x4j transcript-to-notice partial receipt guard', () => {
         formatPersonaNotice(r.config.personas[0]!, buildMessageNotTakenInNotice(r.ref(), 'interject', true)),
       ])
       expect(partialLines(r)).toHaveLength(1)
+      const diagnostic = [...partialLines(r)]
+      const keys = [...e.keyCalls()]
       await e.restartServer(); r = await composition.resetReporting()
       await e.advance(DELIVERY_STUCK_AFTER_MS + DELIVERY_ROW_POLL_MS - e.clock.now()); await r.flush()
       expect(e.records().filter(record => record.kind === 'noticed')).toHaveLength(1)
       expect(r.logs.filter(line => line.includes(MESSAGE_NOT_TAKEN_IN))).toEqual([])
-      expect(partialLines(r)).toHaveLength(1)
+      expect(partialLines(r)).toEqual(diagnostic)
       const posts = r.h.posts(r.alpha)
-      expect(posts).toHaveLength(1)
-      expect(posts[0]!.text).toBe(formatPersonaNotice(r.config.personas[0]!, buildDeliveryStuckNotice(r.ref(), r.alpha, 1, e.clock.now(), 'not-taken-in', e.queue.items('alpha')[0]!.retypeCount + 1, true)))
+      expect(posts).toEqual([])
+      expect(r.h.posts(r.beta)).toEqual([])
+      expect(e.keyCalls()).toEqual(keys)
+      expect(e.queue.openCount('alpha')).toBe(1)
+      appendTranscript(e.p().path, [promptEntry(partialReceiptText)])
+      await e.until(() => e.queue.openCount('alpha') === 0)
+      expect(e.keyCalls()).toEqual(keys)
     } finally { await e.cleanup() }
   })
 })

@@ -109,23 +109,23 @@
  * resolved entry with its source).
  *
  * part of the contract merge check: the shipped `package.json`
- * depends on agent-director at exactly the Phase 1 release's version — one
+ * depends on agent-director at exactly the approved client version — one
  * exact version, with no range operator, pre-release suffix or build
- * metadata, equal to CSCB's floor (`PHASE1_FLOOR_VERSION`) — and
+ * metadata, at or above CSCB's floor (`PHASE1_FLOOR_VERSION`) — and
  * `bun.lock` resolves to it. `clientPinVerdict` is that rule as a pure,
- * file-local checker: given a spec and the floor it answers whether the spec
+ * file-local checker: given a spec it answers whether the spec
  * is the pin, and names the first rule broken (a range, a dist-tag such as
  * `latest`, a file, git or URL source, a pre-release, build metadata or
- * another version). Its fixture specs are all built from the floor or the
+ * another version). Its fixture specs are all built from the pins or the
  * versions helper (`tests/test-helpers/agent-director-versions.ts`), never
  * typed; `lockPin`'s fixture lock objects show it reports a mismatched
  * workspace spec, a release-candidate resolution and a file source.
  *
  * The real files are checked with both: `package.json` names agent-director
  * in `dependencies` and in no other section, with a spec `clientPinVerdict`
- * accepts against the floor; `bun.lock`'s root workspace names the same
+ * accepts against the approved client pin; `bun.lock`'s root workspace names the same
  * spec, in `dependencies` only; and its `packages` entry resolves
- * `agent-director@<floor>` from the default registry, with an integrity hash.
+ * `agent-director@<approved-client>` from the default registry, with an integrity hash.
  *
  * Every npm-backed test shares one memoised pack probe per file load. Each npm
  * child's environment is a direct `hostSafeChildEnv` call: the probe's temp dir as HOME, only `npm` and `node` on PATH, and a
@@ -198,7 +198,7 @@ import {
 import { DELIVERY_MODES, DM_DESTINATION, type ChannelMode } from '../src/config.ts'
 import { PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
 import { HostSafetyError, hostSafeChildEnv, resolveToolDir } from './test-helpers/host-safe-env.ts'
-import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
+import { AD_FIXTURE_NEWER_VERSION, AD_FIXTURE_OTHER_VERSION, CI_AD_CLIENT_VERSION, OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import { deliveryResultSamples, sharedChannelPath, SHARED_CHANNEL_IDS } from './test-helpers/shared-channels.ts'
 import { THREAD_PERSONAS, THREAD_CHANNELS, THREAD_ROOTS, threadPath } from './test-helpers/thread-memory.ts'
@@ -1605,7 +1605,7 @@ describe(`${TOML_PARSER} is a runtime dependency at exactly its pinned version (
 })
 
 // ---------------------------------------------------------------------------
-// 5. agent-director is pinned at the Phase 1 floor
+// 5. agent-director has an exact approved client pin, independent of the host floor
 // ---------------------------------------------------------------------------
 
 /** The agent-director npm client, CSCB's runtime dependency. */
@@ -1619,18 +1619,18 @@ const AD_PACKAGE = 'agent-director'
  *     `>=`, `=`), `v` prefix, wildcard, x-range, space or `||` alternation;
  *   - `no-pre-release`: no `-<pre-release>` suffix;
  *   - `no-build-metadata`: no `+<build>` suffix;
- *   - `equals-floor`: the version is the floor.
+ *   - `equals-client-pin`: the version is the approved client pin.
  */
-type PinRule = 'version' | 'no-range' | 'no-pre-release' | 'no-build-metadata' | 'equals-floor'
+type PinRule = 'version' | 'no-range' | 'no-pre-release' | 'no-build-metadata' | 'equals-client-pin'
 
 type PinVerdict = { ok: true } | { ok: false; broken: PinRule }
 
 /**
- * pin check: whether `spec` is one exact version equal to `floor`,
+ * pin check: whether `spec` is one exact version equal to the approved client pin,
  * with no range operator, pre-release suffix or build metadata; otherwise the
  * first {@link PinRule} it breaks.
  */
-function clientPinVerdict(spec: string, floor: string): PinVerdict {
+function clientPinVerdict(spec: string): PinVerdict {
   const parsed = semver.parse(spec)
   if (parsed === null) {
     return { ok: false, broken: semver.validRange(spec) === null ? 'version' : 'no-range' }
@@ -1639,40 +1639,40 @@ function clientPinVerdict(spec: string, floor: string): PinVerdict {
   if (spec !== bare) return { ok: false, broken: 'no-range' }
   if (parsed.prerelease.length > 0) return { ok: false, broken: 'no-pre-release' }
   if (parsed.build.length > 0) return { ok: false, broken: 'no-build-metadata' }
-  if (parsed.version !== floor) return { ok: false, broken: 'equals-floor' }
+  if (parsed.version !== CI_AD_CLIENT_VERSION) return { ok: false, broken: 'equals-client-pin' }
   return { ok: true }
 }
 
-/** The floor's next minor release: a later version than the floor. */
-const LATER_MINOR_VERSION = semver.inc(PHASE1_FLOOR_VERSION, 'minor')!
+/** The client's x-range (`<major>.<minor>.x`). */
+const CLIENT_X_RANGE = `${semver.major(CI_AD_CLIENT_VERSION)}.${semver.minor(CI_AD_CLIENT_VERSION)}.x`
 
-/** The floor's x-range (`<major>.<minor>.x`). */
-const FLOOR_X_RANGE = `${semver.major(PHASE1_FLOOR_VERSION)}.${semver.minor(PHASE1_FLOOR_VERSION)}.x`
-
-describe(`the pin checker gives each spec its verdict against the floor ${PHASE1_FLOOR_VERSION}`, () => {
-  test('the floor itself is the pin', () => {
-    expect(clientPinVerdict(PHASE1_FLOOR_VERSION, PHASE1_FLOOR_VERSION)).toEqual({ ok: true })
+describe(`the pin checker gives each spec its verdict against the approved client ${CI_AD_CLIENT_VERSION}`, () => {
+  test('the approved client release is the pin', () => {
+    expect(clientPinVerdict(CI_AD_CLIENT_VERSION)).toEqual({ ok: true })
   })
 
   test.each<[string, string, PinRule]>([
-    ['the caret range', `^${PHASE1_FLOOR_VERSION}`, 'no-range'],
-    ['the tilde range', `~${PHASE1_FLOOR_VERSION}`, 'no-range'],
-    ['the >= range', `>=${PHASE1_FLOOR_VERSION}`, 'no-range'],
-    ['the = form', `=${PHASE1_FLOOR_VERSION}`, 'no-range'],
-    ['the v form', `v${PHASE1_FLOOR_VERSION}`, 'no-range'],
-    ['the x-range', FLOOR_X_RANGE, 'no-range'],
+    ['the caret range', `^${CI_AD_CLIENT_VERSION}`, 'no-range'],
+    ['the tilde range', `~${CI_AD_CLIENT_VERSION}`, 'no-range'],
+    ['the >= range', `>=${CI_AD_CLIENT_VERSION}`, 'no-range'],
+    ['the = form', `=${CI_AD_CLIENT_VERSION}`, 'no-range'],
+    ['the v form', `v${CI_AD_CLIENT_VERSION}`, 'no-range'],
+    ['the x-range', CLIENT_X_RANGE, 'no-range'],
     ['the * wildcard', '*', 'no-range'],
-    ['an || alternation', `${OLD_AD_VERSION} || ${PHASE1_FLOOR_VERSION}`, 'no-range'],
+    ['an || alternation', `${OLD_AD_VERSION} || ${CI_AD_CLIENT_VERSION}`, 'no-range'],
     ['the latest dist-tag', 'latest', 'version'],
-    ['the floor release candidate', PHASE1_RC_VERSION, 'no-pre-release'],
-    ['the floor with build metadata', `${PHASE1_FLOOR_VERSION}+build.1`, 'no-build-metadata'],
-    ['a file: tarball path', `file:../${AD_PACKAGE}-${PHASE1_FLOOR_VERSION}.tgz`, 'version'],
-    ['a git spec', `git+https://github.com/example/${AD_PACKAGE}.git#v${PHASE1_FLOOR_VERSION}`, 'version'],
-    ['a URL spec', `https://registry.npmjs.org/${AD_PACKAGE}/-/${AD_PACKAGE}-${PHASE1_FLOOR_VERSION}.tgz`, 'version'],
-    ['the release before Phase 1', OLD_AD_VERSION, 'equals-floor'],
-    ['a later minor version', LATER_MINOR_VERSION, 'equals-floor'],
+    ['the client release candidate', `${CI_AD_CLIENT_VERSION}-rc.1`, 'no-pre-release'],
+    ['the client with build metadata', `${CI_AD_CLIENT_VERSION}+build.1`, 'no-build-metadata'],
+    ['a file: tarball path', `file:../${AD_PACKAGE}-${CI_AD_CLIENT_VERSION}.tgz`, 'version'],
+    ['a link: directory', `link:../${AD_PACKAGE}`, 'version'],
+    ['a git spec', `git+https://github.com/example/${AD_PACKAGE}.git#v${CI_AD_CLIENT_VERSION}`, 'version'],
+    ['a URL spec', `https://registry.npmjs.org/${AD_PACKAGE}/-/${AD_PACKAGE}-${CI_AD_CLIENT_VERSION}.tgz`, 'version'],
+    ['the release before Phase 1', OLD_AD_VERSION, 'equals-client-pin'],
+    ['the host floor', PHASE1_FLOOR_VERSION, 'equals-client-pin'],
+    ['an older client release above the floor', AD_FIXTURE_OTHER_VERSION, 'equals-client-pin'],
+    ['a newer client release', AD_FIXTURE_NEWER_VERSION, 'equals-client-pin'],
   ])('refuses %s (%s), breaking rule %s', (_label, spec, broken) => {
-    expect(clientPinVerdict(spec, PHASE1_FLOOR_VERSION)).toEqual({ ok: false, broken })
+    expect(clientPinVerdict(spec)).toEqual({ ok: false, broken })
   })
 })
 
@@ -1690,28 +1690,28 @@ function fixtureLock(root: NonNullable<BunLock['workspaces']>[string], entry: un
 }
 
 describe('the bun.lock pin reader reports what each fixture lock pins', () => {
-  const fileSource = `file:../${AD_PACKAGE}-${PHASE1_FLOOR_VERSION}.tgz`
+  const fileSource = `file:../${AD_PACKAGE}-${CI_AD_CLIENT_VERSION}.tgz`
 
   test.each<[string, BunLock, LockPin]>([
     [
-      'the floor pinned and resolved from the default registry',
-      fixtureLock({ dependencies: { [AD_PACKAGE]: PHASE1_FLOOR_VERSION } }, registryEntry(PHASE1_FLOOR_VERSION)),
+      'the approved client pinned and resolved from the default registry',
+      fixtureLock({ dependencies: { [AD_PACKAGE]: CI_AD_CLIENT_VERSION } }, registryEntry(CI_AD_CLIENT_VERSION)),
       {
-        workspaceSpec: PHASE1_FLOOR_VERSION,
+        workspaceSpec: CI_AD_CLIENT_VERSION,
         otherSections: [],
-        resolved: { id: `${AD_PACKAGE}@${PHASE1_FLOOR_VERSION}`, ref: PHASE1_FLOOR_VERSION, registry: '', integrity: FIXTURE_INTEGRITY },
+        resolved: { id: `${AD_PACKAGE}@${CI_AD_CLIENT_VERSION}`, ref: CI_AD_CLIENT_VERSION, registry: '', integrity: FIXTURE_INTEGRITY },
       },
     ],
     [
       'a workspace spec that does not match the resolution, also named in devDependencies',
       fixtureLock(
-        { dependencies: { [AD_PACKAGE]: `^${OLD_AD_VERSION}` }, devDependencies: { [AD_PACKAGE]: PHASE1_FLOOR_VERSION } },
-        registryEntry(PHASE1_FLOOR_VERSION),
+        { dependencies: { [AD_PACKAGE]: `^${OLD_AD_VERSION}` }, devDependencies: { [AD_PACKAGE]: CI_AD_CLIENT_VERSION } },
+        registryEntry(CI_AD_CLIENT_VERSION),
       ),
       {
         workspaceSpec: `^${OLD_AD_VERSION}`,
         otherSections: ['devDependencies'],
-        resolved: { id: `${AD_PACKAGE}@${PHASE1_FLOOR_VERSION}`, ref: PHASE1_FLOOR_VERSION, registry: '', integrity: FIXTURE_INTEGRITY },
+        resolved: { id: `${AD_PACKAGE}@${CI_AD_CLIENT_VERSION}`, ref: CI_AD_CLIENT_VERSION, registry: '', integrity: FIXTURE_INTEGRITY },
       },
     ],
     [
@@ -1742,30 +1742,34 @@ describe('the bun.lock pin reader reports what each fixture lock pins', () => {
   })
 })
 
-describe(`the real package.json and bun.lock pin ${AD_PACKAGE} at the floor ${PHASE1_FLOOR_VERSION} (hermetic)`, () => {
+describe(`the real package.json and bun.lock pin ${AD_PACKAGE} at the approved client ${CI_AD_CLIENT_VERSION} (hermetic)`, () => {
   test(`package.json names ${AD_PACKAGE} in dependencies and in no other section`, () => {
     const pkg = readPkg()
     expect(pkg.dependencies?.[AD_PACKAGE]).toBeDefined()
     expect(NON_RUNTIME_SECTIONS.filter((section) => Object.keys(pkg[section] ?? {}).includes(AD_PACKAGE))).toEqual([])
   })
 
-  test(`package.json's ${AD_PACKAGE} spec is the pin: one exact version equal to the floor`, () => {
-    expect(clientPinVerdict(readPkg().dependencies?.[AD_PACKAGE] ?? '', PHASE1_FLOOR_VERSION)).toEqual({ ok: true })
+  test(`package.json's ${AD_PACKAGE} spec is the pin: one exact version equal to the approved client`, () => {
+    expect(clientPinVerdict(readPkg().dependencies?.[AD_PACKAGE] ?? '')).toEqual({ ok: true })
+  })
+
+  test('the client pin separately satisfies the host compatibility floor', () => {
+    expect(semver.gte(readPkg().dependencies?.[AD_PACKAGE] ?? '', PHASE1_FLOOR_VERSION)).toBe(true)
   })
 
   test(`bun.lock's root workspace names ${AD_PACKAGE} with package.json's exact spec, in dependencies only`, () => {
     const { workspaceSpec, otherSections } = lockPin(readBunLock(), AD_PACKAGE)
-    expect([workspaceSpec, otherSections, clientPinVerdict(workspaceSpec ?? '', PHASE1_FLOOR_VERSION)]).toEqual([
+    expect([workspaceSpec, otherSections, clientPinVerdict(workspaceSpec ?? '')]).toEqual([
       readPkg().dependencies?.[AD_PACKAGE],
       [],
       { ok: true },
     ])
   })
 
-  test(`bun.lock resolves ${AD_PACKAGE}@<floor> from the default registry, with integrity`, () => {
+  test(`bun.lock resolves ${AD_PACKAGE}@<approved-client> from the default registry, with integrity`, () => {
     const resolved = lockPin(readBunLock(), AD_PACKAGE).resolved
     expect(resolved).toBeDefined()
-    expect([resolved!.id, resolved!.registry]).toEqual([`${AD_PACKAGE}@${PHASE1_FLOOR_VERSION}`, ''])
+    expect([resolved!.id, resolved!.registry]).toEqual([`${AD_PACKAGE}@${CI_AD_CLIENT_VERSION}`, ''])
     expect(resolved!.integrity).toStartWith('sha512-')
   })
 })

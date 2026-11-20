@@ -508,6 +508,7 @@ export const PERSONA_EPISODE_KIND_RELOAD_APPLY_FAILED = 'reload-apply-failed'
 
 /** Every notice or log-only diagnostic kind with a latch here. */
 export const PERSONA_EPISODE_KINDS = [
+  'ad-input-unconfirmed', 'ad-delivery-unconfirmed',
   'message-not-saved',
   'delivery-stuck',
   'messages-waiting',

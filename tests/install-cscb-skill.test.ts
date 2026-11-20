@@ -58,12 +58,13 @@
  * (skill clause; design notes
  * ):
  *   - The pin: every `agent-director@<spec>` in the whole skill (a file-local
- *     extractor) equals `PHASE1_FLOOR_VERSION`, and equals `package.json`'s
+ *     extractor) equals `CI_AD_CLIENT_VERSION`, an exact release at or above
+ *     `PHASE1_FLOOR_VERSION`, and equals `package.json`'s
  * `dependencies['agent-director']`, read from the file; there is
  *     at least one. No
  *     `@latest` and no other dist-tag appears anywhere in the skill. Self-checks
- *     build `@latest`, a caret range of the floor, the floor's release
- *     candidate (`PHASE1_RC_VERSION`) and `OLD_AD_VERSION` from the shared
+ *     build `@latest`, a caret range, a release candidate, build metadata,
+ *     the floor and unequal releases from the shared
  *     versions; each is extracted and fails. The skill's whole prose carries
  *     no package-manager install command (the shared upgrade-forms row taken
  *     by its label; the skill runs no client install); self-checks put
@@ -103,6 +104,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 import type { UnreachableReason } from 'agent-director'
+import * as semver from 'semver'
 
 import { INSTALL_CHECK_NOTE_LABEL } from '../scripts/install-check.ts'
 import { PHASE1_FLOOR_VERSION, PHASE1_RUNBOOK_DOC, PHASE1_RUNBOOK_SECTION_TITLE, PUBLISHING_HOST_BLOCK_HEADING } from '../src/ad-version-gate.ts'
@@ -113,7 +115,7 @@ import {
   AD_SYSTEM_INSTALL_UNREACHABLE,
   AD_VERSION_FLOOR_UNREADABLE,
 } from '../src/install-check-labels.ts'
-import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
+import { AD_FIXTURE_NEWER_VERSION, AD_FIXTURE_OTHER_VERSION, CI_AD_CLIENT_VERSION, OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 import { UNREACHABLE_REASONS } from './test-helpers/install-check-fixtures.ts'
 import { classHeading, flat, headings, requiredSection, splitFences } from './test-helpers/markdown.ts'
 import { ROLLBACK_RUNBOOK_SECTION_TITLE, stepHeadingPrefix, stepNumberOf } from './test-helpers/runbooks.ts'
@@ -533,8 +535,17 @@ describe('install-cscb skill: the pinned agent-director client (hatch notes , )'
     expect(clientPins(skillContent).length).toBeGreaterThan(0)
   })
 
-  test('a pin other than the floor: every agent-director@<spec> in the skill is PHASE1_FLOOR_VERSION', () => {
-    expect(clientPins(skillContent).filter((spec) => spec !== PHASE1_FLOOR_VERSION)).toEqual([])
+  test('every agent-director@<spec> in the skill equals the approved client pin', () => {
+    expect(clientPins(skillContent).filter((spec) => spec !== CI_AD_CLIENT_VERSION)).toEqual([])
+  })
+
+  test('the approved client pin is an exact release at or above the host floor', () => {
+    const parsed = semver.parse(CI_AD_CLIENT_VERSION)
+    expect(parsed).not.toBeNull()
+    expect(parsed!.version).toBe(CI_AD_CLIENT_VERSION)
+    expect(parsed!.prerelease).toEqual([])
+    expect(parsed!.build).toEqual([])
+    expect(semver.gte(CI_AD_CLIENT_VERSION, PHASE1_FLOOR_VERSION)).toBe(true)
   })
 
   test("a pin other than package.json's: every agent-director@<spec> in the skill is package.json's dependencies['agent-director']", () => {
@@ -561,18 +572,22 @@ describe('install-cscb skill: the pinned agent-director client (hatch notes , )'
 
   test.each([
     ['@latest', 'latest'],
-    ['a caret range of the floor', `^${PHASE1_FLOOR_VERSION}`],
-    ["the floor's release candidate", PHASE1_RC_VERSION],
+    ['a caret range of the client', `^${CI_AD_CLIENT_VERSION}`],
+    ["the client's release candidate", `${CI_AD_CLIENT_VERSION}-rc.1`],
+    ['the client with build metadata', `${CI_AD_CLIENT_VERSION}+build.1`],
+    ['the host floor', PHASE1_FLOOR_VERSION],
+    ['an older client release above the floor', AD_FIXTURE_OTHER_VERSION],
+    ['a newer client release', AD_FIXTURE_NEWER_VERSION],
     ['the release before Phase 1', OLD_AD_VERSION],
     ['an empty spec', ''],
   ])('self-check: %s is extracted and is not the pin', (_how, spec) => {
     const pins = clientPins(`The client is \`agent-director@${spec}\`; run nothing for agent-director@${spec}.`)
     expect(pins).toEqual([spec, spec])
-    expect(pins.filter((pin) => pin !== PHASE1_FLOOR_VERSION)).toEqual([spec, spec])
+    expect(pins.filter((pin) => pin !== CI_AD_CLIENT_VERSION)).toEqual([spec, spec])
   })
 
-  test('self-check: the floor itself is extracted and passes', () => {
-    expect(clientPins(`The client is \`agent-director@${PHASE1_FLOOR_VERSION}\`, as agent-director@${PHASE1_FLOOR_VERSION}.`)).toEqual([PHASE1_FLOOR_VERSION, PHASE1_FLOOR_VERSION])
+  test('self-check: the approved client itself is extracted and passes', () => {
+    expect(clientPins(`The client is \`agent-director@${CI_AD_CLIENT_VERSION}\`, as agent-director@${CI_AD_CLIENT_VERSION}.`)).toEqual([CI_AD_CLIENT_VERSION, CI_AD_CLIENT_VERSION])
   })
 
   test.each(['bun add agent-director@latest', 'pin @latest', 'npx claude-slack-channel-bots@next', 'agent-director@beta.'])(

@@ -371,7 +371,7 @@ describe('module properties', () => {
 
   test('runtime loads use built-ins and the import-safe Codex policy, with no production modules', () => {
     const specifiers = runtimeSpecifiers(stripComments(runnerSource()))
-    const allowed = (specifier: string): boolean => specifier.startsWith('node:') || specifier === 'bun' || specifier === 'bun:ffi' || specifier === './codex-login.ts' || specifier === './safe-docker-inspect.ts' || specifier === SHARED_MEMORY_MEASURE
+    const allowed = (specifier: string): boolean => specifier.startsWith('node:') || specifier === 'bun' || specifier === 'bun:ffi' || specifier === './codex-login.ts' || specifier === './safe-docker-inspect.ts' || specifier === './lib/ad-latest.ts' || specifier === SHARED_MEMORY_MEASURE
 
     expect(specifiers.length).toBeGreaterThan(0)
     expect(specifiers.filter((specifier) => !allowed(specifier))).toEqual([])
@@ -1429,6 +1429,8 @@ describe('validation: validation stages 2–8', () => {
     const lockDir = join(root, 'lock')
     const signals = createSignalSource({ clock })
     const deps: RunnerDeps = {
+      fetchAd: forbidden('fetchAd'),
+      readAdBaseRecord: forbidden('readAdBaseRecord'),
       spawn: recorder.spawn,
       env: { ...env, TMPDIR: tempDir },
       pid: VALIDATION_RUNNER_PID,

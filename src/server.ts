@@ -1,4 +1,7 @@
 #!/usr/bin/env bun
+import { createAdInputHoldStore, createAdInputHoldIo } from './ad-input-holds.ts'
+import { setSubmissionInputServices, prepareSubmissionInput } from './session-manager.ts'
+import { buildAdInputHoldNotice, buildAdDeliveryUnconfirmedNotice, buildAdInputOutcomeLine } from './ad-input-notices.ts'
 /**
  * Slack Channel for Claude Code
  *
@@ -1631,6 +1634,7 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   await reactHandoffDrained
   await deliveryPreparation?.stop()
   await deliveryStopping
+  setSubmissionInputServices(undefined)
   clearNotConnectedEpisodes()
   await remindersStopping
   await deliveryClients?.close()
@@ -2072,9 +2076,10 @@ export function _buildReconnectSessionAdapter(
 ):(key: string) => Promise<'success' | ReconnectEscalateDead | 'transient' | 'pending'> {
   // `key` is the persona key.
   const run: (key: string) => Promise<'success' | ReconnectEscalateDead | 'transient' | 'pending'> = async (key: string) => {
+    prepareSubmissionInput(key)
     const upgrade = await inspectPersonaUpgrade(key, getPersona?.(key) ?? appliedPersona(key))
     if (upgrade !== 'current') { if (!isLiveRowSequenceRunning(key)) deliveryLifecycle?.defer(key); return 'transient' }
-    if (getSessionByPersona(key)?.connected === true && !deliveryLifecycle?.reconnectInput(key)) { deliveryLifecycle?.clearDeferred(key); return 'success' }
+    if (getSessionByPersona(key)?.connected === true && !deliveryLifecycle?.reconnectInput(key) && !deliveryLifecycle?.inputHeld(key)) { deliveryLifecycle?.clearDeferred(key); return 'success' }
     if (deliveryLifecycle?.owner(key) !== undefined && deliveryLifecycle.owner(key) !== 'free') { deliveryLifecycle.defer(key); return 'transient' }
     if (deliveryLifecycle && !await deliveryLifecycle.recoverBeforeReconnect(key)) { if (!isLiveRowSequenceRunning(key)) deliveryLifecycle.defer(key); return 'transient' }
     let state: string
@@ -2202,7 +2207,7 @@ export function _buildReconnectSessionAdapter(
       // restart.ts relaunches after a `dead` re-probe with no kill.
       return escalateDeadWith(verdict)
     }
-    // 'transient' — nothing typed, no sweep, nothing counted.
+    // A held or transient input never sweeps, restarts or counts a failure.
     return 'transient'
   }
   return async key => {
@@ -3918,12 +3923,31 @@ export async function main(): Promise<void> {
     onError: error => console.error(`[slack] deferred reconnect failed: ${describeThrownValue(error)}`),
   })
   setDeliveryLifecycle(deliveryLifecycle)
+  const inputHolds = createAdInputHoldStore({ stateDir: STATE_DIR, now: Date.now, io: createAdInputHoldIo() })
+  const loadedInputKeys = new Set<string>()
+  const loadInputHold = (key: string): void => {
+    if (loadedInputKeys.has(key)) return
+    const reading = inputHolds.load(key)
+    loadedInputKeys.add(key)
+    if (reading.kind === 'record' && reading.record.step === 'text-ready') {
+      deliveryLifecycle!.rememberReconnectInput(key, { session: reading.record.binding.sessionId, launchStartedAt: reading.record.binding.launchStartedAt })
+    } else if (reading.kind !== 'clear') {
+      deliveryLifecycle!.holdInput(key)
+      noticeEpisodes.begin(key, 'ad-input-unconfirmed')
+      noticeEpisodes.post(key, 'ad-input-unconfirmed', buildAdInputHoldNotice(getAppliedPersona(key) ?? { key }, inputHolds.path(key)))
+    }
+  }
+  for (const persona of personaConfig.personas) loadInputHold(persona.key)
+  setSubmissionInputServices({ holds: inputHolds, prepare: loadInputHold, released: key => { noticeEpisodes.end(key, 'ad-input-unconfirmed') }, log: line => console.error(line), notify: (key, text) => {
+    noticeEpisodes.begin(key, 'ad-input-unconfirmed')
+    noticeEpisodes.post(key, 'ad-input-unconfirmed', text)
+  } })
   setDeliveryPersonaLookup(getAppliedPersona)
   deliveryClients = createDeliveryClientFactory(agentDirectorCallTimeoutMsOf(personaConfig))
   const deferredReconnect = _buildReconnectSessionAdapter(getAppliedPersona, key => conflictLatch.isLatched(key), getAppliedPersona, { noNotice: true })
   deliveryEngines = createDeliveryEngines({
     queue: deliveryQueue!, lifecycle: deliveryLifecycle,
-    clientFor: key => deliveryClients!.clientFor(key),
+    clientFor: key => { loadInputHold(key); return deliveryClients!.clientFor(key) },
     call: (key, verb, client, run) => withOutageDetection(key, undefined, verb, c => run(c), { client: client as Client, armsNothing: { personaConfigured: () => !!getAppliedPersona(key) } }),
     instanceId: personaInstanceId,
     persona: key => { const p = getAppliedPersona(key); return p ? { cwd: p.working_directory } : undefined },
@@ -3943,6 +3967,11 @@ export async function main(): Promise<void> {
     inspectUpgrade: (key, _row, client, beforeCall) => deliveryScope.run(key, client as Client, beforeCall, async () => { await inspectPersonaUpgrade(key, getAppliedPersona(key)) }),
     refreshTranscript: (key, client, beforeCall) => deliveryScope.run(key, client as Client, beforeCall, () => refreshDeliveryTranscript(key)),
     onKeyError: handleDeliveryKeyError,
+    onSubmissionUnconfirmed: (key, facts, row) => {
+      console.error(buildAdInputOutcomeLine({ personaRef: key, site: 'delivery', facts, state: row.state }))
+      noticeEpisodes.begin(key, 'ad-delivery-unconfirmed')
+      noticeEpisodes.post(key, 'ad-delivery-unconfirmed', buildAdDeliveryUnconfirmedNotice(getAppliedPersona(key) ?? { key }))
+    },
     onCoveredBlocked: key => { void personaNotifier.notify(key, buildCoveredDeliveryBlockedNotice(getAppliedPersona(key) ?? { key })) },
     onReadError: handleDeliveryReadError,
     isRestartPendingOrActive, scheduleRestart,
@@ -3954,7 +3983,10 @@ export async function main(): Promise<void> {
       // absence. Keep the engine's GONE evidence unless a new pass started.
       return result === UNAVAILABLE_RETRY_RUN_NOW_RAN || result === UNAVAILABLE_RETRY_RUN_NOW_ARMED
     },
-    onEvent: event => deliveryEngineEvents.emit(event),
+    onEvent: event => {
+      if (event.type === 'item-delivered') noticeEpisodes.end(event.key, 'ad-delivery-unconfirmed')
+      deliveryEngineEvents.emit(event)
+    },
     onError: (key, error) => console.error(`[slack] delivery persona=${key}: ${describeThrownValue(error)}`),
     onInfo: (key, message) => console.log(`[slack] delivery persona=${key}: ${message}`),
     reconnect: (key, client, beforeCall) => deliveryScope.run(key, client as Client, beforeCall, async () => {

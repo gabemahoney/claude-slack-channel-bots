@@ -77,7 +77,7 @@ client-tarball SHA-256 values in `/opt/agent-director/client/release.json`.
 Test 1 unpacks the client privately under CSCB's own `node_modules`, so its
 imports resolve the exact local tarball. Candidate checks retain content,
 native error exports, binary identity, client minimum-binary floor and
-Client.create checks; only the shipped dependency-pin/Phase-1-floor equality
+Client.create checks; only the shipped dependency-pin equality
 check is inapplicable to this explicit overlay. CSCB's own runtime floor still
 runs. No npm prerelease publication, host install or package/lockfile edit is
 needed. Ordinary image prerequisites still apply if the base is missing.
@@ -88,7 +88,7 @@ uncovered launch. With a truly covered candidate launch those legacy legs
 are omitted explicitly: changing `get` cannot turn its real native transport
 into a legacy one. Held/lookup/final/unknown cases inject synthetic custody
 facts into the packed executor with an explicit fixture transport, because
-the pinned 0.12.0 client cannot serialize E2 options. The stub has no native
+the pinned 0.18.8 client cannot serialize E2 options. The stub has no native
 FileChanged/asyncRewake route; this is not proof of E2's client serializer,
 native Claude delivery, actual turn start, or E6 conditional pause. Run the
 real Claude scenarios against the supplied E2 pair for that evidence;
@@ -812,8 +812,19 @@ input is set; this project's host invocation uses the CI family.
 
 ### The base image
 
-The test image is built `FROM` the base image `cscb-ci-base:v10`, the one
-`docker/Dockerfile.test`'s `FROM` line names. It is built once per host. When
+The test image is built `FROM` the base image `cscb-ci-base:v11`, the one
+`docker/Dockerfile.test`'s `FROM` line names. Every admission first checks the
+runtime/client pins against GitHub Latest and npm `latest`, verifies release
+commit/digests and package/lock consistency, and validates a present base's
+release record by immutable image ID. Stale pins, digest mismatch, failed
+lookup and mismatched cached base produce **FAIL**, with no override,
+warning or offline path, including selective/candidate runs. Appearing and
+just-built bases must also pass before the test image builds.
+
+Use the [strict-check failure codes and recovery](../../../docker/README.md#strict-latest-agent-director-check):
+update/commit pins and rebuild the base for drift, or restore lookup access
+and retry later for service failures. A present mismatched base is not
+silently rebuilt. The base is built once per host. When
 it is missing, the runner checks its build prerequisites before the
 admission lock, without changing anything, and refuses when one fails:
 

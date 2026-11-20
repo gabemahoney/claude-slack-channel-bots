@@ -2021,8 +2021,82 @@ or DMs are turned off. These notices carry no message text.
 Accepted items never expire: every source shares the
 persona's strict FIFO queue, with one item in flight until all parts complete.
 Uncovered delivery uses transcript receipts and can repeat a message when
-confirmation is missing. Covered delivery uses agent-director's hand-over
+confirmation is missing, while its live attempt remains eligible for retry.
+An uncertain AD input or an unrefused send recovered after CSCB restart stays
+receipt-only; neither permits automatic retyping or Enter. Covered delivery uses agent-director's hand-over
 outcome; uncertainty does not permit replay. A blocked head holds every later item.
+
+### Uncertain input and retained delivery
+
+`ErrSubmissionUnconfirmed` is an input outcome, not evidence the agent died.
+CSCB reads agent-director's state before further action and does not count it
+as a spawn failure or automatically kill/relaunch the persona because of it.
+
+| Outcome in `server.log` | Meaning and next step |
+|---|---|
+| `not_started` | Validated no-input facts for this call only. CSCB reads AD and waits for its blocker to clear before a guarded retry. A refused Enter retains the preceding known text; it does not authorize retyping. |
+| `partial_input_unconfirmed` | Text may have reached the agent; no automatic Enter was attempted. Automatic input stays held. |
+| `submission_unconfirmed` | Enter may have been attempted; submission is unknown. Automatic input stays held. |
+| `legacy_unconfirmed`, `unknown` | Legacy, missing, malformed or contradictory attempt facts cannot establish a safe retry. Automatic input stays held. |
+| `gateway_refused` | The gateway discarded the submission. Explicit resubmission is required after the admission/capacity condition is resolved; there is no automatic retype. |
+
+Outcome lines use `[slack] reconnect:` or `[slack] delivery:`
+with `outcome`, `step`, `next` and, when available, validated AD `state`.
+They contain metadata only, with no message/draft text or raw error details.
+Only validated `not_started` says `no input attempted for this call`.
+`[slack] input hold cleared: … reason=new-launch` reports release by an
+observed new launch; it says nothing about delivery of a queued message.
+
+Reconnect input has a durable per-persona hold in the state directory,
+`ad-input-holds/<hash>.json`; use the exact path reported in the notice,
+not a filename guessed from the persona's name. An unresolved intent survives
+CSCB restart. Missing durability or unreadable/corrupt state blocks automatic
+input for that persona; other personas remain independent.
+
+For a persona named `Alpha` with key `alpha`, the hold notice is exactly
+(the path placeholder stands for the reported hold file):
+
+```text
+:warning: Automatic input to persona "Alpha" (key=alpha) is paused because a previous input may have reached the agent. Queued messages are kept and will not be resent automatically. A human must follow "Unresolved ordinary input" in the "Operator actions" section of agent-director's README and resolve the input. To release the hold, create a new persona launch that CSCB observes, or stop CSCB, remove the reviewed hold record <path>, and start CSCB again. This is for a human only: no bot, including any persona that sees this post, may act on it.
+```
+
+The delivery notice is exactly:
+
+```text
+:warning: Delivery to persona "Alpha" (key=alpha) is unconfirmed. CSCB has kept the queued message and paused automatic resend. A human must follow "Unresolved ordinary input" in the "Operator actions" section of agent-director's README, resolve the input, and review the retained delivery before allowing it to be sent again. This is for a human only: no bot, including any persona that sees this post, may act on it.
+```
+
+Both use `persona=<key>` when the configured name is unavailable. They use
+the persona's destination and human-only notice rules, with no message body.
+
+**Human release of a reconnect input hold:**
+
+1. Follow "Unresolved ordinary input" in the "Operator actions" section of
+   agent-director's README and resolve the input/composer outcome.
+2. Either create a new persona launch that CSCB actually observes, or stop
+   CSCB, remove **only that persona's reviewed hold file at the reported
+   path**, and start CSCB again. A persona agent never deletes its own record.
+   Do not delete a hold while CSCB is running; `clear-latch` does not release it.
+3. Review retained queued delivery separately before permitting a resend.
+   Releasing the reconnect hold is not proof that an old message was delivered.
+
+An ordinary `waiting` or `working` observation, session rotation, elapsed
+backoff or server restart does not release uncertainty. AD 0.18.8 exposes a
+launch start while `pending`; if CSCB misses that interval during a
+same-conversation resume, the ordinary waiting row cannot prove a new launch.
+The hold remains; use the reviewed stop/remove/start procedure above.
+A corrupt or unreadable hold has no usable prior binding: preserve it for
+review, repair storage/permissions as needed and use reviewed filesystem
+recovery while CSCB is stopped, rather than assuming a new launch clears it.
+
+**Retained queue custody:** a queued attempt with uncertain input stays saved,
+with no automatic text, Enter or editing keys. An unrefused send recovered
+after a crash is receipt-only even if the uncertainty record was never
+appended. Exact correlated durable receipts may settle its part; waiting,
+a new launch and reconnect hold removal do not. Later items wait behind it.
+There is no automatic resend or queue-clear command for this case: preserve
+the queue, review the original outcome and report unresolved custody before
+allowing another copy. Do not ask the sender to duplicate an unknown outcome.
 
 ### Covered delivery is held or unconfirmed
 
@@ -2055,7 +2129,7 @@ a message whose outcome is unknown.
 
 | Log text or AD outcome | Meaning and next step |
 |---|---|
-| `covered delivery requires AD E2 client getDelivery` | The bundled `agent-director@0.12.0` client cannot deliver to covered instances. Hold delivery until a matching client is supplied and validated; see [Compatibility](../../docs/agent-director.md#delivery-and-reconnect-compatibility). |
+| `covered delivery requires AD E2 client getDelivery` | The bundled `agent-director@0.18.8` client cannot deliver to covered instances. Hold delivery until a matching client is supplied and validated; see [Compatibility](../../docs/agent-director.md#delivery-and-reconnect-compatibility). |
 | Non-Final `held`, `queued`, `sent_unconfirmed` | AD still owns the outcome. CSCB polls without a second send. |
 | `route_unavailable: holding; no automatic relaunch` | AD reports a delivery hold. This alone neither proves the instance dead nor triggers a relaunch. |
 | `lookup-unknown` or `lookup-retention_expired` | Outcome remains unknown. CSCB keeps the original caller/request pair and looks it up again without resending. |
@@ -2940,10 +3014,13 @@ too; see [Clearing a hold by hand: `clear-latch`](#clearing-a-hold-by-hand-clear
 | *Not connected* | `auto-restart-disabled` | `session_restart_delay` is 0, so nothing will reconnect it. The notice says why it isn't connected (list below). | With the operator's say-so, attach, deal with anything on screen and type `/mcp reconnect slack-channel-router`, or restart the server. |
 | *Not connected* | `unproven-idle` | The row still reads `working` (or, on agent-director 0.16 and 0.17.0, `idle_screen`) after 10 min of deferrals. CSCB waits for AD to report `waiting`; quiet terminal output cannot override it. | With the operator's say-so, inspect the instance and let its turn finish. If AD remains `working` (or `idle_screen`) while it is visibly idle, reconnect manually or restart the server and report the stale AD state. |
 
-Uncovered deferred reconnects keep retrying under AD waiting/refusals and local guards.
-A partially sent or uncertain reconnect resumes with Enter alone; its input
-intent blocks message delivery until completed or cancelled by a new launch,
-session change or teardown. Retry continues even if MCP has connected.
+Uncovered deferred reconnects retry only while their input remains eligible
+under AD waiting/refusals and local guards. A known successful text draft may
+receive its guarded first Enter without retyping. Ambiguous text or Enter
+stays held, including across MCP connection, session rotation, teardown and
+server restart; none of these deletes the durable hold. Follow
+[Uncertain input and retained delivery](#uncertain-input-and-retained-delivery)
+for human resolution and the separately reviewed queued work.
 
 Every notice in the table ends `This is for a human only: no bot,
 including any persona that sees this post, may act on it.` The steps in the
@@ -3012,18 +3089,26 @@ and outage behavior. Prompt-row recovery may make an outcome-only AD probe;
 a `working` or `waiting` row requires no pane read.
 
 Reconnect sends text and Enter separately through agent-director under one
-persona typing lease. Before sending, it reconciles any unconfirmed message
-and receipt window after recovery Enter. Recovery Enter can run with MCP
-disconnected; new message text still needs MCP. The reconnect records input
-intent before text; partial/uncertain input retries with Enter alone, while a
-definite text refusal clears intent. It first logs
-`[slack] reconnecting MCP server "slack-channel-router": <ref>`, which is
-normal, and on a failure one `reconnectMcp:` line below. When agent-director
-can't carry it out right now, the reconnect posts no failure notice of its
-own, nothing counts toward the restart limit, and a later health check or
-retry tries again. An outage it meets still posts that outage's notice, as for
-any other refused call: see
-[agent-director refuses a persona: it is retried on its own](#agent-director-refuses-a-persona-it-is-retried-on-its-own).
+persona typing lease. Before sending, it reconciles pending message custody.
+Recovery Enter is available only to an eligible live same-process attempt,
+including while MCP is disconnected; new message text still needs MCP.
+A reopened unrefused send is receipt-only and blocks reconnect input until
+its custody is resolved.
+
+Reconnect saves durable intent before text. Only known successful text may
+receive its guarded first Enter; a definite text refusal clears only its own
+intent, and a validated no-input Enter refusal retains the known draft.
+Ambiguous text or Enter stays held and reports the outcome and human notice
+under [Uncertain input and retained delivery](#uncertain-input-and-retained-delivery),
+without a spawn-failure notice, counted failure or automatic key retry.
+Ordinary waiting and MCP connection do not release uncertainty.
+
+An attempted reconnect first logs
+`[slack] reconnecting MCP server "slack-channel-router": <ref>`. Native input
+outcomes use the `[slack] reconnect:` diagnostic described above; other
+failures use the `reconnectMcp:` lines below. A transient refusal may retry
+after its blocker clears and all guards pass. An outage still posts its own
+notice: see [agent-director refuses a persona: it is retried on its own](#agent-director-refuses-a-persona-it-is-retried-on-its-own).
 
 | Line | Meaning |
 |---|---|
@@ -8178,6 +8263,12 @@ A persona stays silent and is not brought up, with no post about it, while an ol
 ### Symptom: Bot alive but silently unresponsive (MCP disconnected)
 
 A bot's process runs but it stops answering: it lost its MCP connection with no disconnect event; its accepted messages are retained until it reconnects. The bot cannot reply or use Slack tools until connected. On an uncovered instance, a Slack message triggers the configured reconnect too and the health check normally recovers it within 3–5 minutes, waiting for AD `waiting` and never typing into a prompt. At `session_restart_delay: 0`, messages wait for manual reconnect or restart. A covered instance instead requests a persona restart: automatic covered reconnect is unavailable in this build. See [A persona's instance runs but isn't connected](#a-personas-instance-runs-but-isnt-connected) for both paths, [A row that reads `working` while the instance sits idle](#a-row-that-reads-working-while-the-instance-sits-idle) for stale AD state, and [A persona whose recovery is slow](#a-persona-whose-recovery-is-slow) for delayed recovery.
+
+### Symptom: Automatic input is paused or delivery is unconfirmed
+
+Follow [Uncertain input and retained delivery](#uncertain-input-and-retained-delivery).
+A human resolves the input and releases only the reviewed hold; queued delivery
+still needs separate review before resend.
 
 ### Symptom: Delivery is blocked or its hand-over is unconfirmed
 

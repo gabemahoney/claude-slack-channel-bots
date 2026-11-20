@@ -122,6 +122,12 @@ const SUPPORTED_PLATFORMS = ['linux-x64', 'darwin-arm64'] as const
  * them.
  */
 export const REQUIRED_ERR_NAMES = [
+  'ErrSubmissionUnconfirmed',
+  'ErrExperimentalAgentDisabled',
+  'ErrAgentCapabilityUnsupported',
+  'ErrModelMissing',
+  'ErrHostCredentialMissing',
+  'ErrTooManyIds',
   'ErrInvalidFlags',
   'ErrPermissionRequestNotFound',
   'ErrAmbiguousRequest',

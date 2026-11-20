@@ -14,6 +14,7 @@ import { cannedGetResult, makeStubClient, type CannedGetResult } from './agent-d
 import { appendTranscript, codexPromptEntry, endedTurn, promptEntry, replyEntry, writeTranscript } from './working-row-panes.ts'
 
 export async function makeEngineHarness(options: { onInfo?(key: string, message: string): void; keys?: string[]; constants?: DeliveryEngineDeps['constants']; stateDir?: string; queue?: DeliveryQueue; queueFs?: DeliveryQueueOptions['fs']; configuredAgent?: 'claude' | 'codex'; clientFor?: DeliveryEngineDeps['clientFor']; isUp?: DeliveryEngineDeps['isUp']; onRow?: DeliveryEngineDeps['onRow']; inspectUpgrade?: DeliveryEngineDeps['inspectUpgrade']; refreshTranscript?: DeliveryEngineDeps['refreshTranscript']; onEvent?: DeliveryEngineDeps['onEvent']; onCoveredBlocked?: DeliveryEngineDeps['onCoveredBlocked']
+  onSubmissionUnconfirmed?: DeliveryEngineDeps['onSubmissionUnconfirmed']
   /** Preparation's Slack client and name lookup, withdrawal time, log, persona and part limit; `clientFor` above is the engine's AD client. */
   preparation?: Partial<Pick<DeliveryPreparationDeps, 'clientFor' | 'resolveUserName' | 'now' | 'log' | 'persona' | 'tagMaxBytes'>> } = {}) {
   if (options.queue && !options.stateDir) throw new Error('an external queue needs its owned stateDir')
@@ -85,7 +86,7 @@ export async function makeEngineHarness(options: { onInfo?(key: string, message:
       prepare: (key, item) => preparation.owns(key, item.accepted.seq) ? preparation.prepare(key, item) : Promise.resolve(),
       isRestartPendingOrActive: key => personas.get(key)?.state.restartPending ?? false, scheduleRestart: (key, cwd) => restarts.push({ key, cwd }),
       reconnect: async (key, _client, beforeCall) => { beforeCall(); calls.push({ key, verb: 'reconnect', at: clock.now(), params: {} }) },
-      onInfo: options.onInfo, onCoveredBlocked: options.onCoveredBlocked, onRow: options.onRow, inspectUpgrade: options.inspectUpgrade, refreshTranscript: options.refreshTranscript, onEvent: event => { events.push(event); options.onEvent?.(event) }, onError: (_key, error) => errors.push(error),
+      onInfo: options.onInfo, onCoveredBlocked: options.onCoveredBlocked, onSubmissionUnconfirmed: options.onSubmissionUnconfirmed, onRow: options.onRow, inspectUpgrade: options.inspectUpgrade, refreshTranscript: options.refreshTranscript, onEvent: event => { events.push(event); options.onEvent?.(event) }, onError: (_key, error) => errors.push(error),
       onKeyError: async (_key, error) => { errors.push(error) },
     })
   }

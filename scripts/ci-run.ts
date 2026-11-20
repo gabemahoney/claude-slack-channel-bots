@@ -1,4 +1,6 @@
 #!/usr/bin/env bun
+import { parseAdPins, checkLatestAd, compareBaseAdRecord, formatAdCheckError, fetchReleasedAd, AD_BASE_RECORD_MAX_BYTES, AD_BASE_RECORD_PATH, type AdPins, type AdCheckError, type AdFetch, type AdBaseRecordRead } from './lib/ad-latest.ts'
+export type { AdBaseRecordRead } from './lib/ad-latest.ts'
 /**
  * scripts/ci-run.ts — the `/ci` host runner: it runs the integration scripts
  * in up to six capped, isolated shards from one pinned image, admitted under
@@ -143,6 +145,8 @@ export type ProcRead<T> =
 
 /** One child process to start. */
 export interface SpawnRequest {
+  readonly maxOutputBytes?: number
+  readonly timeoutMs?: number
   /** The program and its arguments; `argv[0]` is looked up on the environment's `PATH`. */
   readonly argv: readonly string[]
   /** The child's whole environment: nothing else reaches it. */
@@ -223,6 +227,8 @@ export type SignalOutcome = 'delivered' | 'no-such-process' | 'not-permitted'
  * line. Only `createRealRunnerDeps` binds the real ones.
  */
 export interface RunnerDeps {
+  readonly fetchAd: AdFetch
+  readonly readAdBaseRecord: (imageId: string) => Promise<AdBaseRecordRead>
   readonly codexLogin?: CodexLoginDeps
   /** Starts a child process (docker, git, npm, gh, the base-build step) with its own environment and process group. */
   readonly spawn: SpawnFn
@@ -283,6 +289,8 @@ export function createRealRunnerDeps(): RunnerDeps {
   const uid = process.getuid?.()
   if (uid === undefined) throw new Error('ci-run: this platform gives no user ID')
   return {
+    fetchAd: fetchReleasedAd,
+    readAdBaseRecord: imageId => readRealAdBaseRecord(imageId),
     spawn: safeRunnerSpawn,
     codexLogin: realCodexLoginDeps(path => {
       const opened = openLockFile(path)
@@ -354,6 +362,19 @@ export function safeRunnerSpawn(request: SpawnRequest): SpawnedChild {
       return { exitCode: 0, stdout: new TextEncoder().encode(selected.map(row => JSON.stringify(row)).join('\n') + '\n'), stderr: '' }
     } catch { return { exitCode: 1, stdout: new Uint8Array(), stderr: 'Safe Docker inspection could not be projected' } }
   })() }
+}
+
+/** Bounded file read from a previously inspected immutable base. No mounts or container environment overrides. */
+export async function readRealAdBaseRecord(imageId: string): Promise<AdBaseRecordRead> {
+  const fail = (): AdBaseRecordRead => ({ ok: false, error: { code: 'BASE_RECORD_READ_FAILED', source: 'base' } })
+  if (!/^sha256:[0-9a-f]{64}$/.test(imageId)) return fail()
+  const name = `cscb-ad-record-${cryptoRandomBytes(12).toString('hex')}`
+  const common = { env: childEnvironment(process.env), cwd: resolve(import.meta.dir, '..'), ownProcessGroup: true, maxOutputBytes: AD_BASE_RECORD_MAX_BYTES, timeoutMs: 20_000 }
+  try {
+    const result = await safeRunnerSpawn({ ...common, argv: ['docker', 'run', '--rm', '--name', name, '--pull=never', '--network=none', '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges', '--entrypoint', '/usr/bin/cat', imageId, AD_BASE_RECORD_PATH] }).result
+    return result.exitCode === 0 && result.stdout.length <= AD_BASE_RECORD_MAX_BYTES && result.stderr === '' ? { ok: true, bytes: result.stdout } : fail()
+  } catch { return fail() }
+  finally { await safeRunnerSpawn({ ...common, timeoutMs: 5000, argv: ['docker', 'rm', '--force', name] }).result }
 }
 
 /** A thrown value's message on one line. */
@@ -514,15 +535,18 @@ function deliverLine(onLine: (line: string) => void, line: string): void {
  * pipe; a read error ends the read, cancels the stream so the pipe closes, and
  * answers the bytes read so far with the error on one line.
  */
-async function collectStream(stream: ReadableStream<Uint8Array>, onLine?: (line: string) => void): Promise<CollectedStream> {
+async function collectStream(stream: ReadableStream<Uint8Array>, onLine?: (line: string) => void, maxBytes = Infinity, abort?: () => void): Promise<CollectedStream> {
   const chunks: Uint8Array[] = []
   const decoder = new TextDecoder()
-  let pending = ''
+  let pending = '', size = 0
   let readError: string | null = null
   const reader = stream.getReader()
   try {
     for (let next = await reader.read(); !next.done; next = await reader.read()) {
-      chunks.push(next.value)
+      const room = maxBytes + 1 - size
+      chunks.push(next.value.subarray(0, Math.max(0, room)))
+      size += next.value.length
+      if (size > maxBytes) { readError = 'output bound exceeded'; abort?.(); await reader.cancel().catch(() => undefined); break }
       if (onLine === undefined) continue
       const lines = (pending + decoder.decode(next.value, { stream: true })).split('\n')
       pending = lines.pop() ?? ''
@@ -581,15 +605,16 @@ function spawnChild(request: SpawnRequest): SpawnedChild {
     }
   }
   const started = child
+  const timer = request.timeoutMs === undefined ? undefined : setTimeout(() => started.kill('SIGKILL'), request.timeoutMs)
   const result = Promise.all([
-    collectStream(started.stdout, request.onOutputLine),
-    collectStream(started.stderr, request.onOutputLine),
+    collectStream(started.stdout, request.onOutputLine, request.maxOutputBytes, () => started.kill('SIGKILL')),
+    collectStream(started.stderr, request.onOutputLine, request.maxOutputBytes, () => started.kill('SIGKILL')),
     started.exited,
   ]).then(([stdout, stderr, exited]) => ({
     exitCode: started.signalCode === null ? exited : SIGNAL_EXIT_STATUS_BASE + (osConstants.signals[started.signalCode] ?? 0),
     stdout: stdout.bytes,
     stderr: childStderrText(stdout, stderr),
-  }))
+  })).finally(() => { if (timer !== undefined) clearTimeout(timer) })
   return {
     pid: started.pid,
     processGroup: request.ownProcessGroup ? started.pid : null,
@@ -10045,10 +10070,12 @@ export type BaseImageStage =
       readonly ok: false
       /** No kind; one reason naming the failed check. */
       readonly refusal: Refusal
+      /** A strict AD admission failure also ends the composed run with FAIL. */
+      readonly adFailure?: AdCheckError
     }
 
 /** What step 4 acts through. */
-export type BaseImageDeps = Pick<RunnerDeps, 'spawn' | 'env' | 'worktreeRoot' | 'clock'>
+export type BaseImageDeps = Pick<RunnerDeps, 'spawn' | 'env' | 'worktreeRoot' | 'clock' | 'fetchAd' | 'readAdBaseRecord'>
 
 /** The run-state fields step 4 records. */
 export type BaseImageRunState = Pick<RunState, 'baseImage' | 'baseBuildToken'>
@@ -10113,8 +10140,28 @@ async function checkBaseBuildPrerequisites(deps: BaseImageDeps, state: BaseImage
  * in `state.baseBuildToken`. A failed check is a refusal with no kind, its
  * one reason naming the check; records it. Never throws.
  */
+export function adLatestRefusalReason(error: AdCheckError): string {
+  return `latest agent-director: ${formatAdCheckError(error)}; update and commit pins or restore lookup access, rebuild the base and rerun /ci/prepare`
+}
+function readAdPins(root: string) {
+  try { return parseAdPins({ dockerfile: readFileSync(join(root, 'docker/Dockerfile.test.base'), 'utf8'), packageJson: readFileSync(join(root, 'package.json'), 'utf8'), lockfile: readFileSync(join(root, 'bun.lock'), 'utf8') }) }
+  catch { return { ok: false as const, error: { code: 'PINS_UNREADABLE' as const, source: 'pins' as const } } }
+}
+async function validateAdBase(deps: BaseImageDeps, imageId: string, pins: AdPins): Promise<AdCheckError | undefined> {
+  try {
+    const read = await deps.readAdBaseRecord(imageId)
+    if (!read.ok) return read.error
+    const compared = compareBaseAdRecord(pins, read.bytes)
+    return compared.ok ? undefined : compared.error
+  } catch { return { code: 'BASE_RECORD_READ_FAILED', source: 'base' } }
+}
 export async function checkBaseImage(deps: BaseImageDeps, state: BaseImageRunState): Promise<BaseImageStage> {
   const refused = (reason: string): BaseImageStage => ({ ok: false, refusal: buildRefusal(null, reason) })
+  const adFailed = (error: AdCheckError): BaseImageStage => ({ ok: false, refusal: buildRefusal(null, adLatestRefusalReason(error)), adFailure: error })
+  const pins = readAdPins(deps.worktreeRoot)
+  if (!pins.ok) return adFailed(pins.error)
+  const latest = await checkLatestAd(pins.value, { fetchAd: deps.fetchAd, clock: deps.clock })
+  if (!latest.ok) return adFailed(latest.error)
   const name = readBaseImageName(deps.worktreeRoot)
   if (!name.ok) return refused(name.reason)
   const image = name.name
@@ -10122,6 +10169,8 @@ export async function checkBaseImage(deps: BaseImageDeps, state: BaseImageRunSta
   const found = await inspectImage(baseImageDockerContext(deps), image)
   if (!found.ok) return refused(baseImageCheckFailedReason(image, found.error))
   if (found.value !== null) {
+    const error = await validateAdBase(deps, found.value.id, pins.value)
+    if (error) return adFailed(error)
     const check: BaseImageCheck = { kind: 'present', image }
     state.baseImage = check
     return { ok: true, check, baseBuildToken: null, secrets: secretCredentialSet(deps.env) }
@@ -10425,8 +10474,13 @@ export async function runBaseBuild(deps: BaseBuildDeps, state: BaseBuildRunState
   if (base === null) throw new Error('runBaseBuild: step 4 recorded no base-image outcome')
   if (base.kind === 'present') return { kind: 'not-run', why: 'present-at-step-4' }
 
+  const validationFailure = (error: AdCheckError): BaseBuildStage => ({ kind: 'failed', run: { startedAtMs: deps.clock.now(), endedAtMs: deps.clock.now() }, exitCode: 1, failure: imageBuildFailure(`${FAIL_PREFIX}${adLatestRefusalReason(error)}`) })
+  const pins = readAdPins(deps.worktreeRoot)
+  if (!pins.ok) return validationFailure(pins.error)
   const again = await inspectImage(baseImageDockerContext(deps), base.image)
   if (again.ok && again.value !== null) {
+    const error = await validateAdBase(deps, again.value.id, pins.value)
+    if (error) return validationFailure(error)
     logBaseBuildLine(log, baseBuiltMeanwhileLine(base.image))
     return { kind: 'not-run', why: 'present-at-recheck' }
   }
@@ -10442,7 +10496,13 @@ export async function runBaseBuild(deps: BaseBuildDeps, state: BaseBuildRunState
   const run: BaseBuildRun = { startedAtMs, endedAtMs: deps.clock.now() }
   state.baseBuildRun = run
 
-  if (exit.exitCode === 0) return { kind: 'built', run }
+  if (exit.exitCode === 0) {
+    const built = await inspectImage(baseImageDockerContext(deps), base.image)
+    if (!built.ok || !built.value) return validationFailure({ code: 'BASE_RECORD_READ_FAILED', source: 'base' })
+    const error = await validateAdBase(deps, built.value.id, pins.value)
+    if (error) return validationFailure(error)
+    return { kind: 'built', run }
+  }
   if (exit.endedByHandle || state.firstStop !== null) return { kind: 'stopped', run, exitCode: exit.exitCode }
   return { kind: 'failed', run, exitCode: exit.exitCode, failure: imageBuildFailure(baseImageBuildFailedLine(exit.exitCode)) }
 }
@@ -15641,6 +15701,7 @@ export interface RunSequence {
   controller: FaultController | null
   /** The test or base image build's failure, not one a stop ended (image preparation). */
   imageBuildFailure: Failure | null
+  adAdmissionFailed: boolean
   /** An internal error's failure line, when one ended steps 3–13 (`internalErrorFailureLine`). */
   internalErrorLine: string | null
   /** When the first run-level stop came; null for none. */
@@ -15843,6 +15904,7 @@ function createRunSequence(deps: RunnerDeps, run: RunContext, validated: Validat
     shards: [],
     controller: null,
     imageBuildFailure: null,
+    adAdmissionFailed: false,
     internalErrorLine: null,
     firstStopTiming: null,
     resultsWritten: false,
@@ -16073,7 +16135,17 @@ async function admitRun(seq: RunSequence): Promise<SequencePartOutcome> {
   // Step 4: the base image, and its build's prerequisites when it is missing.
   if (enterStep(seq, 'base-image-check')) return TO_END_OF_RUN
   const base = await checkBaseImage(deps, seq.state)
-  if (!base.ok) return refuseUnlessStopped(seq, base.refusal)
+  if (!base.ok) {
+    if (base.adFailure) {
+      seq.adAdmissionFailed = true
+      if (!runStopRecorded(seq)) {
+        seq.imageBuildFailure = imageBuildFailure(`${FAIL_PREFIX}${adLatestRefusalReason(base.adFailure)}`)
+        seq.say(seq.imageBuildFailure.line)
+      }
+      return TO_END_OF_RUN
+    }
+    return refuseUnlessStopped(seq, base.refusal)
+  }
   // Step 5: packing.
   if (enterStep(seq, 'packing')) return TO_END_OF_RUN
   await takePerformanceBuildLock(seq)
@@ -16628,7 +16700,8 @@ async function runSteps(seq: RunSequence): Promise<number> {
     if (seq.refusalBeingRecorded) throw err
     seq.internalErrorLine = internalErrorFailureLine(dependencyErrorText(err))
   }
-  return finishRun(seq)
+  const exit = await finishRun(seq)
+  return seq.adAdmissionFailed ? FAILURE_EXIT_STATUS : exit
 }
 
 // The end of run.

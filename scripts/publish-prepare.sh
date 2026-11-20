@@ -43,6 +43,7 @@
 #   15  SR-2.5  preflight: host agent-director missing, its version unreadable, or
 #                below the installed agent-director client's minimum (or that
 #                minimum unreadable); names the switch-over runbook section
+#   16  SR-2.8  latest agent-director lookup, pins or base identity failed
 #   20  SR-3.1  npm version bump failed, OR CHANGELOG.md has no '## Unreleased'
 #                heading, OR its rewrite to the release's heading failed
 #   --  SR-3.2  rollback, no exit code of its own. Runs on the 20, 21, 22, 23
@@ -139,6 +140,16 @@ PREFLIGHT_EXIT=0
 bash "${SCRIPT_DIR}/preflight.sh" "${BUMP_KIND}" || PREFLIGHT_EXIT=$?
 if [ "${PREFLIGHT_EXIT}" != "0" ]; then
   sr_exit "${PREFLIGHT_EXIT}"
+fi
+
+# A fresh release/provenance gate, before any version or release mutation.
+AD_LATEST_EXIT=0
+bun "${SCRIPT_DIR}/ad-latest-check.ts" || AD_LATEST_EXIT=$?
+if [ "${AD_LATEST_EXIT}" != "0" ]; then
+  if [ "${AD_LATEST_EXIT}" != "16" ]; then
+    echo 'SR-2.8 (latest agent-director): adapter failed; restore lookup access and rerun /ci/prepare' >&2
+  fi
+  sr_exit 16
 fi
 
 FROM_VERSION="$(node -p "require('./package.json').version")"

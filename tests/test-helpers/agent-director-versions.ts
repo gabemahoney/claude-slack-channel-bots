@@ -55,9 +55,19 @@ export const PHASE1_RC_VERSION = `${PHASE1_FLOOR_VERSION}-rc.1`
 export const OLD_AD_VERSION = '0.10.0'
 
 /** b.iy3's approved release-gate runtime, independent of CSCB's client/floor. */
-export const CI_AD_RUNTIME_VERSION = '0.17.1'
-/** Peeled v0.17.1 release tag; a checkout's HEAD is not runtime provenance. */
-export const CI_AD_RUNTIME_COMMIT = 'c794af3865d113d85573601fdcc70bdc842b3471'
+export const CI_AD_RUNTIME_VERSION = '0.18.8'
+/** Peeled release tag; a checkout's HEAD is not runtime provenance. */
+export const CI_AD_RUNTIME_COMMIT = 'f2c9ce525e3c37e41e4884818354ffe8e793c8fb'
+/** Published client identity, independent of the host compatibility floor. */
+export const CI_AD_CLIENT_VERSION = '0.18.8'
+/** Unequal released identities for latest-check and exact-pin rejection controls. */
+export const AD_FIXTURE_OTHER_VERSION = '0.18.7'
+export const AD_FIXTURE_NEWER_VERSION = '0.18.9'
+export const CI_AD_BINARY_SHA256 = '39a2ee907d5561b7a16764a7a919f6cf381596f21741e3505565cb7866085e82'
+export const CI_AD_ADMIN_SHA256 = '7c6a27da2eb513361616d3a98f9e563360305a24f3f11f20face8e36a9d3730c'
+export const CI_AD_INSTALLER_SHA256 = '696dde6e05f421c9bb4d2b0450944de588d5397522737d35762c519318903eec'
+export const CI_AD_CLIENT_SHA256 = '35fc7769872d3fc926748c80fa3251beec7a36505ea530c017471326a828d475'
+export const CI_AD_CLIENT_INTEGRITY = 'sha512-2oby1UXq3EXPIGVnjhBESFXuHFM4gLpiKbLQR/Q2k+vg3Wd7b60gh7MZaQQId6JLasrpR2l9+oFHKEt3tybs4A=='
 
 /** Last release with displayed values in state and aged permission prompts. */
 export const LEGACY_DISPLAYED_STATE_AD_VERSION = '0.17.0'

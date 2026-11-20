@@ -1,4 +1,4 @@
-# docker/Dockerfile.test.base — the /ci base image, cscb-ci-base:v10.
+# docker/Dockerfile.test.base — the /ci base image, cscb-ci-base:v11.
 #
 # Source-independent layers shared by the /ci image (docker/Dockerfile.test)
 # and the /ci-live image (docker/Dockerfile.live). From the repo build context
@@ -8,7 +8,7 @@
 #
 #   docker build --network=host --secret id=gh_token,env=GH_TOKEN \
 #     --build-context agent-director-install=<directory holding install.sh> \
-#     -f docker/Dockerfile.test.base -t cscb-ci-base:v10 .
+#     -f docker/Dockerfile.test.base -t cscb-ci-base:v11 .
 #
 # agent-director is the release pinned below (AD_VERSION, AD_COMMIT): its
 # binaries come from agent-director's GitHub release, installed by that
@@ -204,11 +204,11 @@ RUN --mount=type=secret,id=gh_token set -eu; \
 # AD_VERSION and AD_COMMIT. The build then checks that the first
 # agent-director on PATH is the release's, that no other PATH directory holds
 # one, and that no agent-director-admin is on PATH.
-ARG AD_VERSION=0.17.1
-ARG AD_COMMIT=c794af3865d113d85573601fdcc70bdc842b3471
-ARG AD_SHA256=a3ec40103c170a9070b89681d0d723ea741f3c1f47eb3f0a4f284f7c5160e57c
-ARG AD_ADMIN_SHA256=86ccfacb48a439c04a446d92416fbc1c420a3f8a732f9bd52022abc9d926e490
-ARG AD_INSTALL_SH_SHA256=9bc73dd6542414e06473ac6ef5bc01d9c6943e61fd80708d7e483aafa6aa51cc
+ARG AD_VERSION=0.18.8
+ARG AD_COMMIT=f2c9ce525e3c37e41e4884818354ffe8e793c8fb
+ARG AD_SHA256=39a2ee907d5561b7a16764a7a919f6cf381596f21741e3505565cb7866085e82
+ARG AD_ADMIN_SHA256=7c6a27da2eb513361616d3a98f9e563360305a24f3f11f20face8e36a9d3730c
+ARG AD_INSTALL_SH_SHA256=696dde6e05f421c9bb4d2b0450944de588d5397522737d35762c519318903eec
 RUN --mount=type=bind,from=agent-director-install,target=/mnt/agent-director-install \
     set -eu; \
     AD_TAG="v${AD_VERSION}"; \
@@ -316,8 +316,8 @@ COPY --chmod=0755 docker/ad-client-check.sh /opt/agent-director/check/ad-client-
 # equal the tarball's, it exports the Phase 1 classes, and it pairs with the
 # release's binary first on PATH. The check's summary line is the last line
 # this layer prints.
-ARG AD_CLIENT_VERSION=0.12.0
-ARG AD_CLIENT_TGZ_SHA256=66265d3ed575732312b1df43aab1eb328be910798f2a22ddb4cb86026c0d5340
+ARG AD_CLIENT_VERSION=0.18.8
+ARG AD_CLIENT_TGZ_SHA256=35fc7769872d3fc926748c80fa3251beec7a36505ea530c017471326a828d475
 RUN set -eu; \
     AD_CHECK=/opt/agent-director/check/ad-client-check.sh; \
     CLIENT_DIR=/opt/agent-director/client; \
@@ -347,8 +347,7 @@ RUN set -eu; \
     "${AD_CHECK}" --client "${GLOBAL_CLIENT}"
 
 # Legacy displayed-state contract: real 0.17.0 binaries, kept off PATH.
-# The installer at v0.17.0 is byte-identical to v0.17.1's; verify that pin
-# before copying it. This fixture never replaces the default runtime/client.
+# Fetch and verify its own installer independently of the runtime installer. This fixture never replaces the default runtime/client.
 ARG AD_LEGACY_VERSION=0.17.0
 ARG AD_LEGACY_COMMIT=3ece400076aba2e6e675d51fc0533b8430bb8f2f
 ARG AD_LEGACY_SHA256=9290d436b03f121df577f317a84166723acc2b3e90d4a2aeed53652cdf93d5fc
@@ -362,14 +361,15 @@ RUN set -eu; \
         || { echo "ERROR: could not download legacy agent-director binary" >&2; exit 1; }; \
     curl -fsSL -o "${LEGACY_DIR}/admin/agent-director-admin" "${LEGACY_URL}/agent-director-admin-linux-amd64" \
         || { echo "ERROR: could not download legacy agent-director-admin binary" >&2; exit 1; }; \
+    curl -fsSL -o "${LEGACY_DIR}/install/install.sh" "https://raw.githubusercontent.com/gabemahoney/agent-director/v${AD_LEGACY_VERSION}/skills/install-agent-director/install.sh" \
+        || { echo "ERROR: could not download legacy installer" >&2; exit 1; }; \
     printf '%s  %s\n' "${AD_LEGACY_SHA256}" "${LEGACY_DIR}/bin/agent-director" \
         "${AD_LEGACY_ADMIN_SHA256}" "${LEGACY_DIR}/admin/agent-director-admin" \
-        "${AD_LEGACY_INSTALL_SH_SHA256}" /opt/agent-director/install/install.sh \
+        "${AD_LEGACY_INSTALL_SH_SHA256}" "${LEGACY_DIR}/install/install.sh" \
         | sha256sum --check --status \
         || { echo "ERROR: legacy agent-director fixture digest mismatch" >&2; exit 1; }; \
-    install -m 0755 /opt/agent-director/install/install.sh "${LEGACY_DIR}/install/install.sh"; \
     chmod -R a+rX "${LEGACY_DIR}"; \
-    chmod 0755 "${LEGACY_DIR}/bin/agent-director" "${LEGACY_DIR}/admin/agent-director-admin"; \
+    chmod 0755 "${LEGACY_DIR}/bin/agent-director" "${LEGACY_DIR}/admin/agent-director-admin" "${LEGACY_DIR}/install/install.sh"; \
     for legacy_bin in "${LEGACY_DIR}/bin/agent-director" "${LEGACY_DIR}/admin/agent-director-admin"; do \
         LEGACY_ID=$("${legacy_bin}" version) \
             || { echo "ERROR: legacy fixture version probe failed" >&2; exit 1; }; \

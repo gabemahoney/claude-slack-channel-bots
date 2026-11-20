@@ -265,6 +265,7 @@ function threadMemoryShutdown(bindings: Record<string, unknown>): () => Promise<
   expect(last).toBeGreaterThan(first)
   return expression(`async () => { ${statements.slice(first, last + 1).join('\n')} }`, {
     deliveryPreparation: undefined, deliveryStopping: undefined, remindersStopping: undefined, deliveryClients: undefined,
+    setSubmissionInputServices: (services: unknown) => { expect(services).toBeUndefined() },
     reactHandoffDrained: undefined, clearNotConnectedEpisodes: () => {}, buildThreadMemorySealNotSavedLine, ...bindings,
   })
 }
@@ -6197,7 +6198,7 @@ describe('delivery ownership wiring', () => {
   test('delivery uses independent configured clients through outage wrapping, with the same latch and held guards', () => {
     expect(onlyCallArgs('createDeliveryClientFactory')).toEqual(['agentDirectorCallTimeoutMsOf(personaConfig)'])
     const engine = onlyCallProps('createDeliveryEngines')
-    expect(engine.get('clientFor')).toBe('key => deliveryClients!.clientFor(key)')
+    expect(engine.get('clientFor')).toBe('key => { loadInputHold(key); return deliveryClients!.clientFor(key) }')
     expect(engine.get('call')).toContain('withOutageDetection(key, undefined, verb, c => run(c), { client: client as Client, armsNothing:')
     expect(engine.get('isLatched')).toBe('key => conflictLatch.isLatched(key)')
     expect(engine.get('isHeld')).toContain('invalidFlagsHold.isHeld(key)')
@@ -8237,7 +8238,7 @@ describe('typed delivery reporting production wiring', () => {
     expect(onlyCallProps('createDeliveryPreparation').get('onReceived')).toBe('(key, item) => deliveryReporting?.received(key, item)')
     expect(onlyCallProps('createPersonaRouting').get('onReceived')).toBe("(key, item, mode) => { if (deliveryReporting) deliveryReporting.received(key, item, mode) else if (mode === 'recovered') bufferedHeldReleases.set(`${key}:${item.accepted.seq}`, { key, item }) }")
     const engine = onlyCallProps('createDeliveryEngines')
-    expect(engine.get('onEvent')).toBe('event => deliveryEngineEvents.emit(event)')
+    expect(engine.get('onEvent')).toBe("event => { if (event.type === 'item-delivered') noticeEpisodes.end(event.key, 'ad-delivery-unconfirmed') deliveryEngineEvents.emit(event) }")
     expect(engine.get('inspectUpgrade')).toContain('deliveryScope.run(key, client as Client, beforeCall,')
     expect(engine.get('inspectUpgrade')).toContain('inspectPersonaUpgrade(key, getAppliedPersona(key))')
     expect(engine.get('refreshTranscript')).toContain('deliveryScope.run(key, client as Client, beforeCall, () => refreshDeliveryTranscript(key))')

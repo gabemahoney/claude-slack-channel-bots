@@ -266,7 +266,7 @@ export function deadLivenessReading(rowRead?: DeadRowRead): DeadLivenessReading 
  * string, or a row in any other state, whose field is ignored). No parsing or
  * ageing. Never throws.
  */
-export function pendingLaunchStartOf(result: StatusResult | null | undefined): string | undefined {
+export function pendingLaunchStartOf(result: Pick<StatusResult, 'state' | 'launch_started_at'> | null | undefined): string | undefined {
   try {
     if (result === null || result === undefined) return undefined
     if (result.state !== AGENT_DIRECTOR_PENDING_STATE) return undefined

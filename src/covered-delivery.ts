@@ -29,7 +29,7 @@ export function buildCoveredDeliveryBlockedNotice(persona: { key: string; name?:
 export function hasUnresolvedCoveredCustody(item: QueueItem): boolean {
   const refused = new Set(item.records.flatMap(r => r.kind === 'refused' ? [r.attempt] : []))
   const delivered = new Set(item.records.flatMap(r => r.kind === 'delivered' ? [r.part] : []))
-  return item.records.some(r => r.kind === 'submission-blocked' || (r.kind === 'submitted' && !refused.has(r.attempt) && !delivered.has(r.part)))
+  return item.records.some(r => (r.kind === 'submission-blocked' && r.reason !== 'ad-input-unconfirmed') || (r.kind === 'submitted' && !refused.has(r.attempt) && !delivered.has(r.part)))
 }
 
 export function isCoveredRow(row: GetResult): boolean { return row.busy_send === 'covered' }

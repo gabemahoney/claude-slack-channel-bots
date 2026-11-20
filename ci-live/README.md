@@ -29,12 +29,12 @@ exception is `hgx`, which takes a value only as an argument (see
     created on the current VM through mail.tm's API, and its address is also
     in `/tmp/cscb-test-mailbox-address.txt`.
 - On the VM: docker, the `/ci` base image (check with
-  `bun scripts/safe-docker-inspect.ts docker image inspect cscb-ci-base:v10`;
+  `bun scripts/safe-docker-inspect.ts docker image inspect cscb-ci-base:v11`;
   if confirmed missing, run `/ci` once with `CSCB_AD_SRC_DIR` set: see
   `docker/README.md`; an inspection error stops the check, with no raw fallback), Google Chrome
   (`google-chrome --version`), bun, and `CSCB_AD_SRC_DIR` set to a checkout
   of agent-director's source tree holding the tag of the release the base
-  pins (`ARG AD_VERSION` in `docker/Dockerfile.test.base`, `v0.17.1`). A run
+  pins (`ARG AD_VERSION` in `docker/Dockerfile.test.base`, `v0.18.8`). A run
   takes its agent-director binary explicitly: the release's
   `agent-director-linux-amd64`, downloaded from agent-director's GitHub
   release into a scratch directory and checked against the base's pinned
@@ -42,7 +42,7 @@ exception is `hgx`, which takes a value only as an argument (see
   Steps 5 and 6 pass it with `--agent-director-binary`, and the runner
   stages that file in the live image without running it on the host. The
   image build checks its version, commit and SHA-256 against the runtime
-  record and proves the independently pinned `0.12.0` client accepts it.
+  record and proves the independently pinned `0.18.8` client accepts it.
   Without the option the runner stages the host's own agent-director
   binary, which the build refuses unless it is that release's (see "The
   live image's agent-director" in `docker/README.md`).
@@ -72,6 +72,15 @@ changes a mode itself.
 A VM reboot can loosen these modes: at boot the pod's `fsGroup` re-applies
 its group to the files. After a reboot, check the modes with the `stat`
 above before a run.
+
+The base pins runtime and client `0.18.8`; the runtime's peeled release commit
+is `f2c9ce525e3c37e41e4884818354ffe8e793c8fb`. The client pin is independent
+of the unchanged host floor `0.12.0`. A `/ci` admission must pass the
+[strict latest and cached-base check](../docker/README.md#strict-latest-agent-director-check):
+stale pins, digest mismatch, lookup failure and mismatched provenance FAIL
+without an offline path or override. Update pins and rebuild for drift, or
+restore lookup access and retry later; the live runner's binary check remains
+separate. See [the base's provenance record](../docker/README.md#what-the-base-holds).
 
 ## Membership readiness in a run
 

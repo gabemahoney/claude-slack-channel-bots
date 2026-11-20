@@ -15,7 +15,7 @@ import { applyDeliveryOwnRowRead, handleDeliveryKeyError, recoverDeliveryGone, s
 import { LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION, LIVE_ROW_LAUNCH_RESUME, LIVE_ROW_OUTCOME_LAUNCHED } from '../src/live-row-sequence.ts'
 import { KILL_RETRY_TRIES } from '../src/kill-retry.ts'
 import { UNAVAILABLE_RETRY_MODE_PENDING_ONLY, UNAVAILABLE_RETRY_RUN_NOW_ARMED, UNAVAILABLE_RETRY_RUN_NOW_CLOSED, UNAVAILABLE_RETRY_RUN_NOW_RAN, UNAVAILABLE_RETRY_RUN_NOW_RUNNING, UNAVAILABLE_RETRY_STOP_ROW_LIVE, type UnavailableRetryController, type UnavailableRetryRunNowResult } from '../src/unavailable-retry.ts'
-import { cannedPermissionRequest, errCallTimeout, errConfigMalformed, errDialogMaybeOpen, errInstanceIdCollision, errInternal, errInvalidFlags, errPaneChanged, errRelayFallenBack, errSendKeysWhileRelayed, errSpawnNotFound, errSpawnNotInteractive, errSystemInstallDisappeared, errTmuxNotAvailable, errTmuxSendKeys, errTmuxSessionConflict, errTmuxUnresponsive, errUnusableName } from './test-helpers/agent-director-stub.ts'
+import { cannedFindMissing, cannedStatusResult, cannedPermissionRequest, errCallTimeout, errConfigMalformed, errDialogMaybeOpen, errInstanceIdCollision, errInternal, errInvalidFlags, errPaneChanged, errRelayFallenBack, errSendKeysWhileRelayed, errSpawnNotFound, errSpawnNotInteractive, errSystemInstallDisappeared, errTmuxNotAvailable, errTmuxSendKeys, errTmuxSessionConflict, errTmuxUnresponsive, errUnusableName } from './test-helpers/agent-director-stub.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
 import { partialReceiptText, partialReceiptSuffix } from './test-helpers/partial-receipt.ts'
 import { noticedRecord, sentRecord, refusedRecord, deliveredRecord, fixedRecord, heldSlackInput, HOLD_FIELDS, memoryHold, injectedInput, makeQueue, postHold, reactionInput, readQueue, seedQueue, slackInput, unknownRootPostHold } from './test-helpers/delivery-queue.ts'
@@ -33,6 +33,19 @@ afterEach(async () => { for (const h of harnesses.splice(0).reverse()) await h.c
 async function harness(options: Parameters<typeof makeEngineHarness>[0] = {}) { const h = await makeEngineHarness(options); harnesses.push(h); return h }
 async function start(h: EngineHarness, key = 'alpha') { await h.tick(key) }
 async function delivered(h: EngineHarness, key = 'alpha') { await h.until(() => h.queue.openCount(key) === 0) }
+
+/** Establish a live draft with a successfully observed, swallowed first
+ * Enter. Later assertions count recovery calls after this verified prefix. */
+async function liveRetainedDraft(h: EngineHarness, text: string) {
+  const p = h.p()
+  p.autoReceipt = false; p.lostEnters = 1
+  await h.tick(); await h.advance(ENTER_DELAY_MS)
+  expect(h.keyCalls().map(c => c.params.key ?? c.params.text)).toEqual([text, 'Enter'])
+  expect(p.box).toBe(text)
+  expect(h.records().filter(r => r.kind === 'sent')).toMatchObject([{ send_kind: 'text', attempt: 1 }])
+  p.connected = false
+  h.calls.length = 0
+}
 
 async function hold(h: EngineHarness, ts: string = THREAD_ROOTS.secondary, key = 'alpha', field: (at: number) => HoldField = memoryHold) {
   const input = heldSlackInput(field(h.clock.now()), { ts, key: { chat_id: 'C0TEST001', ts } })
@@ -488,8 +501,8 @@ function productionAbsentRecovery(
     UNAVAILABLE_RETRY_RUN_NOW_RUNNING, UNAVAILABLE_RETRY_RUN_NOW_CLOSED)
 }
 
-/** Restart with an unconfirmed text attempt and a stale AD waiting row.
- * Only AD's Enter outcome establishes that the old session is gone. */
+/** A live send whose first Enter succeeds without a receipt; its recovery
+ * Enter then reports the fault against a stale AD waiting row. */
 async function goneRecovery(options: {
   delay?: number; pending?: boolean; holdKill?: boolean; refusedKills?: number; keyError?: () => Error; recoverAbsent?: boolean
 } = {}) {
@@ -502,7 +515,7 @@ async function goneRecovery(options: {
   let path = join(h.stateDir, 'old-session.jsonl')
   writeTranscript(path, [])
   let row = personaRow(h, key, { state: 'waiting', session_id: 'old-session', jsonl_path: path })
-  let resumed = false, draft = '', failed = false, restartAsks = 0, handoffs = 0, killAttempts = 0, up = true
+  let resumed = false, draft = '', firstEnter = false, failed = false, restartAsks = 0, handoffs = 0, killAttempts = 0, up = true
   let readError: Error | undefined, statusError: Error | undefined, beforeGet: (() => Promise<void>) | undefined
   let afterKeyError: (() => void) | undefined
   let absent = false, acceptAbsent = true, absentHandoffs = 0
@@ -528,10 +541,14 @@ async function goneRecovery(options: {
       return { instance_id: row.instance_id }
     },
     getFn: () => readError ?? (absent ? errSpawnNotFound() : { ...row }),
-    statusFn: () => statusError ?? (absent ? errSpawnNotFound() : { state: row.state }),
+    statusFn: () => statusError ?? (absent ? errSpawnNotFound() : cannedStatusResult({ state: row.state })),
     sendKeysFn(params) {
       keys.push(params.key ?? params.text ?? '')
-      if (!resumed) { failed = true; return options.keyError?.() ?? errTmuxSendKeys() }
+      if (!resumed) {
+        if (params.no_enter && !firstEnter) { draft = params.text!; return {} }
+        if (!firstEnter) { firstEnter = true; draft = ''; return {} }
+        failed = true; return options.keyError?.() ?? errTmuxSendKeys()
+      }
       if (params.no_enter) draft = params.text!
       else if (draft) { appendTranscript(path, [promptEntry(draft)]); draft = '' }
       return {}
@@ -553,7 +570,6 @@ async function goneRecovery(options: {
     const accepted = await queue.accept(key, injectedInput({ text: `message ${n}` }))
     if (accepted.status === 'failed') throw new Error('fixture acceptance failed')
     await queue.append(key, fixedRecord(accepted.seq, [`message ${n}`]))
-    if (n === 0) await queue.append(key, sentRecord(accepted.seq, 1, 'text', { part: 1, at: 0, session_id: row.session_id, transcript_path: path, transcript_size: 0 }))
   }
   // Reopen the actual on-disk journal as a new server process would.
   await queue.stop()
@@ -567,7 +583,7 @@ async function goneRecovery(options: {
       return run(client)
     },
     persona: () => ({ cwd: persona.working_directory }), isUp: () => up,
-    isLatched: () => h.latch.isLatched(key), isHeld: () => h.sequenceRunning(key), isConnected: () => resumed,
+    isLatched: () => h.latch.isLatched(key), isHeld: () => h.sequenceRunning(key), isConnected: () => !firstEnter || resumed,
     prepare: async () => {}, onRow: applyDeliveryOwnRowRead,
     onKeyError: async (...args) => { await handleDeliveryKeyError(...args); afterKeyError?.() },
     isRestartPendingOrActive: () => options.pending ?? false, scheduleRestart: () => { restartAsks++ },
@@ -599,6 +615,14 @@ async function goneRecovery(options: {
     beforeGet(hook?: () => Promise<void>) { beforeGet = hook },
     async advance() { await h.clock.advance(1000); await engine.tick(key) },
     async failRecoveryEnter() {
+      await engine.tick(key)
+      await h.clock.advance(1)
+      expect(firstEnter).toBe(true)
+      expect(keys).toEqual(['message 0', 'Enter'])
+      expect(readQueue(h.stateDir, key).filter(r => r.kind === 'sent')).toMatchObject([{ seq: 1, send_kind: 'text' }])
+      // Subsequent assertions count only recovery input, after proving the
+      // ordinary text/Enter prefix ran through this same engine instance.
+      keys.length = 0
       expect((await h.launch(key)).action).toBe('retrying')
       for (let n = 0; n < 100 && !failed; n++) await this.advance()
       expect(failed).toBe(true)
@@ -619,7 +643,7 @@ async function goneRecovery(options: {
   }
 }
 
-describe('AD GONE during durable startup recovery', () => {
+describe('AD GONE during live delivery recovery', () => {
   test.each([0, 60].flatMap(delay => [false, true].map(pending => [delay, pending] as const)))(
     'delay=%s, ordinary restart pending=%s: checked recovery resumes the conversation and drains FIFO', async (delay, pending) => {
       const f = await goneRecovery({ delay, pending })
@@ -630,9 +654,9 @@ describe('AD GONE during durable startup recovery', () => {
           kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_RESUME, reason: LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION,
         })
         expect(f.resumed()).toBe(true)
-        // Immediate AD waiting recovery can first defer to the launch in flight.
-        expect(f.handoffs()).toBe(2)
-        expect(f.owners).toEqual(['free', 'free'])
+        // The live-send fixture has no startup launch in flight at the fault.
+        expect(f.handoffs()).toBe(1)
+        expect(f.owners).toEqual(['free'])
         expect(f.restarts()).toBe(0)
         expect(f.h.stub.calls.killCalls).toHaveLength(1)
         expect(f.h.stub.calls.findMissingCalls).toHaveLength(1)
@@ -1084,11 +1108,11 @@ describe('AD GONE during durable startup recovery', () => {
       const count = f.keys.length
       for (let n = 0; n < 5; n++) await f.advance()
       expect(f.keys).toHaveLength(count)
-      expect(f.handoffs()).toBe(2)
+      expect(f.handoffs()).toBe(1)
       await retryNow(f.h, f.key)
       await f.h.driveSequence(f.h.sequenceSettled(f.key))
       expect(f.resumed()).toBe(true)
-      expect(f.handoffs()).toBe(3)
+      expect(f.handoffs()).toBe(2)
       expect(f.h.stub.calls.killCalls).toHaveLength(KILL_RETRY_TRIES + 1)
       expect(f.h.stub.calls.resumeCalls).toHaveLength(1)
       expect(f.restarts()).toBe(0)
@@ -1362,7 +1386,7 @@ describe('durable FIFO and send sequence', () => {
       if (outcome === 'refused') throw errCallTimeout('find-missing')
       if (outcome === 'teardown') void h.engine.forget('alpha')
       if (outcome !== 'late-file' || sweeps.length > 1) p.row = { ...p.row, jsonl_path: p.path }
-      return { count: 0, ids: [], unverified: 0, unverified_ids: [] }
+      return cannedFindMissing()
     }
     try {
       await h.accept('provisional reference')
@@ -1448,9 +1472,9 @@ describe('fresh send guards', () => {
       expect(h.queue.openCount('alpha')).toBe(1)
       expect(h.queue.items('alpha')[0]).toMatchObject({ accepted: { text: partialReceiptText }, fixed: { parts: [partialReceiptText] } })
       expect(h.records().filter(record => record.kind === 'delivered')).toEqual([])
-      // Replay retains the existing recovery Enter for the uncertain attempt.
+      // Replay retains receipt-only custody; it cannot press another Enter.
       const replayKeys = h.keyCalls()
-      expect(replayKeys.map(call => call.params.key ?? call.params.text)).toEqual([partialReceiptText, 'Enter', 'Enter'])
+      expect(replayKeys.map(call => call.params.key ?? call.params.text)).toEqual([partialReceiptText, 'Enter'])
 
       appendTranscript(p.path, [{ ...promptEntry(partialReceiptSuffix), sessionId: p.row.session_id,
         timestamp: new Date(h.clock.now()).toISOString() }])
@@ -1603,17 +1627,28 @@ describe('Enter and at-least-once recovery', () => {
     if (change.startsWith('server-')) await h.restartServer()
     else if (change === 'session') p.row.session_id = 'resumed-session'
     else appendTranscript(p.path, [{ type: 'system', subtype: 'compact_boundary' }])
+    if (change === 'server-between-text-and-Enter') {
+      const keys = [...h.keyCalls()]
+      await h.advance(RECEIPT_WAIT_MS + RETYPE_BACKOFF_MS[0])
+      expect(h.keyCalls()).toEqual(keys)
+      expect(h.queue.openCount('alpha')).toBe(1)
+      appendTranscript(p.path, [promptEntry('message')])
+    }
     await delivered(h)
     expect(h.textCalls()).toHaveLength(1)
   })
-  test('a server crash after durable sent but before the first key recovers the unknown attempt and retypes its head', async () => {
+  test('a server crash after durable sent recovers receipt-only and keeps FIFO behind the unknown attempt', async () => {
     const h = await harness(); await h.accept('first'); await h.accept('second')
     await h.queue.append('alpha', sentRecord(1, 1, 'text', { part: 1, at: h.clock.now(), session_id: h.p().row.session_id, transcript_path: h.p().path, transcript_size: statSync(h.p().path).size }))
     expect(h.keyCalls()).toEqual([])
     await h.restartServer()
+    await h.advance(RECEIPT_WAIT_MS + RETYPE_BACKOFF_MS[0])
+    expect(h.keyCalls()).toEqual([])
+    expect(h.queue.openCount('alpha')).toBe(2)
+    appendTranscript(h.p().path, [promptEntry('first')])
     await delivered(h)
-    expect(h.textCalls().map(c => c.params.text)).toEqual(['first', 'second'])
-    expect(h.records().filter(r => r.kind === 'sent').map(r => 'send_kind' in r && r.send_kind)).toEqual(['text', 'enter', 'retype', 'text'])
+    expect(h.textCalls().map(c => c.params.text)).toEqual(['second'])
+    expect(h.records().filter(r => r.kind === 'sent' && r.seq === 1)).toHaveLength(1)
     expect(h.events.filter(e => e.type === 'delivered').map(e => e.seq)).toEqual([1, 2])
   })
 
@@ -1972,7 +2007,7 @@ describe('AD authority regressions', () => {
     expect(h.calls.filter(c => c.verb === 'read-pane')).toEqual([])
   })
 
-  test('a restart after an uncertain recovery Enter retries the retained text with Enter before the successor', async () => {
+  test('a restart after an uncertain recovery Enter waits for an exact receipt before the successor', async () => {
     const h = await harness(), p = h.p()
     p.lostEnters = 1
     let enters = 0
@@ -1982,9 +2017,15 @@ describe('AD authority regressions', () => {
     expect(h.records().filter(r => r.kind === 'sent').at(-1)).toMatchObject({ seq: 1, send_kind: 'enter', attempt: 2 })
     expect(h.queue.openCount('alpha')).toBe(2)
     p.keyHook = undefined
-    await h.restartServer(); await delivered(h)
+    const keys = [...h.keyCalls()]
+    await h.restartServer(); await h.advance(RECEIPT_WAIT_MS + RETYPE_BACKOFF_MS[0])
+    expect(h.keyCalls()).toEqual(keys)
+    expect(h.queue.openCount('alpha')).toBe(2)
+    expect(h.events.filter(e => e.type === 'delivered')).toEqual([])
+    appendTranscript(p.path, [promptEntry('head')])
+    await delivered(h)
     expect(h.textCalls().map(c => c.params.text)).toEqual(['head', 'successor'])
-    expect(h.records().filter(r => r.kind === 'sent').map(r => 'send_kind' in r && r.send_kind)).toEqual(['text', 'enter', 'enter', 'text'])
+    expect(h.records().filter(r => r.kind === 'sent').map(r => 'send_kind' in r && r.send_kind)).toEqual(['text', 'enter', 'text'])
     expect(h.events.filter(e => e.type === 'delivered').map(e => e.seq)).toEqual([1, 2])
   })
 
@@ -2090,13 +2131,14 @@ describe('b.2is pending journal recovery consumers', () => {
       // The reconnect gate itself must retry repair; no external compact call.
     }
     expect(await h.lifecycle.recoverBeforeReconnect('alpha')).toBe(false)
-    expect(h.keyCalls().map(c => c.params)).toEqual([{ instance_id: 'cscb_alpha', key: 'Enter' }])
-    // The shared AD stub writes an exact receipt for the retained draft on
-    // Enter. Only after durable receipt reconciliation may reconnect type.
+    expect(h.keyCalls()).toEqual([])
+    expect(h.queue.isWritable!('alpha')).toBe(true)
+    // Receipt-only replay cannot infer submission from journal repair.
+    appendTranscript(h.p().path, [promptEntry('retained delivery')])
     await h.advance(DELIVERY_ROW_POLL_MS)
     expect(await h.lifecycle.recoverBeforeReconnect('alpha')).toBe(true)
     expect(h.queue.item('alpha', 1)?.delivered).toBe(true)
-    expect(h.records().filter(r => r.kind === 'sent').map(r => 'send_kind' in r && r.send_kind)).toEqual(['text', 'enter'])
+    expect(h.records().filter(r => r.kind === 'sent').map(r => 'send_kind' in r && r.send_kind)).toEqual(['text'])
     expect(h.records().filter(r => r.kind === 'delivered')).toHaveLength(1)
     expect(h.textCalls()).toEqual([])
     expect(h.errors).toEqual([])
@@ -2126,17 +2168,17 @@ describe('disconnected delivery draft is recovered before reconnect control text
   async function retainedDraft(failRecoveryAppend = false) {
     const h = await harness()
     await h.accept('retained delivery'); await h.accept('successor')
-    const p = h.p()
-    p.connected = false; p.autoReceipt = false; p.box = 'retained delivery'
-    await h.queue.append('alpha', sentRecord(1, 1, 'text', { part: 1, at: 0, session_id: p.row.session_id, transcript_path: p.path, transcript_size: 0 }))
+    await liveRetainedDraft(h, 'retained delivery')
     if (failRecoveryAppend) h.failAppend('sent')
+    await h.advance(RECEIPT_WAIT_MS)
     expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(false)
     return h
   }
 
   test('an AD read timeout releases the lease without ending the recovery receipt wait', async () => {
     const h = await retainedDraft(), p = h.p()
-    expect(h.keyCalls()).toEqual([{ key: 'alpha', verb: 'send-keys', at: 0, params: { instance_id: 'cscb_alpha', key: 'Enter' } }])
+    const recoveryAt = h.clock.now()
+    expect(h.keyCalls()).toEqual([{ key: 'alpha', verb: 'send-keys', at: recoveryAt, params: { instance_id: 'cscb_alpha', key: 'Enter' } }])
     const timeout = errCallTimeout('get')
     p.getError = timeout
     await h.advance(DELIVERY_ROW_POLL_MS)
@@ -2145,7 +2187,7 @@ describe('disconnected delivery draft is recovered before reconnect control text
     p.getError = undefined
     await h.clock.advance(1)
     expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(false)
-    expect(h.clock.now()).toBe(DELIVERY_ROW_POLL_MS + 1)
+    expect(h.clock.now()).toBe(recoveryAt + DELIVERY_ROW_POLL_MS + 1)
     expect(h.engine.snapshot('alpha')?.e.timers.receipt).toBe(RECEIPT_WAIT_MS - DELIVERY_ROW_POLL_MS - 1)
     await h.advance(RECEIPT_WAIT_MS - DELIVERY_ROW_POLL_MS - 2)
     expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(false)
@@ -2153,7 +2195,7 @@ describe('disconnected delivery draft is recovered before reconnect control text
     await h.advance(1)
     expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(true)
     expect(h.keyCalls().map(c => c.params)).toEqual([{ instance_id: 'cscb_alpha', key: 'Enter' }])
-    expect(h.records().filter(r => r.kind === 'sent').map(r => [r.seq, 'send_kind' in r && r.send_kind, r.at])).toEqual([[1, 'text', 0], [1, 'enter', 0]])
+    expect(h.records().filter(r => r.kind === 'sent').map(r => [r.seq, 'send_kind' in r && r.send_kind, r.at])).toEqual([[1, 'text', 0], [1, 'enter', recoveryAt]])
     expect(h.records().filter(r => r.kind === 'delivered')).toEqual([])
     expect(h.queue.openCount('alpha')).toBe(2)
     expect(h.calls.filter(c => c.verb === 'read-pane' || c.verb === 'reconnect')).toEqual([])
@@ -2161,6 +2203,7 @@ describe('disconnected delivery draft is recovered before reconnect control text
 
   test('an exact recovery receipt permits reconnect early only after its delivered append is durable', async () => {
     const h = await retainedDraft(), p = h.p()
+    const recoveryAt = h.clock.now()
     await h.advance(DELIVERY_ROW_POLL_MS)
     const offset = statSync(p.path).size
     const receipt = { ...promptEntry('retained delivery'), uuid: 'recovery-receipt' }
@@ -2182,9 +2225,9 @@ describe('disconnected delivery draft is recovered before reconnect control text
       expect(h.events.filter(e => e.type === 'delivered')).toEqual([])
     } finally { releaseAppend() }
     expect(await recovering).toBe(true)
-    expect(h.clock.now()).toBeLessThan(RECEIPT_WAIT_MS)
+    expect(h.clock.now() - recoveryAt).toBeLessThan(RECEIPT_WAIT_MS)
     expect(h.records().filter(r => r.kind === 'delivered')).toEqual([
-      { v: 1, kind: 'delivered', seq: 1, part: 1, at: DELIVERY_ROW_POLL_MS, receipt: { path: p.path, uuid: receipt.uuid, offset } },
+      { v: 1, kind: 'delivered', seq: 1, part: 1, at: recoveryAt + DELIVERY_ROW_POLL_MS, receipt: { path: p.path, uuid: receipt.uuid, offset } },
     ])
     expect(h.events.filter(e => e.type === 'delivered')).toEqual([{ type: 'delivered', key: 'alpha', seq: 1, part: 1 }])
     expect(h.queue.openCount('alpha')).toBe(1)
@@ -2242,10 +2285,7 @@ describe('disconnected delivery draft is recovered before reconnect control text
       const h = await harness()
       await h.accept('retained delivery')
       const p = h.p()
-      p.connected = false
-      p.autoReceipt = false
-      p.box = 'retained delivery'
-      await h.queue.append('alpha', sentRecord(1, 1, 'text', { part: 1, at: 0, session_id: p.row.session_id, transcript_path: p.path, transcript_size: 0 }))
+      await liveRetainedDraft(h, 'retained delivery')
       let enters = 0
       p.keyHook = params => {
         if (params.key === 'Enter' && ++enters === 1) {
@@ -2254,6 +2294,7 @@ describe('disconnected delivery draft is recovered before reconnect control text
         }
         return undefined
       }
+      await h.advance(RECEIPT_WAIT_MS)
       expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(false)
       expect(h.keyCalls().map(c => c.params.key)).toEqual(['Enter'])
       if (fault !== 'none') {
@@ -2276,10 +2317,8 @@ test('a reconnect timer outlived by a six-second AD read resumes its retained co
   const h = await harness()
   await h.accept('delivery before reconnect')
   const p = h.p()
-  p.connected = false
-  p.autoReceipt = false
-  p.box = 'delivery before reconnect'
-  await h.queue.append('alpha', sentRecord(1, 1, 'text', { part: 1, at: 0, session_id: p.row.session_id, transcript_path: p.path, transcript_size: 0 }))
+  await liveRetainedDraft(h, 'delivery before reconnect')
+  await h.advance(RECEIPT_WAIT_MS)
   expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(false)
   await h.advance(RECEIPT_WAIT_MS + 1000)
   expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(true)
@@ -2953,7 +2992,9 @@ describe('Reaction Items in the FIFO', () => {
     p.box = 'retained draft'
     await h.queue.append('alpha', sentRecord(2, 1, 'text', { part: 1, at: 0, session_id: p.row.session_id, transcript_path: p.path, transcript_size: 0 }))
     expect(await h.lifecycle.recoverBeforeReconnect('alpha')).toBe(false)
-    expect(h.keyCalls().map(c => c.params)).toEqual([{ instance_id: 'cscb_alpha', key: 'Enter' }])
+    expect(h.keyCalls()).toEqual([])
+    expect(h.queue.item('alpha', 2)?.delivered).toBe(false)
+    appendTranscript(p.path, [promptEntry('retained draft')])
     await h.advance(DELIVERY_ROW_POLL_MS)
     expect(await h.lifecycle.recoverBeforeReconnect('alpha')).toBe(true)
     expect(h.queue.item('alpha', 2)?.delivered).toBe(true)

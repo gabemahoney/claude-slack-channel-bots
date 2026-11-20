@@ -88,6 +88,8 @@ const ROLLBACK_CHECKOUT = 'git checkout HEAD -- package.json bun.lock CHANGELOG.
 
 const RUN_TIMEOUT_MS = 20_000
 const TEST_TIMEOUT_MS = 30_000
+/** An injected CLI failure; the shell must relay this exact line once. */
+const LATEST_REFUSAL = 'SR-2.8 (latest agent-director): HTTP_STATUS github-release 503; restore lookup access and rerun /ci/prepare'
 
 // ---------------------------------------------------------------------------
 // CHANGELOG.md fixtures, built from blocks of lines
@@ -127,9 +129,11 @@ interface Fixture {
   changelogAtPack: string
   /** Where a failing SR-5.1 step records the paths staged when it failed. */
   stagedAtFailure: string
+  events: string
 }
 
 interface FixtureOptions {
+  latest?: 'ok' | 'refuse' | 'crash'
   changelog: string
   /** `fail-locked` also leaves a `.git/index.lock`, so the rollback's `git checkout` fails too. */
   pack?: 'ok' | 'fail' | 'fail-locked'
@@ -190,13 +194,15 @@ function makeFixture(opts: FixtureOptions): Fixture {
     bin: join(root, 'bin'),
     changelogAtPack: join(root, 'record', 'changelog-at-pack.md'),
     stagedAtFailure: join(root, 'record', 'staged-at-failure.txt'),
+    events: join(root, 'record', 'events.txt'),
   }
   for (const dir of [fx.home, join(fx.repo, 'scripts'), fx.bin, join(root, 'record'), join(root, 'pack', 'package')]) {
     mkdirSync(dir, { recursive: true })
   }
 
   copyFileSync(PREPARE_SCRIPT, join(fx.repo, 'scripts', 'publish-prepare.sh'))
-  writeExec(join(fx.repo, 'scripts', 'preflight.sh'), ['#!/usr/bin/env bash', 'exit 0'])
+  writeFileSync(fx.events, '')
+  writeExec(join(fx.repo, 'scripts', 'preflight.sh'), ['#!/usr/bin/env bash', `echo preflight >> ${JSON.stringify(fx.events)}`, 'exit 0'])
   writeExec(join(fx.repo, 'scripts', 'smoke-check.sh'), ['#!/usr/bin/env bash', 'exit 0'])
   writeFileSync(join(fx.repo, 'package.json'), packageJson(FROM_VERSION))
   writeFileSync(join(fx.repo, 'bun.lock'), 'LOCK v1\n')
@@ -206,12 +212,20 @@ function makeFixture(opts: FixtureOptions): Fixture {
   writeExec(join(fx.bin, 'npm'), [
     '#!/usr/bin/env bash',
     `[ "$*" = "version ${BUMP} --no-git-tag-version" ] || exit 1`,
+    `echo version >> ${JSON.stringify(fx.events)}`,
     "cat > package.json <<'EOF'",
     `${packageJson(NEXT_VERSION)}EOF`,
   ])
   writeExec(join(fx.bin, 'bun'), [
     '#!/usr/bin/env bash',
+    'if [[ "$1" == */ad-latest-check.ts ]]; then',
+    `  echo latest >> ${JSON.stringify(fx.events)}`,
+    ...(opts.latest === 'refuse'
+      ? [`  echo ${JSON.stringify(LATEST_REFUSAL)} >&2`, '  exit 16']
+      : opts.latest === 'crash' ? ['  exit 1'] : ['  exit 0']),
+    'fi',
     '[ "$*" = "pm pack" ] || exit 1',
+    `echo pack >> ${JSON.stringify(fx.events)}`,
     `cp CHANGELOG.md ${JSON.stringify(fx.changelogAtPack)}`,
     ...(opts.pack === 'fail' || opts.pack === 'fail-locked'
       ? [...(opts.pack === 'fail-locked' ? [': > .git/index.lock'] : []), 'echo "stub bun: pack failed" >&2', 'exit 1']
@@ -288,6 +302,26 @@ function expectRolledBack(fx: Fixture, head: string): void {
 // ---------------------------------------------------------------------------
 // Success: the release commit carries the versioned CHANGELOG.md
 // ---------------------------------------------------------------------------
+
+describe('b.bvq: prepare rechecks latest AD before release mutations', () => {
+  test.each(['refuse', 'crash'] as const)('%s: guarded exit 16 before bump, pack, commit, tag or manifest', latest => {
+    const fx = makeFixture({ changelog: unreleasedChangelog('## Unreleased'), latest })
+    const head = git(fx, 'rev-parse', 'HEAD')
+    const result = runPrepare(fx)
+    expect(result.code).toBe(16)
+    expect(readFileSync(fx.events, 'utf8').trim().split('\n')).toEqual(['preflight', 'latest'])
+    expectRolledBack(fx, head)
+    expect(existsSync(fx.changelogAtPack)).toBe(false)
+    expect(result.stderr.match(/SR-2\.8 \(latest agent-director\)/g)).toHaveLength(1)
+    if (latest === 'refuse') expect(result.stderr).toContain(LATEST_REFUSAL)
+  }, TEST_TIMEOUT_MS)
+
+  test('successful recheck runs after preflight and before bump and pack', () => {
+    const fx = makeFixture({ changelog: unreleasedChangelog('## Unreleased') })
+    expect(runPrepare(fx)).toEqual({ code: 0, stderr: '' })
+    expect(readFileSync(fx.events, 'utf8').trim().split('\n')).toEqual(['preflight', 'latest', 'version', 'pack'])
+  }, TEST_TIMEOUT_MS)
+})
 
 describe('prepare turns the unreleased entry into the release entry', () => {
   test.each(['## Unreleased', '## Unreleased (next minor version)'])(

@@ -189,6 +189,12 @@ export const STORE_OPEN_ERR_NAMES = [
 
 export {
   AgentDirectorError,
+  ErrExperimentalAgentDisabled,
+  ErrAgentCapabilityUnsupported,
+  ErrModelMissing,
+  ErrHostCredentialMissing,
+  ErrSubmissionUnconfirmed,
+  ErrTooManyIds,
   ErrInternal,
   ErrConfigMalformed,
   ErrSchemaMismatch,

@@ -12,6 +12,34 @@
 Conventions for unit tests are in `docs/testing-guide.md`; this file covers how
 to run each kind safely and how the integration suite is laid out.
 
+## Latest AD and uncertain-input coverage
+
+The base `cscb-ci-base:v11` pins AD runtime and client `0.18.8` independently
+of the unchanged host floor `0.12.0`. Runtime provenance is release commit
+`f2c9ce525e3c37e41e4884818354ffe8e793c8fb`, verified binary/admin/installer
+hashes and the npm client's separate tarball hash/integrity. The legacy
+`0.17.0` fixture fetches and verifies its own installer. See [the base records](../docker/README.md#what-the-base-holds)
+and [strict latest failure codes/recovery](../docker/README.md#strict-latest-agent-director-check).
+Every `/ci` admission and prepare recheck FAILs lookup, pin, digest or cached
+base drift without an offline path or override; candidate uses the same v11
+base. The next coordinated base bump is v11 to v12.
+
+| Regression files | Evidence |
+|---|---|
+| `ad-latest.test.ts`, `ad-latest-check.test.ts` | Injected bounded GitHub/npm provenance and base-record validation; prepare SR-2.8/exit 16, no network. |
+| `ci-run-lifecycle.test.ts`, `ci-live-docker.test.ts`, `ci-ad-runtime.test.ts`, `publish-prepare-changelog.test.ts` | Composed latest/base admission and publish-before-mutation checks, including release-digest, present-base and client-only-latest FAIL artifacts before any packing/build/shard; all discovered base consumers including candidate, independent client/floor and legacy installer checks. |
+| `ad-input-holds.test.ts`, `ad-input-holds-io.test.ts` | Durable reconnect intents, revision safety, IO/schema faults, no-follow production file access, strictly validated launch release and service callbacks; FIFO IO/load runs in a bounded isolated child process. |
+| `ad-input-notices.test.ts`, `ad-submission-classification.test.ts` | Ruled human-only notice pins/escaping, safe diagnostics and native outcome validation. |
+| `ad-submission-reconnect.test.ts`, `ad-submission-delivery.test.ts`, `ad-submission-edge.test.ts` | No blind text/Enter after uncertainty, including failed fresh AD reads through retry deadlines and durable reload; restart and interrupted-save custody, exact late receipts, multipart progress, CAS races, state-based launch release and isolation. |
+
+Recovered unrefused `sent` work is receipt-only: reopening a queue cannot send
+recovery Enter or retype, including a crash before `submission-blocked` was
+saved. A correlated durable receipt can settle its part; a new persona launch
+or cleared reconnect hold is not delivery proof. Existing delivery/recovery
+suites drive live same-process sends for retry behavior and keep crash recovery
+separate. No pane-text classification or new idle polling supplies proof.
+See [human recovery](../skills/debug-slack-channel-bots/SKILL.md#uncertain-input-and-retained-delivery).
+
 ## Running the unit suite
 
 Run `bun test` with a scratch HOME and state directory, and with the token
@@ -1279,7 +1307,7 @@ independently completed duplicate copies. They reject classifier stops
 with or without exact JSON, late linked stops, synthetic/API-error answers,
 fallback, unfinished duplicates and spoof actions, and reject `stop` mode.
 
-Run these controls only in the marked `cscb-ci-base:v10` image or a CI test
+Run these controls only in the marked `cscb-ci-base:v11` image or a CI test
 image derived from it (see
 `docker/README.md`), which supplies Bun, Python 3, Bash and jq. Set
 `AI_CONTROLS_PACKAGE` to the absolute `package/` directory extracted from a
@@ -1296,7 +1324,7 @@ docker run --rm --network none --memory 512m --cpus 1 --pids-limit 128 \
   --mount type=bind,src="$PWD/tests",dst=/tests,readonly \
   --mount type=bind,src="$AI_CONTROLS_PACKAGE",dst=/control/package,readonly \
   --mount type=bind,src="$PWD/node_modules",dst=/control/node_modules,readonly \
-  --entrypoint /usr/local/bin/bun cscb-ci-base:v10 \
+  --entrypoint /usr/local/bin/bun cscb-ci-base:v11 \
   /tests/real-agent/ai-readback-controls.ts
 ```
 
@@ -2117,7 +2145,7 @@ root, with the existing base image available (no pull/build):
     --mount "type=bind,src=$PWD/tests/runner.sh,dst=/source/runner.sh,readonly" \
     --mount "type=bind,src=$PWD/tests/runner-keep-going-controls.py,dst=/controls.py,readonly" \
     --mount "type=bind,src=$CI_CONTROL_LOCK,dst=/run/cscb-ci-performance.lock,readonly" \
-    --entrypoint /usr/bin/python3 cscb-ci-base:v10 /controls.py
+    --entrypoint /usr/bin/python3 cscb-ci-base:v11 /controls.py
 )
 ```
 
@@ -2295,7 +2323,7 @@ continues to mean every integration script.
 ### Version-specific displayed-state coverage (b.iy3)
 
 Tests 42 and 43 depend on test-1 and use fresh fmk HOME, store and tmux socket.
-Test 42 selects the current 0.17.1 release. Test 43 selects the separately verified,
+Test 42 selects the current 0.18.8 release. Test 43 selects the separately verified,
 off-PATH 0.17.0 release through `SCENARIO_AD_START=0.17.0`; it never downgrades the
 current store or changes the npm client. Both check the default image and
 installed runtime against the version, commit and digest release record.
@@ -2317,7 +2345,7 @@ key. This single-persona fixture does not rerun the connection-manager lifecycle
 
 Get/status observations and exact list assertions distinguish the versions:
 
-| List read | Current 0.17.1 | Legacy 0.17.0 |
+| List read | Current 0.18.8 | Legacy 0.17.0 |
 |---|---|---|
 | Raw `idle_screen` filter after the screen is unchanged | One row: `state=working`, `displayed_state=idle_screen` | One row: `state=idle_screen` |
 | Raw `working` filter at the same point | One row: `state=working`, `displayed_state=idle_screen` | Zero rows |
@@ -2568,8 +2596,8 @@ fmk mode. Sourcing also:
   `install_ad_legacy_displayed`, which installs the separately verified
   legacy displayed-state fixture only into a fresh agent-director directory,
   using this scenario's isolated HOME, store and tmux socket. The default
-  `release` selects 0.17.1; a shared-mode script that sets `SCENARIO_AD_START`
-  fails. All current-package legs keep the pinned 0.12.0 npm client;
+  `release` selects 0.18.8; a shared-mode script that sets `SCENARIO_AD_START`
+  fails. All current-package legs keep the pinned 0.18.8 npm client;
 - writes no agent-director `config.toml`, so agent-director runs on its
   default settings. Scenarios 10, 20 (Test 23) and 24 (Test 26) are the exceptions: they
   write a `[tmux]` table with `write_ad_settings` (see Harness agent-director
@@ -3157,8 +3185,8 @@ The contract for a scenario:
 
 These hold for every fmk script:
 
-- It runs on the current runtime (0.17.1 binary, agent-director-admin and
-  installer) with the separately pinned 0.12.0 client, unless it selects the
+- It runs on the current runtime (0.18.8 binary, agent-director-admin and
+  installer) with the separately pinned 0.18.8 client, unless it selects the
   0.10.0 migration fixture or the isolated 0.17.0 displayed-state fixture
   through `SCENARIO_AD_START`. It runs at
   agent-director's default settings, with no `config.toml`, unless it is
@@ -3319,7 +3347,7 @@ step; every other change replaces only the binary behind it:
 
 | Leg | Behind the shim, in order |
 |---|---|
-| set-up | the current runtime (0.17.1) |
+| set-up | the current runtime (0.18.8) |
 | 8a | 0.10.0 (`swap_ad_binary 0.10.0`), then the release |
 | 8b | the release; nothing at the standard path (`hide_ad_install` moves the shim and the binary aside, and no `agent-director` is on the server's PATH); the stand-in reporting no parseable version (`restore_ad_install_with_stand_in unparseable pass`); the release |
 | 8c | 0.10.0, then the release once the server has stopped |
@@ -3489,7 +3517,7 @@ report, no daemon running, only `version` calls through the shim since the
 start (the shim log is read whole, since the refused daemon never wrote its
 PID file), no new tmux session and no new stub record line.
 
-The image holds the current 0.17.1 runtime, separate 0.17.0 and 0.10.0
+The image holds the current 0.18.8 runtime, separate 0.17.0 and 0.10.0
 fixtures, and no release candidate, so 23a runs on
 the stand-in reporting `<next-patch-above-floor>-rc.1`, the form 8d's passing wrapper
 reports. `dev` is not a CSCB constant: the script quotes it, citing

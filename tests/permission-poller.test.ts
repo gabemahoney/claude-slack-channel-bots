@@ -664,7 +664,7 @@ describe('listed-row read budget', () => {
 
   test('older binary without state_changed_at is read every tick', async () => {
     const s = scenario()
-    s.row.state_changed_at = undefined
+    Reflect.deleteProperty(s.row, 'state_changed_at')
     const ivl = s.start()
     for (let i = 0; i < 3; i++) await ivl.tick()
     expect(s.gets()).toBe(3)

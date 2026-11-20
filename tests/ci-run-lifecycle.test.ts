@@ -157,6 +157,7 @@ import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, writtenFile } from './test-h
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { treeSnapshot } from './test-helpers/tree-snapshot.ts'
 import { BASE_IMAGE } from '../ci-live/lib/docker.ts'
+import { makeAdLatestFixture, adBytes, adJson, AD_FIXTURE_OTHER_VERSION, AD_FIXTURE_NEWER_VERSION, AD_FIXTURE_OTHER_DIGEST, AD_FIXTURE_OTHER_COMMIT } from './test-helpers/ad-latest.ts'
 
 // ===========================================================================
 // the RUN_ID, the run directory and the status file; main and
@@ -437,6 +438,8 @@ describe('shared runner helpers: ci-run lifecycle', () => {
           throw new Error(`${name} must not be called`)
         }
       const deps: RunnerDeps = {
+        fetchAd: forbidden('fetchAd'),
+        readAdBaseRecord: forbidden('readAdBaseRecord'),
         spawn: recorder.spawn,
         env: { TMPDIR: tempDir, ANTHROPIC_API_KEY: fakeToken(RAW_KEY_PREFIX, 'raw'), GH_TOKEN: fakeToken('', 'gh') },
         pid: RUNNER_PID,
@@ -1542,6 +1545,8 @@ describe('image preparation: the run\'s images and tags', () => {
 
   /** One image preparation case's world. */
   interface ImageRig {
+    readonly ad: ReturnType<typeof makeAdLatestFixture>
+    readonly adRecordReads: string[]
     /** The case's `mkdtempSync` root, removed in `afterEach`; the spawn recorder's side-effect root. */
     readonly root: string
     /** The constructed system temp directory, the environment's `TMPDIR`. */
@@ -1668,7 +1673,12 @@ describe('image preparation: the run\'s images and tags', () => {
       images: initialImageState(),
       imageBuildInProgress: null,
     }
-    const deps: BaseBuildDeps = { spawn: recorder.spawn, env, worktreeRoot, clock, sendSignal: signals.sendSignal }
+    const ad = makeAdLatestFixture()
+    const adRecordReads: string[] = []
+    const deps: BaseBuildDeps = { spawn: recorder.spawn, env, worktreeRoot, clock, sendSignal: signals.sendSignal,
+      fetchAd: ad.fetchAd,
+      readAdBaseRecord: async (imageId: string) => { adRecordReads.push(imageId); return { ok: true, bytes: ad.recordBytes } },
+    }
     const dockerContext: DockerContext = { spawn: recorder.spawn, env: { ...env }, cwd: worktreeRoot }
     const imagesContext: RunImagesContext = { docker: dockerContext, sendSignal: signals.sendSignal, owner: IMAGE_OWNER, clock, log }
 
@@ -1692,6 +1702,8 @@ describe('image preparation: the run\'s images and tags', () => {
     }
 
     return {
+      ad,
+      adRecordReads,
       root,
       tempDir,
       worktree,
@@ -1767,7 +1779,10 @@ describe('image preparation: the run\'s images and tags', () => {
         else answerGhToken({ personal: { stdout: `${token}\n` } })
       },
       answerBaseBuildStep(answer = {}) {
-        recorder.answer(baseBuildStepArgs(worktreeRoot), answer)
+        recorder.answer(baseBuildStepArgs(worktreeRoot), { ...answer, sideEffect: (files, request) => {
+          if (answer.notStarted === undefined && (answer.exitCode ?? 0) === 0) docker.addImage({ tags: [baseImageName()] })
+          answer.sideEffect?.(files, request)
+        } })
       },
     }
   }
@@ -1902,7 +1917,6 @@ describe('image preparation: the run\'s images and tags', () => {
       adInstallScriptUnreadableReason,
       adSourceDirUnsetReason,
       adTagMissingReason,
-      adVersionMissingReason,
       BASE_BUILD_STEP_PATH,
       BASE_DOCKERFILE_PATH,
       baseBuildTokenBadReason,
@@ -1954,6 +1968,41 @@ describe('image preparation: the run\'s images and tags', () => {
     }
 
     describe('step 4: the base image\'s name, existence and prerequisites', () => {
+      test.each([
+        ['empty', { adVersion: 'empty' }, 'PINS_INVALID'],
+        ['absent', { adVersion: 'absent' }, 'PINS_INVALID'],
+        ['unreadable', { base: 'absent' }, 'PINS_UNREADABLE'],
+      ] as const)('b.bvq: %s pin source refuses before network or build prerequisites', async (_label, dockerfiles, code) => {
+        const rig = makeE8Rig({ worktree: { dockerfiles } })
+        const stage = await checkBaseImage(rig.deps, rig.state)
+        expect(stage.ok).toBe(false)
+        if (!stage.ok) expect(stage.refusal.summary).toContain(code)
+        expect(rig.ad.requests).toEqual([])
+        expect(nonDockerArgvs(rig)).toEqual([])
+      })
+      test.each([true, false])('b.bvq: latest lookup failure refuses a %s-present base', async present => {
+        const rig = makeE8Rig()
+        if (present) rig.addBaseImage()
+        else rig.answerPrerequisites()
+        rig.ad.routes.set(rig.ad.urls.release, { status: 503, body: adBytes('untrusted body') })
+        const stage = await checkBaseImage(rig.deps, rig.state)
+        expect(stage.ok).toBe(false)
+        if (!stage.ok) expect(stage.refusal.summary).toContain('HTTP_STATUS')
+        expect(rig.adRecordReads).toEqual([])
+        expect(rig.state.baseImage).toBeNull()
+      })
+
+      test('b.bvq: a present base with an unequal identity is refused before use', async () => {
+        const rig = makeE8Rig()
+        const id = rig.addBaseImage()
+        rig.ad.recordBytes = adJson({ ...rig.ad.record, commit: '0'.repeat(40) })
+        const stage = await checkBaseImage(rig.deps, rig.state)
+        expect(stage.ok).toBe(false)
+        if (!stage.ok) expect(stage.refusal.summary).toContain('BASE_RECORD_MISMATCH')
+        expect(rig.adRecordReads).toEqual([id])
+        expect(rig.state.baseImage).toBeNull()
+      })
+
       const FROM_FORMS: readonly (readonly [string, string])[] = [
         ['a FROM naming another tag', `FROM ${BASE_BUILD_OTHER_BASE}\n`],
         ['a FROM with a flag and a stage name', `FROM --platform=linux/amd64 ${BASE_BUILD_OTHER_BASE} AS test\n`],
@@ -1970,13 +2019,15 @@ describe('image preparation: the run\'s images and tags', () => {
         imageAssertNoLeak({ stage: { ...stage, secrets: null }, logLines: rig.logLines })
       })
 
-      test('with the base present the spawn record shows only the existence query: no prerequisite check and no token lookup', async () => {
+      test('with the base present admission verifies latest and its immutable record, with no prerequisite/token lookup', async () => {
         const rig = makeE8Rig()
-        rig.addBaseImage()
+        const baseId = rig.addBaseImage()
         const before = imageTreeSnapshot(rig.worktreeRoot, { extended: true })
         const stage = await checkBaseImage(rig.deps, rig.state)
         const image = rig.baseImageName()
         expect(stage.ok).toBe(true)
+        expect(rig.ad.requests.length).toBe(6)
+        expect(rig.adRecordReads).toEqual([baseId])
         expect(rig.state.baseImage).toEqual({ kind: 'present', image })
         expect(rig.state.baseBuildToken).toBeNull()
         expect(rig.recorder.spawns()).toHaveLength(1)
@@ -2060,28 +2111,7 @@ describe('image preparation: the run\'s images and tags', () => {
         readonly spawned: (rig: ImageRig) => readonly (readonly string[])[]
       }
 
-      const AD_VERSION_NAMES = (): readonly string[] => [BASE_DOCKERFILE_PATH, AD_VERSION_ARG_PREFIX.slice(0, -1)]
-      /** Rewrites the base Dockerfile's `ARG AD_VERSION=<version>` line, its version kept, into a form Docker accepts but the step's `sed -n 's/^ARG AD_VERSION=//p'` does not read. */
-      function rewriteAdVersionLine(rig: ImageRig, form: (line: string) => string): void {
-        const lines = imageFs.readFileSync(rig.worktree.baseDockerfilePath, 'utf-8').split('\n')
-        const at = lines.findIndex((line) => line.startsWith(AD_VERSION_ARG_PREFIX))
-        if (at < 0 || lines[at] === AD_VERSION_ARG_PREFIX) throw new Error('rewriteAdVersionLine: the base Dockerfile sets no ARG AD_VERSION=<version>')
-        lines[at] = form(lines[at]!)
-        imageFs.writeFileSync(rig.worktree.baseDockerfilePath, lines.join('\n'))
-      }
-      /** A row whose base Dockerfile sets `AD_VERSION` only in a form the step does not read: refused as no `ARG AD_VERSION`, before any git spawn. */
-      const unreadAdVersion = (form: (line: string) => string): FailingPrerequisite => ({
-        script: (rig) => rewriteAdVersionLine(rig, form),
-        reason: (_rig, image) => adVersionMissingReason(image, null),
-        names: AD_VERSION_NAMES,
-        spawned: () => [],
-      })
       const FAILING_PREREQUISITES: readonly (readonly [string, FailingPrerequisite])[] = [
-        ['ARG AD_VERSION= indented (Docker reads it; the step\'s sed does not)', unreadAdVersion((line) => `  ${line}`)],
-        ['a lower-case arg AD_VERSION= (Docker reads it; the step\'s sed does not)', unreadAdVersion((line) => `arg${line.slice('ARG'.length)}`)],
-        ['ARG AD_VERSION empty', { options: { worktree: { dockerfiles: { adVersion: 'empty' } } }, script: () => undefined, reason: (_rig, image) => adVersionMissingReason(image, null), names: AD_VERSION_NAMES, spawned: () => [] }],
-        ['ARG AD_VERSION absent', { options: { worktree: { dockerfiles: { adVersion: 'absent' } } }, script: () => undefined, reason: (_rig, image) => adVersionMissingReason(image, null), names: AD_VERSION_NAMES, spawned: () => [] }],
-        ['docker/Dockerfile.test.base missing', { options: { worktree: { dockerfiles: { base: 'absent' } } }, script: () => undefined, reason: (_rig, image) => adVersionMissingReason(image, null), names: AD_VERSION_NAMES, spawned: () => [] }],
         [
           'CSCB_AD_SRC_DIR unset',
           { options: { env: { CSCB_AD_SRC_DIR: undefined } }, script: () => undefined, reason: (rig, image) => adSourceDirUnsetReason(image, rig.adTag()), names: (rig) => [AD_SOURCE_DIR_VARIABLE, rig.adTag()], spawned: () => [] },
@@ -2551,6 +2581,20 @@ describe('image preparation: the run\'s images and tags', () => {
     })
 
     describe('step 12: the re-check and the base-build step', () => {
+      test.each(['appearing', 'built'] as const)('b.bvq: a %s base record is checked before downstream work', async path => {
+        const rig = makeE8Rig()
+        rig.answerPrerequisites()
+        expect((await checkBaseImage(rig.deps, rig.state)).ok).toBe(true)
+        let id: string | undefined
+        if (path === 'appearing') id = rig.addBaseImage()
+        else rig.answerBaseBuildStep({ sideEffect: () => { id = rig.docker.image(rig.baseImageName())!.id } })
+        rig.ad.recordBytes = adJson({ ...rig.ad.record, version: AD_FIXTURE_OTHER_VERSION })
+        const stage = await runBaseBuild(rig.deps, rig.state, rig.log)
+        expect(stage.kind).toBe('failed')
+        expect(rig.adRecordReads).toEqual([id!])
+        expect(JSON.stringify(stage)).toContain('BASE_RECORD_MISMATCH')
+      })
+
       /** Test data: how long the scripted step runs, on the fake clock. */
       const STEP_MS = 90_000
       /** Test data: the step's output, as a quiet build prints it. */
@@ -2596,11 +2640,13 @@ describe('image preparation: the run\'s images and tags', () => {
           { argv: baseBuildStepArgs(rig.worktreeRoot), cwd: rig.worktreeRoot, env: rig.env, ownProcessGroup: true, atMs: startedAtMs },
         ])
         expect(spawned!.processGroup).toBe(spawned!.pid)
-        // The existence query at step 4 and the re-check: both of the base, nothing else from docker.
+        // Admission, the pre-build recheck, and immutable post-build identity.
         expect(dockerOperationRefs(rig)).toEqual([
           { kind: 'image-inspect', refs: [image] },
           { kind: 'image-inspect', refs: [image] },
+          { kind: 'image-inspect', refs: [image] },
         ])
+        expect(rig.adRecordReads).toEqual([rig.docker.image(image)!.id])
         expect(rig.logLines).toEqual([STEP_EARLY_LINE, STEP_STDOUT_LINE])
         imageAssertNoLeak({ stage, logLines: rig.logLines })
       })
@@ -2608,9 +2654,10 @@ describe('image preparation: the run\'s images and tags', () => {
       test('missing at step 4, then built by another run before the re-check: the step is not spawned and no base-build run is recorded', async () => {
         const rig = makeE8Rig()
         const image = await missingAtStep4(rig)
-        rig.addBaseImage()
+        const id = rig.addBaseImage()
         const stage = await runBaseBuild(rig.deps, rig.state, rig.log)
         expect(stage).toEqual({ kind: 'not-run', why: 'present-at-recheck' })
+        expect(rig.adRecordReads).toEqual([id])
         expect(stepSpawns(rig)).toEqual([])
         expect([rig.state.baseBuildRun, rig.state.baseBuildStep]).toEqual([null, null])
         expect(dockerOperationRefs(rig)).toEqual([
@@ -5532,13 +5579,15 @@ describe('the run lifecycle: the composed run (to)', () => {
     /** How long a shard's `docker run` takes to answer, by its assigned scripts; default 0. */
     readonly dockerRunDelayMs?: (assigned: readonly string[]) => number
     /** Dependencies over the defaults. */
-    readonly deps?: Partial<Pick<e13.RunnerDeps, 'readVolume' | 'readPasswordFile' | 'codexLogin'>>
+    readonly deps?: Partial<Pick<e13.RunnerDeps, 'readVolume' | 'readPasswordFile' | 'codexLogin' | 'fetchAd' | 'readAdBaseRecord'>>
     /** Called after each event of this run is recorded. */
     readonly onEvent?: (event: LifecycleEvent, run: LifecycleRun) => void
   }
 
   /** One run on the host. */
   interface LifecycleRun {
+    readonly ad: ReturnType<typeof makeAdLatestFixture>
+    readonly adRecordReads: string[]
     readonly runId: string
     readonly pid: number
     readonly owner: e13.Owner
@@ -5781,7 +5830,11 @@ describe('the run lifecycle: the composed run (to)', () => {
         (request) => request.argv.join(' ') === e13.GH_AUTH_TOKEN_ARGV.join(' ') && request.env.GH_CONFIG_DIR === e13.ghPersonalConfigDir(env),
         { stdout: `${SECRETS.baseBuildToken}\n` },
       )
-      host.recorder.answer(e13.baseBuildStepArgs(worktree.root), options.baseBuildStep ?? { delayMs: BUILD_MS })
+      const baseStep = options.baseBuildStep ?? { delayMs: BUILD_MS }
+      host.recorder.answer(e13.baseBuildStepArgs(worktree.root), { ...baseStep, sideEffect: (files, request) => {
+        if (baseStep.notStarted === undefined && (baseStep.exitCode ?? 0) === 0) host.docker.addImage({ tags: [baseImage.name] })
+        baseStep.sideEffect?.(files, request)
+      } })
     }
 
     // Each shard's container: its plan, from the runner arguments its `docker run` carries.
@@ -5882,7 +5935,11 @@ describe('the run lifecycle: the composed run (to)', () => {
       })
       return { pid: null, processGroup: null, result }
     }
+    const ad = makeAdLatestFixture()
+    const adRecordReads: string[] = []
     const deps: e13.RunnerDeps = {
+      fetchAd: options.deps?.fetchAd ?? ad.fetchAd,
+      readAdBaseRecord: options.deps?.readAdBaseRecord ?? (async (imageId: string) => { adRecordReads.push(imageId); return { ok: true, bytes: ad.recordBytes } }),
       spawn,
       codexLogin: options.deps?.codexLogin,
       env,
@@ -5920,6 +5977,8 @@ describe('the run lifecycle: the composed run (to)', () => {
       return lifecycleFs.existsSync(path) ? lifecycleFs.readFileSync(path, 'utf-8') : null
     }
     const run: LifecycleRun = {
+      ad,
+      adRecordReads,
       runId,
       pid,
       owner,
@@ -6020,6 +6079,65 @@ describe('the run lifecycle: the composed run (to)', () => {
     const [exit] = await lifecycleSettle(host, [run], [run.main(options)])
     return exit!
   }
+
+  describe('b.bvq strict AD admission verdict', () => {
+    test.each([
+      ['stale', true, 'RUNTIME_NOT_LATEST'], ['stale', false, 'RUNTIME_NOT_LATEST'],
+      ['lookup', true, 'HTTP_STATUS'], ['lookup', false, 'HTTP_STATUS'],
+      ['release-digest', true, 'RELEASE_DIGEST_MISMATCH'],
+      ['base-record', true, 'BASE_RECORD_MISMATCH'],
+      ['client-latest', true, 'CLIENT_NOT_LATEST'],
+    ] as const)('%s with base present=%s: FAIL naming %s before packing, shards or model work', async (failure, present, code) => {
+      const host = lifecycleHost()
+      const run = host.run({ baseMissing: !present })
+      if (failure === 'stale') {
+        run.ad.routes.set(run.ad.urls.release, { status: 200, body: adJson({ ...run.ad.release, tag_name: `v${AD_FIXTURE_NEWER_VERSION}` }) })
+      } else if (failure === 'lookup') {
+        run.ad.routes.set(run.ad.urls.release, { status: 503, body: adBytes('untrusted body') })
+      } else if (failure === 'release-digest') {
+        run.ad.routes.set(run.ad.urls.release, { status: 200, body: adJson({
+          ...run.ad.release,
+          assets: run.ad.release.assets.map((asset, i) => i === 0 ? { ...asset, digest: `sha256:${AD_FIXTURE_OTHER_DIGEST}` } : asset),
+        }) })
+      } else if (failure === 'base-record') {
+        run.ad.recordBytes = adJson({ ...run.ad.record, commit: AD_FIXTURE_OTHER_COMMIT })
+      } else {
+        // Runtime metadata stays current; only the independent npm latest changes.
+        run.ad.routes.set(run.ad.urls.npm, { status: 200, body: adJson({ ...run.ad.npm, version: AD_FIXTURE_NEWER_VERSION }) })
+      }
+      expect(await lifecycleRunToEnd(host, run)).not.toBe(0)
+      expect(run.verdict()).toMatch(/^FAIL:/)
+      expect(run.verdict()).toContain(code)
+      expect(run.logLines().join('\n')).toContain(code)
+      expect(host.recorder.argvs().some(argv => argv[0] === e13.NPM_PROGRAM)).toBe(false)
+      expect(lifecycleFs.existsSync(lifecyclePath.join(run.runDir, e13.PACKAGE_DIR_NAME))).toBe(false)
+      expect(host.docker.operations().filter(op => op.kind === 'container-run' || op.kind === 'image-build')).toEqual([])
+      expect(run.shardStarts.size).toBe(0)
+      if (failure === 'base-record') {
+        expect(run.adRecordReads).toHaveLength(1)
+        expect(run.adRecordReads[0]).toMatch(e13.IMAGE_ID_PATTERN)
+      } else expect(run.adRecordReads).toEqual([])
+      lifecycleCredentials.assertNoLeak(lifecycleOutputs(host, run))
+      await lifecycleExpectNothingAfter(host, run)
+    })
+
+    test('a present base with unreadable identity FAILs and is never used', async () => {
+      const host = lifecycleHost()
+      const reads: string[] = []
+      const run = host.run({ deps: { readAdBaseRecord: async (id: string) => {
+        reads.push(id)
+        return { ok: false, error: { code: 'BASE_RECORD_READ_FAILED', source: 'base' } }
+      } } })
+      expect(await lifecycleRunToEnd(host, run)).not.toBe(0)
+      expect(run.verdict()).toMatch(/^FAIL:/)
+      expect(run.logLines().join('\n')).toContain('BASE_RECORD_READ_FAILED')
+      expect(reads).toHaveLength(1)
+      expect(reads[0]).toMatch(e13.IMAGE_ID_PATTERN)
+      expect(run.shardStarts.size).toBe(0)
+      lifecycleCredentials.assertNoLeak(lifecycleOutputs(host, run))
+      await lifecycleExpectNothingAfter(host, run)
+    })
+  })
 
   /**
    * That nothing changes after a run's last act: no runner timer pending, no
@@ -6692,7 +6810,7 @@ describe('the run lifecycle: the composed run (to)', () => {
         (events: readonly LifecycleEvent[]) => {
           const step = lifecycleIndexOf(events, 'bash')
           expect(events.slice(0, lifecycleIndexOf(events, 'npm')).map((event) => event.what)).toEqual(['version', 'image-inspect', 'git', 'git', 'gh'])
-          expect(events.slice(step - 2, step + 2).map((event) => event.what)).toEqual(['container-list', 'image-inspect', 'bash', 'image-build'])
+          expect(events.slice(step - 2, step + 3).map((event) => event.what)).toEqual(['container-list', 'image-inspect', 'bash', 'image-inspect', 'image-build'])
           expect([events[step]!.lockHeld, events[step]!.reservations.length]).toEqual([false, 1])
         },
       ],

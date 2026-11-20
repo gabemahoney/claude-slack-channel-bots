@@ -27,16 +27,16 @@
 #   2 version        the client's package version is the record's client_version, a
 #                    plain major.minor.patch (no pre-release); with
 #                    --package, the package's dependency on agent-director
-#                    is exactly that version, and so is the package's
-#                    PHASE1_FLOOR_VERSION (src/ad-version-gate.ts);
+#                    is exactly that version; the independent package
+#                    PHASE1_FLOOR_VERSION is checked at step 6;
 #   3 content        the client's files equal that tarball's;
-#   4 exports        the client exports ErrTmuxKillFailed,
-#                    ErrTmuxUnresponsive and ErrTmuxSessionConflict, each an
-#                    AgentDirectorError class;
+#   4 exports        the client exports the required Phase 1 and submission
+#                    safety classes, each an AgentDirectorError class;
 #   5 binary         the first agent-director on PATH reports the record's
 #                    runtime version, commit and binary SHA-256;
 #   6 floor          that version (major.minor.patch) is at or above the
-#                    client's dist/version-floor.json min_binary_version;
+#                    client's dist/version-floor.json min_binary_version
+#                    and, with --package, CSCB's independent runtime floor;
 #   7 client-create  Client.create(), imported from the client's entry point,
 #                    reports a binaryVersion equal to that version.
 #
@@ -51,7 +51,7 @@ set -euo pipefail
 
 MARKER=/etc/cscb-ci-image
 RELEASE_RECORD=/opt/agent-director/client/release.json
-PHASE1_CLASSES='ErrTmuxKillFailed ErrTmuxUnresponsive ErrTmuxSessionConflict'
+PHASE1_CLASSES='ErrTmuxKillFailed ErrTmuxUnresponsive ErrTmuxSessionConflict ErrSubmissionUnconfirmed ErrExperimentalAgentDisabled ErrAgentCapabilityUnsupported ErrModelMissing ErrHostCredentialMissing ErrTooManyIds'
 # The installed package's module that exports CSCB's Phase 1 floor.
 PHASE1_MODULE=src/ad-version-gate.ts
 PLAIN_RELEASE_RE='^[0-9]+\.[0-9]+\.[0-9]+$'
@@ -176,8 +176,7 @@ process.stdout.write(m.PHASE1_FLOOR_VERSION)
         fail '2 (version)' "cannot read PHASE1_FLOOR_VERSION from ${TARGET}/${PHASE1_MODULE}: $(first_line "${SCRATCH}/p1.err")"
     fi
     P1=$(cat "${SCRATCH}/p1.out")
-    [ "${P1}" = "${CLIENT_VERSION}" ] \
-        || fail '2 (version)' "the client's version ${CLIENT_VERSION} is not the package's Phase 1 floor PHASE1_FLOOR_VERSION ${P1}"
+    [[ "${P1}" =~ ${PLAIN_RELEASE_RE} ]] || fail '2 (version)' "invalid package Phase 1 floor"
 fi
 
 # --- 3 content -----------------------------------------------------------
@@ -237,6 +236,15 @@ for i in 0 1 2; do
 done
 [ "${BELOW}" -eq 0 ] \
     || fail '6 (floor)' "the agent-director binary's version ${BIN_VERSION} is below the client's floor ${FLOOR} (${FLOOR_FILE})"
+
+if [ -n "${P1:-}" ]; then
+    [[ "${P1}" =~ ${CORE_RE} ]] || fail '6 (floor)' 'invalid CSCB floor'
+    P1_PARTS=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}")
+    for i in 0 1 2; do
+        if ((10#${BIN_PARTS[i]} > 10#${P1_PARTS[i]})); then break; fi
+        if ((10#${BIN_PARTS[i]} < 10#${P1_PARTS[i]})); then fail '6 (floor)' 'runtime below CSCB floor'; fi
+    done
+fi
 
 # --- 7 client-create -----------------------------------------------------
 if ! (cd / && CLIENT_ENTRY="${ENTRY}" bun --no-install -e '

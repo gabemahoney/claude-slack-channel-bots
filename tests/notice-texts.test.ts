@@ -87,6 +87,7 @@
  */
 
 import { describe, expect, test } from 'bun:test'
+import { buildAdInputHoldNotice, buildAdDeliveryUnconfirmedNotice } from '../src/ad-input-notices.ts'
 
 import { NEVER_DELETE_ROW_PHRASE, NO_KILL_SENT_PHRASE, RETRY_KILL_LATER_PHRASE } from '../src/ad-description-phrases.ts'
 import {
@@ -1168,6 +1169,10 @@ function capEntries(): NoticeEntry[] {
  * is exported).
  */
 const NOTICE_CATALOGUE: readonly NoticeEntry[] = Object.freeze([
+  ...[PERSONA, { key: KEY }, { key: KEY, name: 'Alpha "quoted"\nname' }].flatMap((persona, index) => [
+    entry('common', buildAdInputHoldNotice.name, `input hold persona ${index}`, () => buildAdInputHoldNotice(persona, '/state/ad-input-holds/reviewed.json')),
+    entry('common', buildAdDeliveryUnconfirmedNotice.name, `delivery hold persona ${index}`, () => buildAdDeliveryUnconfirmedNotice(persona)),
+  ]),
   ...commonEntries(),
   ...spawnFailureEntries(),
   ...notConnectedEntries(),

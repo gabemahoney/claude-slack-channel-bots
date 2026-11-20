@@ -166,6 +166,7 @@ import {
   ErrTmuxSessionCreate,
   ErrTmuxUnresponsive,
   ErrUnknownErrorName,
+  ErrSubmissionUnconfirmed,
   STORE_OPEN_ERR_NAMES,
 } from './agent-director-errors.ts'
 import {
@@ -433,6 +434,7 @@ export interface AdErrorClassification {
 export function classifyAdError(value: unknown): AdErrorClassification {
   try {
     if (!isAgentDirectorError(value)) return { errorClass: AD_ERROR_CLASS_UNAVAILABLE }
+    if (isAdErrorInstance(value, ErrSubmissionUnconfirmed)) return { errorClass: AD_ERROR_CLASS_STATE }
     if (cantSendDetailsOf(value)) return { errorClass: AD_ERROR_CLASS_STATE }
     if (isAdErrorInstance(value, ErrUnknownErrorName)) {
       return classifyUnknownName(readProp(value, 'unknownName'), readProp(readProp(value, 'envelope'), 'err_description'))
@@ -460,6 +462,41 @@ export function classifyAdError(value: unknown): AdErrorClassification {
   } catch {
     return { errorClass: AD_ERROR_CLASS_UNAVAILABLE }
   }
+}
+
+export type AdInputStep = 'text' | 'enter' | 'pause'
+export type SubmissionUnknownIssue = 'missing-details' | 'malformed-details' | 'unknown-outcome' | 'contradictory-details'
+export type SubmissionUnconfirmedFacts =
+  | { readonly kind: 'not_started'; readonly step: AdInputStep; readonly keysSent: false; readonly next: 'read-before-retry' }
+  | { readonly kind: 'partial_input_unconfirmed' | 'submission_unconfirmed' | 'legacy_unconfirmed'; readonly step: AdInputStep; readonly keysSent: true; readonly next: 'hold-and-read' }
+  | { readonly kind: 'gateway_refused'; readonly step: AdInputStep; readonly keysSent: true; readonly gatewayReason: 'capacity' | 'other'; readonly next: 'explicit-resubmit' }
+  | { readonly kind: 'unknown'; readonly step: AdInputStep; readonly keysSent: 'unknown'; readonly issue: SubmissionUnknownIssue; readonly next: 'hold-and-read' }
+
+/** Decode attempted-input facts, never error descriptions or agent screen text. */
+export function submissionUnconfirmedFactsOf(error: unknown, step: AdInputStep): SubmissionUnconfirmedFacts | undefined {
+  if (!isAdErrorInstance(error, ErrSubmissionUnconfirmed)) return undefined
+  const unknown = (issue: SubmissionUnknownIssue): SubmissionUnconfirmedFacts => ({ kind: 'unknown', step, keysSent: 'unknown', issue, next: 'hold-and-read' })
+  try {
+    const d = (error as ErrSubmissionUnconfirmed).errDetails
+    if (d === undefined || d === null) return unknown('missing-details')
+    if (typeof d !== 'object' || Array.isArray(d)) return unknown('malformed-details')
+    const keys = d.keys_sent, confirmed = d.submission_confirmed, enter = d.enter_may_have_been_sent, outcome = d.outcome
+    if (outcome !== undefined && typeof outcome !== 'string') return unknown('malformed-details')
+    if (d.row_state !== undefined && typeof d.row_state !== 'string') return unknown('malformed-details')
+    for (const v of [keys, confirmed, enter]) if (v !== undefined && typeof v !== 'boolean') return unknown('malformed-details')
+    if (outcome === undefined && keys === true && confirmed === false && typeof d.row_state === 'string') return { kind: 'legacy_unconfirmed', step, keysSent: true, next: 'hold-and-read' }
+    if (outcome === undefined || keys === undefined || confirmed === undefined) return unknown('missing-details')
+    if (!['not_started', 'partial_input_unconfirmed', 'submission_unconfirmed', 'gateway_refused'].includes(outcome as string)) return unknown('unknown-outcome')
+    if (confirmed !== false) return unknown('contradictory-details')
+    if (outcome === 'not_started') return keys === false && enter !== true
+      ? { kind: 'not_started', step, keysSent: false, next: 'read-before-retry' } : unknown('contradictory-details')
+    if (keys !== true || (outcome === 'partial_input_unconfirmed' ? enter !== false : enter === false)) return unknown('contradictory-details')
+    if (outcome === 'gateway_refused') {
+      if (enter !== true || typeof d.reason !== 'string' || d.reason.length > 256) return unknown('malformed-details')
+      return { kind: 'gateway_refused', step, keysSent: true, gatewayReason: d.reason === 'capacity' ? 'capacity' : 'other', next: 'explicit-resubmit' }
+    }
+    return { kind: outcome as 'partial_input_unconfirmed' | 'submission_unconfirmed', step, keysSent: true, next: 'hold-and-read' }
+  } catch { return unknown('malformed-details') }
 }
 
 /** Accept the installed client's native class or the pinned client's unknown
