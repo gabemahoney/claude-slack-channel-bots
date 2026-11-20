@@ -1023,7 +1023,7 @@ image's build succeeded, and from the pinned ID when it did not (see
 | `--memory` | The per-shard memory cap, in bytes | Each shard is held to the cap admission counted it at (see [The per-shard memory cap and out-of-memory kills](#the-per-shard-memory-cap-and-out-of-memory-kills) for its value and rules) |
 | `--memory-swap` | The same as `--memory` | No swap above the cap: past it the kernel kills a process inside the container instead of swapping |
 | `--pids-limit` | `2048` | Stops a fork or spawn loop inside one shard long before it reaches the host |
-| `--cpus` | `2`, or `3` for a burst-driver shard | The CPUs admission reserves per shard (see [Admission: memory, disk and CPU](#admission-memory-disk-and-cpu) for the CPU budget) |
+| `--cpus` | `2`, or `4` for a burst-driver shard | The CPUs admission reserves per shard (see [Admission: memory, disk and CPU](#admission-memory-disk-and-cpu) for the CPU budget) |
 
 **Isolation.** A shard is on the default network only. No list sets
 `--network`, `--privileged`, or a PID, IPC or network namespace shared with
@@ -1525,7 +1525,8 @@ jobsched submit --context <ctx> --name adg-<cscb version>-<cand|ref>-s<k> --chan
   is declared exactly once and the entrypoint splits, or, for a tag with no
   `DRIVER_CPUS`, unless the entrypoint does not split (`burst_driver`
   null: that tag's CI ran these scripts in ordinary shards, and so does the
-  gate). The driver refuses a tag whose pattern is not the kit's own. A
+  gate). The driver refuses a tag whose pattern is not the kit's own, and a
+  `burst_driver` asking for more than the scheduler's maximum of 8 CPUs. A
   shard with no burst-driver script keeps `--cpus 2` and the scheduler's
   read-only cgroup, and no such shard ever gets `--cgroups writable`. At
   v0.19.x, though, the burst scripts take about a third of the tag's
@@ -1538,7 +1539,15 @@ jobsched submit --context <ctx> --name adg-<cscb version>-<cand|ref>-s<k> --chan
   `jobs`. The job has no `--init` (the scheduler offers none), so
   `entry.sh` must stay PID 1 and start the tag's `entrypoint.sh` as a
   child, never `exec` it: that entrypoint splits the cgroup only when its
-  own PID is not 1, and would otherwise skip the split silently.
+  own PID is not 1, and would otherwise skip the split silently. A
+  writable cgroup would let the job rewrite its own limits, so the
+  scheduler's supervisor watches the container's `memory.max`,
+  `memory.swap.max`, `cpu.max` and `pids.max` and stops a job that changes
+  one: it ends `failed` with outcome `cgroup-limit-changed`, which the gate
+  FAILs, with the scheduler's reason in `verdict.json`'s `jobs[].reason`.
+  The tag's entrypoint only makes the child groups `shard/server` and
+  `shard/driver` and moves processes into them, never writing those four
+  files, so that outcome means a changed entrypoint or test wrote one.
 
 - m is ⌈(2 × the shard's expected seconds + 1800) ÷ 60⌉, and s is
   m × 60 − 600, so the verdict line prints before the scheduler's timeout.

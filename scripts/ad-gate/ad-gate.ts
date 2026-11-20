@@ -719,6 +719,8 @@ const SHARD_CPUS = '2'
  * the server's CPU quota apart from the SR-8 burst driver's (b.ya4).
  */
 const BURST_SHARD_CGROUPS = 'writable'
+/** The most CPUs a burst-driver shard may ask for: the scheduler's `cpus_max`. */
+export const BURST_SHARD_CPUS_MAX = 8
 const SHARD_MEMORY_GIB = 4
 const SHARD_MEMORY = `${SHARD_MEMORY_GIB}g`
 const SHARD_DISK = '20g'
@@ -1435,8 +1437,8 @@ function readManifest(context: string): Manifest {
   const burst = manifest['burst_driver']
   const fields = typeof burst === 'object' && burst !== null ? (burst as Record<string, unknown>) : {}
   const cpus = fields['cpus']
-  if (burst !== null && !(typeof cpus === 'number' && Number.isInteger(cpus) && cpus > 0 && typeof fields['pattern'] === 'string')) {
-    throw new GateError(`the manifest ${path} has no valid burst_driver (null or {cpus, pattern}); an earlier kit's context has none: start a new --out`)
+  if (burst !== null && !(typeof cpus === 'number' && Number.isInteger(cpus) && cpus > 0 && cpus <= BURST_SHARD_CPUS_MAX && typeof fields['pattern'] === 'string')) {
+    throw new GateError(`the manifest ${path} has no valid burst_driver (null or {cpus 1-${BURST_SHARD_CPUS_MAX}, pattern}); an earlier kit's context has none: start a new --out`)
   }
   return manifest as unknown as Manifest
 }

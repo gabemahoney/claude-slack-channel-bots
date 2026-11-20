@@ -113,6 +113,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
+  BURST_SHARD_CPUS_MAX,
   fastestShardCount,
   gateVerdict,
   parseRunLog,
@@ -1688,6 +1689,7 @@ const MALFORMED_BURST_DRIVERS: readonly (readonly [string, unknown])[] = [
   ['burst-driver-absent', 'absent'],
   ['burst-driver-cpus-zero', { cpus: 0, pattern: BURST_DRIVER_SCRIPTS.source }],
   ['burst-driver-cpus-negative', { cpus: -4, pattern: BURST_DRIVER_SCRIPTS.source }],
+  ['burst-driver-cpus-above-scheduler-max', { cpus: 9, pattern: BURST_DRIVER_SCRIPTS.source }],
   ['burst-driver-cpus-fraction', { cpus: 2.5, pattern: BURST_DRIVER_SCRIPTS.source }],
   ['burst-driver-cpus-string', { cpus: '4', pattern: BURST_DRIVER_SCRIPTS.source }],
   ['burst-driver-cpus-missing', { pattern: BURST_DRIVER_SCRIPTS.source }],
@@ -2048,6 +2050,9 @@ describe('the command line over a fake scheduler', () => {
       once('burst-reference-pattern-differs', {
         scripts: BURST_CLI_SCRIPTS, durations: BURST_CLI_DURATIONS, burstDriver: BURST_V0191, refBurstDriver: { cpus: 4, pattern: '-fmk-thread-burst\\.sh$' }, fail: { cand: ['test-44'], ref: ['test-44'] },
       }),
+      once('burst-dry-run-cpus-max', {
+        scripts: BURST_CLI_SCRIPTS, durations: BURST_CLI_DURATIONS, burstDriver: { cpus: BURST_SHARD_CPUS_MAX, pattern: BURST_DRIVER_SCRIPTS.source },
+      }, ['--dry-run']),
       ...MALFORMED_BURST_DRIVERS.map(([name, burstDriver]) => once(name, { burstDriver })),
     ])
   }, CLI_SETUP_TIMEOUT_MS)
@@ -2230,14 +2235,25 @@ describe('the command line over a fake scheduler', () => {
     expect(run.stderr).not.toContain('(unexpected error)')
   })
 
+  test("a dry run's plan marks only burst-driver shards with their CPUs and cgroups, and the scheduler's maximum of 8 CPUs is accepted (b.ya4)", () => {
+    const run = runs['burst-dry-run-cpus-max']
+    const shardLines = run.stdout.split('\n').filter((line) => /^ad-gate: {3}s[0-9]+: ~/.test(line))
+    const marker = `, burst driver (${BURST_SHARD_CPUS_MAX} CPUs, cgroups writable): `
+
+    expect([run.code, run.prepared]).toEqual([0, ['cand']])
+    expect(shardLines.length).toBeGreaterThan(1)
+    for (const line of shardLines) expect(line.includes(marker)).toBe(line.includes(THREAD_BURST))
+    expect(shardLines.filter((line) => line.includes(marker))).toHaveLength(1)
+  })
+
   test.each(MALFORMED_BURST_DRIVERS.map(([name, value]) => [name, JSON.stringify(value)] as const))(
-    'a manifest whose burst_driver is not null or {cpus, pattern} (%s: %s) is refused before anything is submitted (b.ya4)',
+    'a manifest whose burst_driver is not null or {cpus 1-8, pattern} (%s: %s) is refused before anything is submitted (b.ya4)',
     (name) => {
       const run = runs[name]
 
       expect([run.code, run.prepared, submittedNames(run)]).toEqual([2, ['cand'], []])
       expect(run.stderr).toMatch(
-        /^ad-gate: the manifest \S+\/inputs\/manifest\.json has no valid burst_driver \(null or \{cpus, pattern\}\); an earlier kit's context has none: start a new --out$/m,
+        /^ad-gate: the manifest \S+\/inputs\/manifest\.json has no valid burst_driver \(null or \{cpus 1-8, pattern\}\); an earlier kit's context has none: start a new --out$/m,
       )
       expect(run.stderr).not.toContain('(unexpected error)')
     },
