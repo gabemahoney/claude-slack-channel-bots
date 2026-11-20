@@ -574,7 +574,8 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
       result = await deps.queue.acceptDecided<SerialSelection>(key, slackKey, () => {
         selection = decideSerialIntake(key, ev, slackKey, run.isExtSharedChannel, run.provenance)
         return selection.input ? serialStore(key, selection.input, selection.join, run.receivedAt, retention) : { skip: selection }
-      })
+      }, typeof ev['channel'] === 'string' && typeof (ev['thread_ts'] ?? ev['ts']) === 'string'
+        ? { channel: ev['channel'], root: (ev['thread_ts'] ?? ev['ts']) as string } : undefined)
     } finally { releaseDecided(retention) }
     if (selection) reportSerialSelection(key, ev, slackKey, selection)
     if (selection?.requestMembership || result.status === 'failed') run.storeFailed = true
@@ -596,7 +597,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     if (hold?.on === 'post' && postHolds && receivedAt !== undefined) {
       // Before the store: an outcome that lands during its fsync must survive it.
       retainDecided(retention, key, hold.operations)
-      return { store: input, afterStore: ({ seq }) => {
+      return { store: input, effectThread: { channel: input.channel!, root: hold.thread_ts }, afterStore: ({ seq }) => {
         const handed = retention.release ?? NO_RETENTION
         retention.release = undefined
         try {
@@ -604,7 +605,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
         } catch { releaseQuietly(handed) /* cannot undo the store or suppress its ack */ }
       } }
     }
-    return { store: input, ...(join ? { afterStore: () => { deps.joins?.addJoin(key, join) } } : {}) }
+    return { store: input, ...(join ? { effectThread: { channel: join.channel, root: join.root }, afterStore: () => { deps.joins?.addJoin(key, join) } } : {}) }
   }
 
   /** Take the owner's outcome retention for a Post Hold's operations, replacing any earlier one. */

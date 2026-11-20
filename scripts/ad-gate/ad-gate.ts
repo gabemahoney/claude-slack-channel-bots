@@ -20,8 +20,10 @@
  *   3. plans each release's shards from its tag's own `tests/integration`
  *      headers and `tests/ci-durations.tsv` (ci-run.ts's planner), measured
  *      times winning;
- *   4. submits every release's candidate shards together, one scheduler job
- *      per shard, longest first across releases, and waits on them all with
+ *   4. submits ordinary candidate shards together, one scheduler job per
+ *      shard, longest first across releases. Burst-driver shards run one at
+ *      a time across every release and both roles: no next burst submission
+ *      until the previous burst job has ended. Waits on submitted jobs with
  *      `jobsched wait --timeout 20m` at a time; a shard holding a burst-driver
  *      script of a tag that splits its driver's CPU (the manifest's
  *      `burst_driver`) gets that tag's burst CPUs and `--cgroups writable`,
@@ -32,15 +34,16 @@
  *      judges them (`gateVerdict`);
  *   6. only when candidate scripts (never test-1) ran and failed: builds that
  *      release's reference context (an AD release, by default the host's) and
- *      submits just those scripts and their prerequisites at once, sharded the
- *      same way, and judges again when they end;
+ *      submits just those scripts and their prerequisites, sharded the same
+ *      way with the same global burst isolation, and judges when they end;
  *   7. writes each release's `verdict.json` (with the kit's revision and file
  *      hashes and each job's context hash), `report.md` (with the shard
  *      choice) and `measured-durations.tsv`, then the combined verdict.
  * `--dry-run` does steps 1-3, prints the shard choice and every `jobsched
  * submit` command, and submits nothing. `--resume` continues a run recorded
  * in `--out/state.json` without submitting any shard twice, re-checking its
- * recorded plans and reusing its recorded shard choice.
+ * recorded plans and reusing its recorded shard choice. Queued and running
+ * burst jobs recorded before a resume still hold the single burst slot.
  *
  * Exit status: 0 PASS (or a clean dry run), 1 FAIL, 2 the gate could not run
  * (inputs, prepare or the scheduler refused), 3 NON-RELEASE PASS (a pass of
@@ -1598,14 +1601,28 @@ function submitOrder(submissions: readonly Submission[]): Submission[] {
   return [...submissions].sort((a, b) => b.expectedSeconds - a.expectedSeconds || a.release - b.release || a.shard - b.shard)
 }
 
-/** Submits every shard not yet submitted, in submit order, recording each job ID at once. */
-function submitAll(submissions: readonly Submission[], save: () => void): void {
-  for (const { argv, shard, role, version } of submitOrder(submissions)) {
+/** Ordinary work keeps its concurrency; one shared slot admits burst work.
+ * Read all saved roles too, including a reference not yet reconstructed on
+ * resume, so a queued job is never mistaken for a free slot. */
+function submitAvailable(run: RunContext, gates: readonly ReleaseGate[], ended: ReadonlySet<string>): void {
+  let burstActive = gates.some(gate => [gate.version.candidate, gate.version.reference].some(role =>
+    role?.plan?.shards.some(shard => {
+      const id = role.jobs[String(shard.shard)]
+      return id !== undefined && !ended.has(id) && isBurstDriverShard(gate.candManifest.burst_driver, shard.scripts)
+    })))
+  const submissions = gates.filter(gate => gate.outcome === null).flatMap(gate => gate.candidate === null
+    ? submissionsOf(gate.candCommands, gate.version.candidate, gate.version, gate.index)
+    : gate.version.reference ? submissionsOf(gate.refCommands, gate.version.reference, gate.version, gate.index) : [])
+  for (const { argv, shard, role, version, release } of submitOrder(submissions)) {
     if (role.jobs[String(shard)] !== undefined) continue
+    const scripts = role.plan!.shards.find(entry => entry.shard === shard)!.scripts
+    const burst = isBurstDriverShard(gates[release].candManifest.burst_driver, scripts)
+    if (burst && burstActive) continue
     version.firstSubmitAt ??= new Date().toISOString()
     const id = submitShard(argv)
     role.jobs[String(shard)] = id
-    save()
+    if (burst) burstActive = true
+    run.save()
     say(`submitted ${argv[argv.indexOf('--name') + 1]}: ${id} (${argv.slice(argv.indexOf('--') + 1).length} scripts)`)
   }
 }
@@ -1748,6 +1765,7 @@ interface ReleaseGate {
   readonly candManifest: Manifest
   readonly manifestProblems: string[]
   candCommands: string[][]
+  refCommands: string[][]
   /** Set once its candidate jobs are collected and judged. */
   candidate: GateOutcome['candidate'] | null
   candidateVerdict: GateVerdict | null
@@ -1770,7 +1788,7 @@ function prepareRelease(run: RunContext, cscbVersion: string, index: number): Re
   const manifestProblems = inputProblems(version.candidate.context, candManifest, cscbVersion, tagCommit, candSource)
   return {
     cscbVersion, index, version, tagCommit, candSource, candManifest, manifestProblems,
-    candCommands: [], candidate: null, candidateVerdict: null, refManifest: null, outcome: null,
+    candCommands: [], refCommands: [], candidate: null, candidateVerdict: null, refManifest: null, outcome: null,
   }
 }
 
@@ -1805,14 +1823,13 @@ function startReference(run: RunContext, gate: ReleaseGate): void {
   // Planned with the candidate's burst_driver, which equals the reference's
   // unless the problem above is recorded; the kit has already accepted its
   // pattern, so a reference that differs fails as that problem, not mid-gate.
-  const refCommands = planRole(
+  gate.refCommands = planRole(
     run, cscbVersion, refSource, version.reference, candidateVerdict.referenceScripts, run.options.shards ?? MAX_GATE_SHARDS, gate.candManifest.burst_driver,
   )
   if (gate.manifestProblems.length > 0) {
     gate.outcome = finish(run, cscbVersion, version, gate.manifestProblems, gate.candidate!, { plan: version.reference.plan!, shards: [], manifest: refManifest }, candidateVerdict)
     return
   }
-  submitAll(submissionsOf(refCommands, version.reference, version, gate.index), run.save)
 }
 
 /**
@@ -1821,6 +1838,8 @@ function startReference(run: RunContext, gate: ReleaseGate): void {
  */
 function advance(run: RunContext, gate: ReleaseGate, ended: ReadonlySet<string>): void {
   if (gate.outcome !== null || pendingJobs(gate, ended).length > 0) return
+  const role = gate.candidate === null ? gate.version.candidate : gate.version.reference
+  if (!role?.plan || role.plan.shards.some(shard => role.jobs[String(shard.shard)] === undefined)) return
   const { cscbVersion, version } = gate
   if (gate.candidate === null) {
     const shards = collectChecked(run, cscbVersion, 'candidate', version.candidate, gate.candManifest, gate.manifestProblems)
@@ -1839,7 +1858,9 @@ function advance(run: RunContext, gate: ReleaseGate, ended: ReadonlySet<string>)
 function runReleases(run: RunContext, gates: readonly ReleaseGate[]): void {
   const ended = new Set<string>()
   for (;;) {
+    submitAvailable(run, gates, ended)
     for (const gate of gates) advance(run, gate, ended)
+    submitAvailable(run, gates, ended)
     const pending = gates.flatMap((gate) => pendingJobs(gate, ended))
     if (pending.length === 0) {
       if (gates.every((gate) => gate.outcome !== null)) return
@@ -1854,6 +1875,8 @@ function printDryRun(run: RunContext, gates: readonly ReleaseGate[]): void {
   const submissions = submitOrder(gates.flatMap((gate) => submissionsOf(gate.candCommands, gate.version.candidate, gate.version, gate.index)))
   say(`dry run: ${submissions.length} candidate submit command(s) across ${gates.length} release(s), longest first; nothing is submitted:`)
   for (const { argv } of submissions) process.stdout.write(`${argv.map(shellWord).join(' ')}\n`)
+  const bursts = submissions.filter(({ argv, release }) => isBurstDriverShard(gates[release].candManifest.burst_driver, argv.slice(argv.indexOf('--') + 1)))
+  say(`burst shards run one at a time across releases and candidate/reference roles (queued jobs included): ${bursts.map(({ argv }) => argv[argv.indexOf('--name') + 1]).join(', ') || 'none in this candidate plan'}`)
   say(`the reference ${run.referenceTag} runs only for candidate failures: just those scripts and their prerequisites, sharded the same way`)
 }
 
@@ -2310,7 +2333,6 @@ function runGate(invocation: Invocation): number {
     }
   }
   const live = gates.filter((gate) => gate.outcome === null)
-  submitAll(live.flatMap((gate) => submissionsOf(gate.candCommands, gate.version.candidate, gate.version, gate.index)), save)
   say(`waiting on ${live.length} release(s)' candidate jobs together`)
   runReleases(run, gates)
   const outcomes = gates.map((gate) => gate.outcome!)

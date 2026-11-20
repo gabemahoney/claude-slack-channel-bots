@@ -199,7 +199,8 @@ export type QueueEvent =
   | { type: 'retained'; key: string; count: number }
 export type QueueAcceptResult = { status: 'accepted' | 'duplicate'; item?: QueueItem; seq: number } | { status: 'failed'; error: unknown }
 export type QueueAccept = (key: string, input: AcceptedInput) => Promise<QueueAcceptResult>
-export type QueueAcceptDecision<T> = { store: AcceptedInput; afterStore?: (stored: { seq: number }) => void } | { skip: T }
+export interface QueueEffectThread { channel: string; root: string }
+export type QueueAcceptDecision<T> = { store: AcceptedInput; afterStore?: (stored: { seq: number }) => void; effectThread?: QueueEffectThread } | { skip: T }
 export type QueueDecidedResult<T> = QueueAcceptResult | { status: 'skipped'; outcome: T }
 export interface DeliveryQueue {
   start(): Promise<void>
@@ -211,11 +212,24 @@ export interface DeliveryQueue {
    * `decide` may run while the persona's earlier stores are staged in a group
    * commit but not yet durable or published. It never reads an unfinished
    * store's record (`unresolvedHolds` lists staged holds) or depends on that
-   * store's outcome. Anything it needs from an earlier store reaches it only
-   * as that store's applied `afterStore` effect, which runs after its group's
-   * fsync, in the same synchronous step that publishes its record, and before
-   * any later decision. */
-  acceptDecided<T>(key: string, slackKey: SlackKey | undefined, decide: (facts: { keyChecked: boolean }) => QueueAcceptDecision<T>): Promise<QueueDecidedResult<T>>
+   * store's outcome. Decisions run in section-arrival order. Only a decision
+   * sharing an unfinished effect's thread (channel and root) or durable key
+   * waits for that effect; a key check also waits for any unfinished store of
+   * its key. A waiting head holds back later decisions. Other decisions may
+   * run before earlier stores finish and their frozen inputs are never
+   * re-evaluated. Groups contain up to 8 stores, effects included, and never
+   * pass another queue write. After all required fsyncs, records publish,
+   * effects apply and callers are answered in sequence order. A failed group
+   * fails every store and applies none of its effects. Supply the decision's
+   * event thread and, if different, the after-store effect's thread. */
+  acceptDecided<T>(key: string, slackKey: SlackKey | undefined, decide: (facts: { keyChecked: boolean }) => QueueAcceptDecision<T>, thread?: QueueEffectThread): Promise<QueueDecidedResult<T>>
+  /** Serial intakes and acceptance stores, queued or running, not yet answered. */
+  hasAcceptanceBacklog?(key: string): boolean
+  /** One notification when that persona next has no acceptance backlog. */
+  onAcceptanceBacklogCleared?(key: string, callback: () => void): () => void
+  /** Retention only: includes decided holds not yet assigned a queue sequence.
+   * Intake decisions must not read it. */
+  memoryHoldStamps?(key: string): readonly { channel: string; stamp: ChannelStamp }[]
   append(key: string, record: QueueRecord): Promise<void>
   /** Check and close exactly the open head in one serialized durable turn. */
   abandon(key: string, seq: number, at: number): Promise<AbandonResult>
@@ -435,17 +449,24 @@ export function createQueueItemReader(queue: DeliveryQueue, key: string): () => 
 type AcceptOutcome = { result: QueueDecidedResult<unknown> } | { error: unknown }
 /** One acceptance waiting in its persona's group. */
 interface AcceptMember {
+  decides?: boolean
+  thread?: QueueEffectThread
   /** The key its duplicate check reads. */
   dedupeKey?: SlackKey
   /** A Reaction Item's key, which its duplicate check reads instead. */
   reactionKey?: ReactionKey
   /** Runs in the group's turn: checks, decides and returns the input to store, or its final result. */
-  stage(): Promise<{ input: AcceptedInput; afterStore?: (stored: { seq: number }) => void } | { result: QueueDecidedResult<unknown> }>
+  stage(): Promise<{ input: AcceptedInput; afterStore?: (stored: { seq: number }) => void; effectThread?: QueueEffectThread } | { result: QueueDecidedResult<unknown> }>
   /** Called once, in member order; must not throw. */
   settle(outcome: AcceptOutcome): void
 }
-interface StagedAccept { record: AcceptedRecord; turnStarted: number | undefined; afterStore?: (stored: { seq: number }) => void }
+interface StagedAccept { record: AcceptedRecord; turnStarted: number | undefined; afterStore?: (stored: { seq: number }) => void; effectThread?: QueueEffectThread }
 interface BatchEntry { member: AcceptMember; staged?: StagedAccept; outcome?: AcceptOutcome }
+interface PreparedAccept {
+  member: AcceptMember; input?: AcceptedInput; afterStore?: (stored: { seq: number }) => void
+  effectThread?: QueueEffectThread; receivedAt?: number; turnStarted?: number; outcome?: AcceptOutcome
+}
+interface AcceptGroup { members: AcceptMember[]; notify?: () => void }
 interface StageCursor { nextSeq: number; lastInjected?: bigint }
 function emptyJournal(): Journal { return { records: [], nextSeq: 1, loaded: false, reminders: new Map(), items: new Map(), slackKeys: new Map(), reactionKeys: new Map(), holds: new Map(), openCount: 0, itemChanges: {} } }
 /** Queue snapshots contain only journal data (objects, arrays and scalars).
@@ -476,8 +497,11 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
   const writers = new Map<string, Promise<unknown>>()
   const appendBlocked = new Set<string>()
   const storingHolds = new Map<string, Map<number, UnresolvedHold>>()
-  const formingAccepts = new Map<string, AcceptMember[]>()
+  const formingAccepts = new Map<string, AcceptGroup>()
+  const preparingHolds = new Map<string, Set<AcceptedInput>>()
   const maintenanceQueued = new Set<string>()
+  const acceptanceBacklog = new Map<string, number>()
+  const backlogCleared = new Map<string, Set<() => void>>()
   const startId = `${new Date(now()).toISOString().replace(/[:]/g, '-')}-${randomUUID()}`
   let started = false, stopped = false
   let timer: ReturnType<typeof globalThis.setInterval> | undefined
@@ -834,61 +858,133 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
    * only while it is the last work queued for the persona, so acceptances
    * never pass other writes. */
   function enqueueAccept(key: string, member: AcceptMember): void {
+    acceptanceBacklog.set(key, (acceptanceBacklog.get(key) ?? 0) + 1)
     let settled = false
     const settle = member.settle
-    member.settle = outcome => { if (settled) return; settled = true; settle(outcome) }
-    const forming = formingAccepts.get(key)
-    if (forming) { forming.push(member); return }
-    const members = [member]
-    void serial(key, async () => {
-      if (formingAccepts.get(key) === members) formingAccepts.delete(key)
-      // An unexpected throw still answers every caller that has no result.
-      try { await storeGroup(key, members) } catch (error) { for (const m of members) m.settle({ error }) }
-    })
-    formingAccepts.set(key, members)
-  }
-  /** The group's serial turn: stages members in order and commits each batch
-   * with one append. A batch ends after a member with `afterStore`, so later
-   * decisions see its effect, and before a member whose key a staged record
-   * holds, so its duplicate check reads published state. */
-  async function storeGroup(key: string, members: readonly AcceptMember[]): Promise<void> {
-    let batch: BatchEntry[] = [], cursor: StageCursor | undefined
-    const stagedKeys = new Set<string>(), stagedReactionKeys = new Set<string>()
-    const flush = async () => { const entries = batch; batch = []; cursor = undefined; stagedKeys.clear(); stagedReactionKeys.clear(); await commitBatch(key, entries) }
-    for (const member of members) {
-      if ((member.dedupeKey && stagedKeys.has(slackKeyString(member.dedupeKey))) ||
-        (member.reactionKey && stagedReactionKeys.has(reactionKeyString(member.reactionKey)))) await flush()
-      const turnStarted = turnStart()
-      let entry: BatchEntry
-      try {
-        const staged = await member.stage()
-        if ('result' in staged) entry = { member, outcome: staged }
+    member.settle = outcome => {
+      if (settled) return
+      settled = true
+      try { settle(outcome) } finally {
+        const remaining = acceptanceBacklog.get(key)! - 1
+        if (remaining) acceptanceBacklog.set(key, remaining)
         else {
-          const j = journal(key)
-          cursor ??= { nextSeq: j.nextSeq, lastInjected: j.lastInjected }
-          const record = stageRecord(staged.input, cursor)
-          if (record.key) stagedKeys.add(slackKeyString(record.key))
-          if (record.reaction_key) stagedReactionKeys.add(reactionKeyString(record.reaction_key))
-          if (record.hold) {
-            let storing = storingHolds.get(key)
-            if (!storing) storingHolds.set(key, storing = new Map())
-            storing.set(record.seq, unresolvedEntry(record.hold, record.hold.on, record.seq, record.channel!))
-          }
-          entry = { member, staged: { record, turnStarted, afterStore: staged.afterStore } }
+          acceptanceBacklog.delete(key)
+          const callbacks = backlogCleared.get(key)
+          backlogCleared.delete(key)
+          for (const callback of callbacks ?? []) { try { callback() } catch { /* an observer cannot change acceptance */ } }
         }
-      } catch (error) { entry = { member, outcome: { error } } }
-      batch.push(entry)
-      if (entry.staged?.afterStore || batch.length >= QUEUE_GROUP_COMMIT_MAX) await flush()
+      }
     }
-    await flush()
+    const forming = formingAccepts.get(key)
+    if (forming) { forming.members.push(member); forming.notify?.(); return }
+    const group: AcceptGroup = { members: [member] }
+    void serial(key, async () => {
+      // An unexpected throw still answers every caller that has no result.
+      try { await storeGroup(key, group) } catch (error) { for (const m of group.members) m.settle({ error }) }
+      finally { if (formingAccepts.get(key) === group) formingAccepts.delete(key); preparingHolds.delete(key) }
+    })
+    formingAccepts.set(key, group)
+  }
+  /** Decisions remain serial while the single writer commits earlier batches.
+   * A dependency drains those batches first; an independent decision freezes
+   * its input without waiting for disk. Sequence allocation stays with the
+   * writer, so a failed batch cannot leave gaps in a later batch. */
+  async function storeGroup(key: string, group: AcceptGroup): Promise<void> {
+    let batch: PreparedAccept[] = [], stores = 0, active = 0, index = 0
+    let committed = Promise.resolve()
+    const pendingKeys = new Map<string, number>(), pendingReactions = new Map<string, number>(), effectThreads = new Map<string, number>()
+    let effects = 0, unknownThreads = 0
+    const threadKey = (thread: QueueEffectThread) => JSON.stringify([thread.channel, thread.root])
+    const count = (map: Map<string, number>, value: string, delta: number) => {
+      const next = (map.get(value) ?? 0) + delta
+      if (next) map.set(value, next); else map.delete(value)
+    }
+    const track = (entry: PreparedAccept, delta: number) => {
+      if (entry.input?.key) count(pendingKeys, slackKeyString(entry.input.key), delta)
+      if (entry.input?.reaction_key) count(pendingReactions, reactionKeyString(entry.input.reaction_key), delta)
+      if (entry.afterStore) {
+        effects += delta
+        if (entry.effectThread) count(effectThreads, threadKey(entry.effectThread), delta)
+        else unknownThreads += delta
+      }
+    }
+    const flush = () => {
+      if (!batch.length) return
+      const prepared = batch; batch = []; stores = 0; active++
+      committed = committed.then(async () => {
+        const j = journal(key), cursor: StageCursor = { nextSeq: j.nextSeq, lastInjected: j.lastInjected }
+        const entries: BatchEntry[] = prepared.map(entry => {
+          if (!entry.input) return { member: entry.member, outcome: entry.outcome }
+          preparingHolds.get(key)?.delete(entry.input)
+          try {
+            const turnStarted = entry.turnStarted ?? turnStart()
+            const record = stageRecord(entry.input, cursor, entry.receivedAt)
+            if (record.hold) {
+              let storing = storingHolds.get(key)
+              if (!storing) storingHolds.set(key, storing = new Map())
+              storing.set(record.seq, unresolvedEntry(record.hold, record.hold.on, record.seq, record.channel!))
+            }
+            return { member: entry.member, staged: { record, turnStarted, afterStore: entry.afterStore, effectThread: entry.effectThread } }
+          } catch (error) { return { member: entry.member, outcome: { error } } }
+        })
+        try { await commitBatch(key, entries) }
+        catch (error) { for (const entry of prepared) entry.member.settle({ error }) }
+        finally {
+          for (const entry of prepared) if (entry.input) track(entry, -1)
+          if (preparingHolds.get(key)?.size === 0) preparingHolds.delete(key)
+          active--
+        }
+      })
+    }
+    for (;;) {
+      while (index < group.members.length) {
+        const member = group.members[index++]!
+        const blocked = (member.dedupeKey && pendingKeys.has(slackKeyString(member.dedupeKey))) ||
+          (member.reactionKey && pendingReactions.has(reactionKeyString(member.reactionKey))) ||
+          (member.decides && (member.thread ? unknownThreads > 0 || effectThreads.has(threadKey(member.thread)) : effects > 0))
+        if (blocked) { flush(); await committed }
+        // Waiting for a prior group's writer is queueing, outside storeMs.
+        // The first batch still includes its members' own staging work.
+        const turnStarted = active === 0 ? turnStart() : undefined
+        let entry: PreparedAccept
+        try {
+          const staged = await member.stage()
+          if ('result' in staged) entry = { member, outcome: staged }
+          else {
+            const input = staged.input
+            // Validate before exposing even retention-only facts. The real
+            // sequence, injected watermark and item ID belong to the writer.
+            const j = journal(key)
+            const checked = stageRecord(input, { nextSeq: j.nextSeq, lastInjected: j.lastInjected }, undefined, false)
+            const root = input.thread_join?.thread_ts ?? input.hold?.thread_ts ?? input.thread_ts ?? input.ts ?? input.key?.ts
+            entry = { member, input, receivedAt: checked.received_at, turnStarted, afterStore: staged.afterStore,
+              effectThread: staged.effectThread ?? (input.channel && root ? { channel: input.channel, root } : undefined) }
+            if (input.hold) {
+              let holds = preparingHolds.get(key)
+              if (!holds) preparingHolds.set(key, holds = new Set())
+              holds.add(input)
+            }
+            track(entry, 1)
+            stores++
+          }
+        } catch (error) { entry = { member, outcome: { error } } }
+        batch.push(entry)
+        if (stores >= QUEUE_GROUP_COMMIT_MAX) flush()
+      }
+      flush()
+      if (!active) { if (formingAccepts.get(key) === group) formingAccepts.delete(key); return }
+      // New arrivals may join only while no other queue write has closed
+      // this group. Wake to decide them even if the current fsync is held.
+      await Promise.race([committed, new Promise<void>(resolve => { group.notify = resolve })])
+      group.notify = undefined
+    }
   }
   /** The next record in a batch; `cursor` carries the batch's unpublished sequence and injected watermark. */
-  function stageRecord(input: AcceptedInput, cursor: StageCursor): AcceptedRecord {
-    const received_at = input.received_at ?? now()
+  function stageRecord(input: AcceptedInput, cursor: StageCursor, received_at = input.received_at ?? now(), allocateId = true): AcceptedRecord {
     const candidate = BigInt(Math.trunc(received_at * 1000))
     const injected = cursor.lastInjected === undefined || candidate > cursor.lastInjected ? candidate : cursor.lastInjected + 1n
     // Reaction records keep their closed field set; covered sends derive their id instead.
-    const record: AcceptedRecord = { ...input, v: 1, kind: 'accepted', ...(input.source === 'reaction' ? {} : { item_id: randomUUID() }), seq: cursor.nextSeq, received_at, ts: input.source === 'slack' ? input.ts ?? input.key?.ts ?? '' : input.source === 'reaction' ? input.ts ?? '' : formatMicros(injected) }
+    const record: AcceptedRecord = { ...input, v: 1, kind: 'accepted', ...(input.source === 'reaction' || !allocateId ? {} : { item_id: randomUUID() }), seq: cursor.nextSeq, received_at, ts: input.source === 'slack' ? input.ts ?? input.key?.ts ?? '' : input.source === 'reaction' ? input.ts ?? '' : formatMicros(injected) }
     if (!isQueueRecord(record)) throw new Error('Invalid accepted record')
     cursor.nextSeq = record.seq + 1
     if (injectedSource(record.source)) cursor.lastInjected = injected
@@ -954,6 +1050,19 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
   // Values callers hand in are copied with structuredClone itself:
   // cloneJournalData copies only records the queue built or already copied.
   const api: ReplyReminderQueue = {
+    memoryHoldStamps(key) {
+      return [...api.unresolvedHolds(key).filter(hold => hold.memoryDependent).map(hold => ({ channel: hold.channel, stamp: hold.stamp })),
+        ...[...preparingHolds.get(key) ?? []].filter(input => input.hold!.on === 'memory' || (input.hold!.on === 'post' && input.hold!.root_unknown))
+          .map(input => ({ channel: input.channel!, stamp: structuredClone(input.hold!.stamp) }))]
+    },
+    hasAcceptanceBacklog: key => acceptanceBacklog.has(key),
+    onAcceptanceBacklogCleared(key, callback) {
+      if (!acceptanceBacklog.has(key)) { callback(); return () => {} }
+      let callbacks = backlogCleared.get(key)
+      if (!callbacks) backlogCleared.set(key, callbacks = new Set())
+      callbacks.add(callback)
+      return () => { callbacks.delete(callback); if (!callbacks.size && backlogCleared.get(key) === callbacks) backlogCleared.delete(key) }
+    },
     callerUuid() {
       if (callerUuid) return callerUuid
       // start() has already ensured the queue directory.
@@ -1078,11 +1187,13 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
         settle: outcome => resolve('error' in outcome ? storeFailed(key, input, outcome.error) : outcome.result as QueueAcceptResult),
       }))
     },
-    async acceptDecided<T>(key: string, slackKey: SlackKey | undefined, decide: (facts: { keyChecked: boolean }) => QueueAcceptDecision<T>): Promise<QueueDecidedResult<T>> {
+    async acceptDecided<T>(key: string, slackKey: SlackKey | undefined, decide: (facts: { keyChecked: boolean }) => QueueAcceptDecision<T>, thread?: QueueEffectThread): Promise<QueueDecidedResult<T>> {
       let input: AcceptedInput | undefined
-      try { slackKey = structuredClone(slackKey) } catch (error) { return storeFailed(key, input, error) }
+      try { slackKey = structuredClone(slackKey); thread = structuredClone(thread) } catch (error) { return storeFailed(key, input, error) }
       return new Promise<QueueDecidedResult<T>>(resolve => enqueueAccept(key, {
         dedupeKey: slackKey,
+        decides: true,
+        thread,
         async stage() {
           let keyChecked = false, unavailable: unknown
           try {
@@ -1096,7 +1207,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
           if ('skip' in decision) return { result: { status: 'skipped' as const, outcome: decision.skip } }
           input = structuredClone(decision.store)
           if (!keyChecked) throw unavailable
-          return { input, afterStore: decision.afterStore }
+          return { input, afterStore: decision.afterStore, effectThread: structuredClone(decision.effectThread) }
         },
         settle: outcome => resolve('error' in outcome ? storeFailed(key, input, outcome.error) : outcome.result as QueueDecidedResult<T>),
       }))

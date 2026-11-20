@@ -114,6 +114,9 @@ export function cloneJournalData<T>(value: T): T {
 
 export interface DurableJournalOptions {
   dir: string; parentDir: string; directoryMode: number; fileMode: number; fs?: typeof nodeFs
+  /** Opt-in for Thread Memory rewrites. Appends and queue rewrites retain
+   * their existing whole-buffer write. */
+  rewriteChunkBytes?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -138,10 +141,10 @@ let appendTimer: DurableAppendTimer | undefined
  * append reads no clock and runs exactly as before. */
 export function setDurableAppendTimer(timer: DurableAppendTimer | undefined): void { appendTimer = timer }
 
-/** The syscalls that wait for the disk. Each sequence below yields them, so
- * one ordering runs either on the I/O pool or, for read-time quarantine
- * only, blocking. Every other step is immediate and stays synchronous. */
-type DurableStep = { op: 'fsync'; fd: number; target: 'file' | 'dir' } | { op: 'rename'; from: string; to: string }
+/** Sequences yield disk waits to the I/O pool (or, for read-time quarantine
+ * only, run them blocking). Thread Memory rewrites also yield event-loop
+ * turns between bounded synchronous writes. */
+type DurableStep = { op: 'fsync'; fd: number; target: 'file' | 'dir' } | { op: 'rename'; from: string; to: string } | { op: 'yield' }
 type DurableSteps = Generator<DurableStep, void, void>
 interface StepTimes { now(): number; fileFsyncMs: number; dirFsyncMs: number; fsyncs: number }
 interface FileIdentity { dev: number; ino: number; birthtimeMs: number }
@@ -149,6 +152,7 @@ const sameFile = (a: FileIdentity, b: FileIdentity) => a.dev === b.dev && a.ino 
 /** `readFileSync`'s steps after a successful open. */
 const AFTER_OPEN_SYSCALLS = new Set(['read', 'fstat'])
 export function createDurableJournal(options: DurableJournalOptions) {
+  if (options.rewriteChunkBytes !== undefined && (!Number.isSafeInteger(options.rewriteChunkBytes) || options.rewriteChunkBytes <= 0)) throw new Error('Invalid journal rewrite chunk size')
   const fs = options.fs ?? nodeFs, dir = options.dir
   let durableDirectory: { dev: number; ino: number } | undefined
   const fileModes = new Map<string, FileIdentity>()
@@ -178,12 +182,13 @@ export function createDurableJournal(options: DurableJournalOptions) {
     try {
       for (let next = steps.next(); !next.done;) {
         const step = next.value
-        try { if (step.op === 'fsync') fs.fsyncSync(step.fd); else fs.renameSync(step.from, step.to) } catch (error) { next = steps.throw(error); continue }
+        try { if (step.op === 'fsync') fs.fsyncSync(step.fd); else if (step.op === 'rename') fs.renameSync(step.from, step.to); else throw new Error('A yielding rewrite cannot run synchronously') } catch (error) { next = steps.throw(error); continue }
         next = steps.next()
       }
     } finally { testSyncWorkEnd(start, 'journal-sync-recovery') }
   }
   function perform(step: DurableStep): Promise<void> {
+    if (step.op === 'yield') return yieldToEventLoop()
     return new Promise((resolve, reject) => {
       const done = (error: NodeJS.ErrnoException | null) => { if (error) reject(error); else resolve() }
       if (step.op === 'fsync') fs.fsync(step.fd, done)
@@ -310,7 +315,14 @@ export function createDurableJournal(options: DurableJournalOptions) {
     yield* ensureDirSteps()
     try {
       const fd = fs.openSync(temp, 'wx', options.fileMode)
-      try { writeAll(fd, bytes); yield { op: 'fsync', fd, target: 'file' } } finally { fs.closeSync(fd) }
+      try {
+        const chunk = options.rewriteChunkBytes ?? Math.max(1, bytes.length)
+        for (let offset = 0; offset < bytes.length; offset += chunk) {
+          writeAll(fd, bytes.subarray(offset, offset + chunk))
+          if (offset + chunk < bytes.length) yield { op: 'yield' }
+        }
+        yield { op: 'fsync', fd, target: 'file' }
+      } finally { fs.closeSync(fd) }
       // A failed rename may have replaced the entry or left no file, so the
       // path is untracked until its next opening, a creating append's included.
       try { yield { op: 'rename', from: temp, to: path } } catch (error) { entries.delete(path); throw error }

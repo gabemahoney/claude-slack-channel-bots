@@ -44,7 +44,7 @@ import { QUEUE_COMPACT_INTERVAL_MS } from './delivery-queue.ts'
 import { DurableUnlinkUnsyncedError } from './atomic-write.ts'
 import type { ThreadMemoryJournalFact, ThreadMemoryJournalFacts, ThreadMemorySealPort, ThreadMemoryStoreIdentity } from './thread-memory-seal.ts'
 import { createDurableJournal, splitJournalLines, removeTornTail, yieldToEventLoop, type AppendRollback } from './durable-journal.ts'
-import { THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MAX_MS, THREAD_MEMORY_RETRY_MIN_MS } from './delivery-constants.ts'
+import { THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MAX_MS, THREAD_MEMORY_RETRY_MIN_MS, THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS, THREAD_MEMORY_REWRITE_CHUNK_BYTES } from './delivery-constants.ts'
 import type { PersonaConnectionClock } from './persona-connections.ts'
 import { SLACK_ERROR_CODE_RE, WEB_API_AUTH_FAILURE_ERRORS, slackRetryAfterSeconds } from './persona-slack-validation.ts'
 import { sameChannelStamp, type ChannelStamp } from './shared-channels.ts'
@@ -287,6 +287,11 @@ export interface ThreadMemoryOptions {
   monotonicNow?: () => number
   /** Clock for the bounded post-ACK join-save window. */
   joinSaveClock?: Pick<PersonaConnectionClock, 'setTimeout' | 'clearTimeout'>
+  /** P's queue owns this signal; subscribing must not miss a clear between
+   * has() and onCleared(). No signal means there is no acceptance backlog. */
+  acceptanceBacklog?: { has(key: string): boolean; onCleared(key: string, callback: () => void): () => void }
+  /** Monotonic clock and timer for maintenance's bounded backlog wait. */
+  maintenanceClock?: Pick<PersonaConnectionClock, 'now' | 'setTimeout' | 'clearTimeout'>
   seal?: ThreadMemorySealPort
   setInterval?: typeof globalThis.setInterval; clearInterval?: typeof globalThis.clearInterval
   appliedKeys(): readonly string[]
@@ -726,7 +731,7 @@ async function serializeSavedImage(j: MemoryJournal, header: ThreadMemoryHeader,
 export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
   const fs = options.fs ?? nodeFs, now = options.now ?? Date.now, dir = join(options.stateDir, 'threads')
   const monotonicNow = options.monotonicNow ?? (() => performance.now())
-  const io = createDurableJournal({ dir, parentDir: options.stateDir, directoryMode: THREAD_MEMORY_DIRECTORY_MODE, fileMode: THREAD_MEMORY_FILE_MODE, fs })
+  const io = createDurableJournal({ dir, parentDir: options.stateDir, directoryMode: THREAD_MEMORY_DIRECTORY_MODE, fileMode: THREAD_MEMORY_FILE_MODE, fs, rewriteChunkBytes: THREAD_MEMORY_REWRITE_CHUNK_BYTES })
   const journals = new Map<string, MemoryJournal>(), writers = new Map<string, Promise<unknown>>()
   interface JoinSaveRequest { facts: ThreadJoin[]; resolve(result: ThreadMemoryWriteResult): void }
   interface JoinSaveGroup {
@@ -741,6 +746,12 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
   const forgotten = new Set<string>(), clocks = new Map<string, number>()
   const pendingJoins = new Map<string, ThreadJoin[]>()
   const maintenanceQueued = new WeakSet<MemoryJournal>()
+  const maintenanceWaits = new Map<MemoryJournal, () => void>()
+  const maintenanceClock = options.maintenanceClock ?? {
+    now: () => performance.now(),
+    setTimeout: (fn: () => void, ms: number) => globalThis.setTimeout(fn, ms),
+    clearTimeout: (handle: unknown) => globalThis.clearTimeout(handle as ReturnType<typeof globalThis.setTimeout>),
+  }
   // Records are private immutable versions. Failed writes do not install
   // their records in the saved indexes; weak keys release abandoned versions.
   const recordLines = new WeakMap<ThreadMemoryRecord, string>()
@@ -1501,7 +1512,9 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
   async function remove(key: string): Promise<ThreadMemoryWriteResult> {
     pathFor(key)
     if (options.canRemove?.(key) === false) return { kind: 'kept' }
+    const j = journals.get(key)
     forgotten.add(key); journals.delete(key); pendingJoins.delete(key)
+    if (j) maintenanceWaits.get(j)?.()
     return serial(key, async () => {
       if (options.dryRun || stopped || quiesced) return { kind: 'cancelled' }
       if (options.canRemove?.(key) === false) return { kind: 'kept' }
@@ -1540,9 +1553,40 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
    * state at or after this trigger. A forgotten journal's mark goes with it. */
   async function compactForMaintenance(): Promise<void> {
     await Promise.allSettled([...journals].filter(([, j]) => !maintenanceQueued.has(j)).map(([k, j]) => {
+      const triggeredAt = maintenanceClock.now()
       maintenanceQueued.add(j)
-      return serial(k, () => { maintenanceQueued.delete(j); return compactOne(k, j, undefined, true) })
+      return serial(k, async () => {
+        try { await waitForAcceptanceBacklog(k, j, triggeredAt) }
+        finally { maintenanceQueued.delete(j) }
+        await compactOne(k, j, undefined, true)
+      })
     }))
+  }
+  /** Coalesced triggers retain the first trigger's deadline. Waiting owns no
+   * queue turn and never delays a queue store, even for this same persona. */
+  async function waitForAcceptanceBacklog(key: string, j: MemoryJournal, triggeredAt: number): Promise<void> {
+    const backlog = options.acceptanceBacklog
+    if (!current(key, j) || !backlog?.has(key)) return
+    const remaining = triggeredAt + THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS - maintenanceClock.now()
+    if (remaining <= 0) return
+    await new Promise<void>(resolve => {
+      let done = false, unsubscribe: (() => void) | undefined
+      let timeout: ReturnType<PersonaConnectionClock['setTimeout']> | undefined
+      const finish = () => {
+        if (done) return
+        done = true
+        if (timeout !== undefined) maintenanceClock.clearTimeout(timeout)
+        unsubscribe?.()
+        maintenanceWaits.delete(j)
+        resolve()
+      }
+      maintenanceWaits.set(j, finish)
+      timeout = maintenanceClock.setTimeout(finish, remaining)
+      unsubscribe = backlog.onCleared(key, finish)
+      // A subscribing adapter may notify synchronously.
+      if (done) unsubscribe()
+      else if (!backlog.has(key)) finish()
+    })
   }
   const api: ThreadMemory = {
     readAtStart() {
@@ -1737,7 +1781,11 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     advancePast,
     flush(key) { const j = journals.get(key); return j ? serial(key, () => saveKept(key, j)) : Promise.resolve({ kind: 'cancelled' }) },
     compact,
-    forget(key) { forgotten.add(key); journals.delete(key); pendingJoins.delete(key); sealJoinSaves(key) },
+    forget(key) {
+      const j = journals.get(key)
+      forgotten.add(key); journals.delete(key); pendingJoins.delete(key); sealJoinSaves(key)
+      if (j) maintenanceWaits.get(j)?.()
+    },
     remove, removeUnappliedAtStart,
     startMaintenance(intervalMs) {
       if (stopped || quiesced || timer !== undefined) return
@@ -1748,6 +1796,7 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
     setCompactionObserver(observer) { compactionObserver = observer },
     async quiesce() {
       quiesced = true
+      for (const finish of maintenanceWaits.values()) finish()
       for (const key of formingJoinSaves.keys()) sealJoinSaves(key)
       await Promise.allSettled([...writers.values()])
     },

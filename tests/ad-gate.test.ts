@@ -1629,8 +1629,12 @@ interface FakeScenario {
   readonly badManifestLine?: 'cand' | 'ref'
   /** The first `jobsched wait` fails. */
   readonly failWaitOnce?: boolean
+  /** Limit the interrupted wait to one that includes this role. */
+  readonly failWaitRole?: 'cand' | 'ref'
   /** Job names to end on successive successful waits; after these batches, end all requested jobs. */
   readonly waitBatches?: readonly (readonly string[])[]
+  /** Unfinished jobs report this state; running by default. */
+  readonly pendingState?: 'queued' | 'running'
   /** The role whose jobs' result.json reports an OOM kill. */
   readonly oomKilled?: 'cand' | 'ref'
   /** The role whose jobs keep no result.json. */
@@ -1684,6 +1688,14 @@ const SLOT_WORK_SECONDS = 260
 const BURST_CLI_SCRIPTS: Readonly<Record<string, string | null>> = { ...CLI_SCRIPTS, [THREAD_BURST]: null }
 const BURST_CLI_DURATIONS = durationsText([[1, 10], [2, 5], [3, 5], [5, 100], [6, 50], [44, 30]])
 
+/** Two distinct burst shards (the longest units), plus three ordinary shards. */
+const ISOLATION_SCRIPTS: Readonly<Record<string, string | null>> = { ...BURST_CLI_SCRIPTS, [MEMBERSHIP_LOAD]: null }
+const ISOLATION_DURATIONS = durationsText([[1, 10], [2, 5], [3, 5], [5, 100], [6, 50], [44, 300], [51, 200]])
+
+const BURST_RESUME_CASES = (['cand', 'ref'] as const).flatMap((role) =>
+  (['queued', 'running'] as const).map((pendingState) => ({ role, pendingState, name: `burst-resume-${role}-${pendingState}` })),
+)
+
 /** Manifest burst_driver values readManifest refuses, by scenario name (b.ya4); `'absent'` leaves the key out. */
 const MALFORMED_BURST_DRIVERS: readonly (readonly [string, unknown])[] = [
   ['burst-driver-absent', 'absent'],
@@ -1734,6 +1746,15 @@ interface CliRun {
   readonly calls: readonly (readonly string[])[]
   /** Every fake prepare.sh call's role, in order. */
   readonly prepared: readonly string[]
+  /** Scheduler lifecycle facts, including ends before a resumed invocation. */
+  readonly events: readonly SchedulerEvent[]
+}
+
+interface SchedulerEvent {
+  readonly event: 'submit' | 'end'
+  readonly id: string
+  readonly name: string
+  readonly scripts: readonly string[]
 }
 
 let root = ''
@@ -1834,6 +1855,7 @@ async function runGate(dir: string, extra: readonly string[], candidateDist: str
     out,
     calls: jsonLines<string[]>(join(dir, 'jobsched-calls.jsonl')),
     prepared: jsonLines<{ role: string }>(join(dir, 'prepare-calls.jsonl')).map((call) => call.role),
+    events: jsonLines<SchedulerEvent>(join(dir, 'jobsched-events.jsonl')),
   }
 }
 
@@ -1854,6 +1876,30 @@ function submittedNames(run: CliRun): string[] {
 /** The submit call for a job name. */
 function submitCall(run: CliRun, name: string): readonly string[] {
   return run.calls.find((call) => call[0] === 'submit' && call[call.indexOf('--name') + 1] === name)!
+}
+
+/** Independent known burst scripts, rather than resource flags or the production classifier. */
+function hasIsolationBurst(scripts: readonly string[]): boolean {
+  return scripts.includes(THREAD_BURST) || scripts.includes(MEMBERSHIP_LOAD)
+}
+
+function isBurstSubmit(call: readonly string[]): boolean {
+  return call[0] === 'submit' && hasIsolationBurst(call.slice(call.indexOf('--') + 1))
+}
+
+/** A submitted job stays active until the scheduler actually ends it, even across failed waits. */
+function expectBurstIsolation(run: CliRun, role?: 'ref'): void {
+  const active = new Map<string, string>()
+  for (const event of run.events.filter((event) => hasIsolationBurst(event.scripts) && (role === undefined || event.name.includes(`-${role}-`)))) {
+    if (event.event === 'submit') {
+      expect([...active.values()], `burst ${event.name} submitted before earlier burst jobs ended`).toEqual([])
+      active.set(event.id, event.name)
+    } else {
+      expect(active.get(event.id)).toBe(event.name)
+      active.delete(event.id)
+    }
+  }
+  expect([...active.values()]).toEqual([])
 }
 
 interface ReleaseVerdict {
@@ -1980,6 +2026,7 @@ describe('the command line over a fake scheduler', () => {
       runs[`${name}-resumed`] = await runGate(dir, ['--resume'])
     }
     const slotScenario = { scripts: SLOT_SCRIPTS, durations: SLOT_DURATIONS }
+    const isolationScenario = { scripts: ISOLATION_SCRIPTS, durations: ISOLATION_DURATIONS, burstDriver: BURST_V0191, waitBatches: [] }
     const twoReleases = ['--cscb-version', SECOND_CSCB_VERSION]
     await Promise.all([
       // The shard count from the free slots (engineer fix round 3).
@@ -1993,7 +2040,7 @@ describe('the command line over a fake scheduler', () => {
       once('list-not-object', { listOutput: '[]' }),
       once('list-fails', { listFails: true }),
       // Releases submitted together.
-      once('two-releases', {}, twoReleases),
+      once('two-releases', isolationScenario, twoReleases),
       once('two-releases-one-reference', { fail: { cand: ['test-5'], ref: ['test-5'] }, onlyRelease: SECOND_CSCB_VERSION }, twoReleases),
       once('two-releases-staged-reference', {
         fail: { cand: ['test-5'], ref: ['test-5'] },
@@ -2041,6 +2088,13 @@ describe('the command line over a fake scheduler', () => {
       once('only', {}, ['--only', 'test-6']),
       once('inject-fail', { fail: { cand: [], ref: ['test-5'] } }, ['--inject-fail', 'test-5']),
       // Burst-driver shards (b.ya4).
+      once('burst-isolation', isolationScenario),
+      once('burst-isolation-reference', { ...isolationScenario, fail: { cand: ['test-44', 'test-51'], ref: ['test-44', 'test-51'] } }, twoReleases),
+      once('burst-isolation-dry-run', isolationScenario, [...twoReleases, '--dry-run']),
+      ...BURST_RESUME_CASES.map(({ role, pendingState, name }) => twice(name, {
+        ...isolationScenario, pendingState, failWaitOnce: true, failWaitRole: role,
+        ...(role === 'ref' ? { fail: { cand: ['test-44', 'test-51'], ref: ['test-44', 'test-51'] } } : {}),
+      }, twoReleases)),
       once('burst', { scripts: BURST_CLI_SCRIPTS, durations: BURST_CLI_DURATIONS, burstDriver: BURST_V0191, fail: { cand: ['test-44'], ref: ['test-44'] } }),
       once('burst-pattern-mismatch', { scripts: BURST_CLI_SCRIPTS, durations: BURST_CLI_DURATIONS, burstDriver: { cpus: 4, pattern: '-fmk-thread-burst\\.sh$' } }),
       once('burst-reference-differs', {
@@ -2207,6 +2261,83 @@ describe('the command line over a fake scheduler', () => {
     for (const call of submits.filter(isBurst)) expect(limits(call)).toEqual([['writable'], ['4']])
     expect(submits.filter((call) => !isBurst(call))).toHaveLength(3)
     for (const call of submits.filter((call) => !isBurst(call))) expect(limits(call)).toEqual([undefined, ['2']])
+  })
+
+  test.each([
+    ['one release', 'burst-isolation', 2],
+    ['two releases', 'two-releases', 4],
+    ['candidate and reference roles across two releases', 'burst-isolation-reference', 8],
+  ] as const)('burst isolation: %s never has two submitted, unfinished burst shards', (_label, name, burstCount) => {
+    const run = runs[name]
+    expect(run.code).toBe(0)
+    expect(run.calls.filter(isBurstSubmit)).toHaveLength(burstCount)
+    expectBurstIsolation(run)
+    for (const version of name === 'burst-isolation' ? [CSCB_VERSION] : [CSCB_VERSION, SECOND_CSCB_VERSION]) {
+      expect(releaseVerdict(run, version).outcome).toBe('pass')
+    }
+    if (name === 'burst-isolation-reference') {
+      expect(run.calls.filter(isBurstSubmit).filter((call) => call.some((word) => /-ref-s\d+$/.test(word)))).toHaveLength(4)
+      for (const version of [CSCB_VERSION, SECOND_CSCB_VERSION]) {
+        expect(releaseVerdict(run, version).verdict.excused).toEqual([THREAD_BURST, MEMBERSHIP_LOAD])
+      }
+    }
+  })
+
+  test('burst isolation: reference reruns across releases wait for the preceding reference burst to end', () => {
+    const run = runs['burst-isolation-reference']
+    expect(run.code).toBe(0)
+    expect(run.events.filter((event) => event.event === 'submit' && event.name.includes('-ref-') && hasIsolationBurst(event.scripts))).toHaveLength(4)
+    expectBurstIsolation(run, 'ref')
+  })
+
+  test.each(BURST_RESUME_CASES)('burst isolation: --resume after an interrupted $role wait with $pendingState jobs never overlaps or resubmits a shard', ({ role, name }) => {
+    const first = runs[name]
+    const resumed = runs[`${name}-resumed`]
+    expect(first.code).toBe(2)
+    expect(first.stderr).toContain('fake jobsched: wait interrupted')
+    expect(resumed.code).toBe(0)
+    const expectedNames = [CSCB_VERSION, SECOND_CSCB_VERSION].flatMap((version) => [
+      ...[1, 2, 3, 4, 5].map((k) => `adg-${version}-cand-s${k}`),
+      ...(role === 'ref' ? [1, 2].map((k) => `adg-${version}-ref-s${k}`) : []),
+    ])
+    expect(submittedNames(resumed).sort()).toEqual(expectedNames.sort())
+    expect(resumed.events.filter((event) => event.event === 'submit').map((event) => event.name).sort()).toEqual(expectedNames.sort())
+    expect(resumed.calls.filter(isBurstSubmit)).toHaveLength(role === 'ref' ? 8 : 4)
+    expectBurstIsolation(resumed)
+    for (const version of [CSCB_VERSION, SECOND_CSCB_VERSION]) expect(releaseVerdict(resumed, version).outcome).toBe('pass')
+  })
+
+  test('burst isolation: every ordinary candidate shard is submitted before the first wait beside a burst shard', () => {
+    for (const name of ['burst-isolation', 'two-releases']) {
+      const run = runs[name]
+      expect(run.code).toBe(0)
+      const firstWait = run.calls.findIndex((call) => call[0] === 'wait')
+      expect(firstWait).toBeGreaterThan(0)
+      const submits = run.calls.filter((call) => call[0] === 'submit')
+      const beforeWait = run.calls.slice(0, firstWait).filter((call) => call[0] === 'submit')
+      expect(beforeWait.filter((call) => !isBurstSubmit(call))).toEqual(submits.filter((call) => !isBurstSubmit(call)))
+      expect(beforeWait.filter((call) => !isBurstSubmit(call))).toHaveLength(name === 'two-releases' ? 6 : 3)
+      expect(beforeWait.filter(isBurstSubmit).length).toBeGreaterThan(0)
+      // Held jobs end only in a successful wait: those ordinary submissions
+      // really share the first burst's active lifetime, whichever was submitted first.
+      const firstEnd = run.events.findIndex((event) => event.event === 'end')
+      expect(run.events.slice(0, firstEnd).filter((event) => event.event === 'submit')).toHaveLength(beforeWait.length)
+    }
+  })
+
+  test('burst isolation: a dry run lists every command and explains which shards run one at a time', () => {
+    const run = runs['burst-isolation-dry-run']
+    expect([run.code, run.calls, run.prepared]).toEqual([0, [LIST_CALL], ['cand', 'cand']])
+    const printed = run.stdout.split('\n').filter((line) => line.startsWith(`${jobsched} submit `))
+    const expectedNames = [1, 2, 3, 4, 5].flatMap((k) => [CSCB_VERSION, SECOND_CSCB_VERSION].map((version) => `adg-${version}-cand-s${k}`))
+    expect(printed.map((line) => /--name (\S+)/.exec(line)?.[1])).toEqual(expectedNames)
+    for (const version of [CSCB_VERSION, SECOND_CSCB_VERSION]) {
+      const recorded = readFileSync(join(run.out, `cscb-${version}`, 'candidate', 'submit-commands.txt'), 'utf8').trim().split('\n')
+      expect(printed.filter((line) => line.includes(`adg-${version}-cand-`))).toEqual(recorded)
+    }
+    // Wording belongs to the driver; require the plan to identify burst
+    // serialization without pinning a new sentence before implementation.
+    expect(run.stdout).toMatch(/burst[^\n]*(?:one at a time|serial|sequential)|(?:one at a time|serial|sequential)[^\n]*burst/i)
   })
 
   test("report.md and verdict.json show each shard job's cpus and cgroups, so a run shows its burst-driver shards (b.ya4)", () => {
@@ -2432,19 +2563,24 @@ describe('the command line over a fake scheduler', () => {
     expect(run.stderr).not.toContain('(unexpected error)')
   })
 
-  test("two releases: every candidate shard is submitted, longest first across the releases, before one wait on all their jobs", () => {
+  test('two releases: candidates stay longest first within each lane, ordinary shards precede the first wait and burst shards wait their turn', () => {
     const run = runs['two-releases']
     const state = stateOf(run)
     const firstWait = run.calls.findIndex((call) => call[0] === 'wait')
-    const lastSubmit = run.calls.map((call) => call[0]).lastIndexOf('submit')
+    const submits = run.calls.filter((call) => call[0] === 'submit')
     const candidateJobs = [CSCB_VERSION, SECOND_CSCB_VERSION].flatMap((version) => Object.values(state.versions[version].candidate.jobs))
+    const beforeWait = run.calls.slice(0, firstWait).filter((call) => call[0] === 'submit')
+    const firstJobIds = run.events.filter((event) => event.event === 'submit').slice(0, beforeWait.length).map((event) => event.id)
+    const namesOf = (calls: readonly (readonly string[])[]): string[] => calls.map((call) => call[call.indexOf('--name') + 1])
 
     expect([run.code, listCalls(run), state.shardChoice?.releases]).toEqual([0, 1, 2])
-    expect(submittedNames(run)).toEqual(
-      [1, 2, 3].flatMap((k) => [`adg-${CSCB_VERSION}-cand-s${k}`, `adg-${SECOND_CSCB_VERSION}-cand-s${k}`]),
-    )
-    expect(lastSubmit).toBeLessThan(firstWait)
-    expect(waitedIds(run.calls[firstWait]).sort()).toEqual(candidateJobs.sort())
+    expect(namesOf(submits.filter(isBurstSubmit))).toEqual([1, 2].flatMap((k) => [`adg-${CSCB_VERSION}-cand-s${k}`, `adg-${SECOND_CSCB_VERSION}-cand-s${k}`]))
+    const ordinary = submits.filter((call) => !isBurstSubmit(call))
+    expect(namesOf(ordinary)).toEqual([3, 4, 5].flatMap((k) => [`adg-${CSCB_VERSION}-cand-s${k}`, `adg-${SECOND_CSCB_VERSION}-cand-s${k}`]))
+    expect(beforeWait.filter((call) => !isBurstSubmit(call))).toEqual(ordinary)
+    expect(beforeWait.filter(isBurstSubmit)).toHaveLength(1)
+    expect(waitedIds(run.calls[firstWait]).sort()).toEqual(firstJobIds.sort())
+    expect([...new Set(run.calls.filter((call) => call[0] === 'wait').flatMap(waitedIds))].sort()).toEqual(candidateJobs.sort())
     expect([releaseVerdict(run).outcome, releaseVerdict(run, SECOND_CSCB_VERSION).outcome]).toEqual(['pass', 'pass'])
     expect((JSON.parse(readFileSync(join(run.out, 'verdict.json'), 'utf8')) as { outcome: string }).outcome).toBe('pass')
   })

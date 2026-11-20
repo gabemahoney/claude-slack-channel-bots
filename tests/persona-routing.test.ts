@@ -11,6 +11,7 @@ import { durableWriteFileSync, DurableWriteUnsyncedError } from '../src/atomic-w
 import { buildTagParts, NAME_LOOKUP_TIMEOUT_MS, TAG_MAX_BYTES, TAG_MAX_BYTES_MACOS } from '../src/tag-wrapper.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import type { AcceptedRecord, PostHoldField, QueueEvent } from '../src/delivery-queue.ts'
+import { QUEUE_GROUP_COMMIT_MAX } from '../src/delivery-queue.ts'
 import { createDeliveryReporting, MESSAGE_NOT_SAVED, buildMessageNotSavedNotice } from '../src/delivery-notices.ts'
 import { createOriginalConversationPoster } from '../src/notice-correction.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
@@ -19,7 +20,7 @@ import { buildThreadMemoryChangedWhileStoppedNotice } from '../src/thread-memory
 import { LIVENESS_READING_DEAD_ENDED } from '../src/liveness-reading.ts'
 import { sanitizeFilename } from '../src/lib.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
-import { durableIo } from './test-helpers/durable-io.ts'
+import { durableIo, heldStep } from './test-helpers/durable-io.ts'
 import { outputDuringAsync } from './test-helpers/slack-logger-probes.ts'
 import { makeRestartDeps, makeRoutingHarness, observedMembership, resetRoutingState, NEVER_FIRE_RESTART_DELAY_S, type RoutingHarness, type RoutingHarnessOptions } from './test-helpers/persona-routing-harness.ts'
 import { asWebClient, broadcastText, makeAppMention, makeChannelMessage, makeDm, makeGroupDmMessage, makeBotMessage, makeOwnFileShare, makeReaction, makeWebhookPost, makeStubSlack, makeDeferredWebApiCall, makeMembershipEvent, mentionText, ENVELOPE_FLAG_FORMS, type EnvelopeOverrides, type OwnFileShareOptions, type SlackEvent } from './test-helpers/slack-stub.ts'
@@ -470,12 +471,101 @@ describe.each(['strict', 'open'] as const)('%s serial hybrid joins', mode => {
   const mention = (h: RoutingHarness, root: string = THREAD_ROOTS.primary) => makeChannelMessage({ channel: CA, ts: root, text: mentionText(h.p('alpha').stub.identity.botUserId) })
   const expected = (event: SlackEvent, via: string) => ({ channel: event.channel as string, ts: event.ts as string, text: event.text as string, via })
   const savedJoins = (key = 'alpha') => readThreads(dir, key).filter(r => r.kind === 'join')
+  const fileSyncs = (io: ReturnType<typeof threadFsControls>) => io.calls.filter(c => c.op === 'fsync' && c.path === queuePath(dir))
+
+  test('SR-9.11: sixteen first-time root mentions share two capped commits, with each join and ack after its group fsyncs', async () => {
+    const io = threadFsControls(dir), h = await joined({ queueOptions: { fs: io.fs } }), t = h.threads!
+    const count = 2 * QUEUE_GROUP_COMMIT_MAX
+    const events = Array.from({ length: count }, (_, i) => mention(h, `1700000100.${String(i + 1).padStart(6, '0')}`))
+    const first = io.hold('fsync', 'alpha', { match: path => path === queuePath(dir) })
+    const directory = io.hold('fsync', 'alpha', { match: path => path === join(dir, 'queue') })
+    const second = io.hold('fsync', 'alpha', { match: path => path === queuePath(dir) })
+    const ackGate = heldStep(), releaseSaves = h.holdJoinSaves('alpha')
+    const atAck: Array<{ index: number; joined: string; seq: number | undefined }> = []
+    const work = Promise.all(events.map((event, index) => h.receive(event, ['alpha'], async () => {
+      const stored = h.queue.lookupSlackKey('alpha', { chat_id: CA, ts: event.ts as string })
+      atAck.push({ index, joined: t.memory.view('alpha', CA, event.ts as string), seq: stored && stored.status !== 'failed' ? stored.seq : undefined })
+      await ackGate.promise
+    })))
+    try {
+      await first.reached
+      expect(readQueue(dir).map(r => r.seq)).toEqual(Array.from({ length: QUEUE_GROUP_COMMIT_MAX }, (_, i) => i + 1))
+      expect(atAck).toEqual([]); expect(h.queued('alpha')).toEqual([])
+      expect(t.memory.joins('alpha')).toEqual([])
+      first.release(); await directory.reached
+      // File durability alone is insufficient for the newly created journal.
+      await t.clock.flush()
+      expect(atAck).toEqual([]); expect(h.queued('alpha')).toEqual([])
+      expect(t.memory.joins('alpha')).toEqual([])
+      directory.release(); await second.reached; await t.clock.flush()
+      expect(fileSyncs(io)).toHaveLength(2)
+      expect(readQueue(dir).map(r => r.seq)).toEqual(Array.from({ length: count }, (_, i) => i + 1))
+      expect(atAck).toEqual(Array.from({ length: QUEUE_GROUP_COMMIT_MAX }, (_, i) => ({ index: i, joined: 'joined', seq: i + 1 })))
+      expect(h.queued('alpha')).toHaveLength(QUEUE_GROUP_COMMIT_MAX)
+      expect(t.memory.joins('alpha').map(({ join }) => join.root)).toEqual(events.slice(0, QUEUE_GROUP_COMMIT_MAX).map(e => e.ts as string))
+      second.release(); await t.clock.flush()
+      expect(atAck).toEqual(events.map((_, index) => ({ index, joined: 'joined', seq: index + 1 })))
+      expect(fileSyncs(io)).toHaveLength(2)
+      expect(io.calls.filter(c => c.op === 'fsync' && c.path === join(dir, 'queue'))).toHaveLength(1)
+      expect(h.queued('alpha').map(i => [i.accepted.seq, i.accepted.via, i.accepted.thread_join?.thread_ts])).toEqual(events.map((event, i) => [i + 1, 'mention', event.ts as string]))
+      expect(h.queued('beta')).toEqual([]); expect(h.p('beta').stub.callLog).toEqual([])
+      expect(savedJoins()).toEqual([])
+    } finally {
+      first.release(); directory.release(); second.release(); ackGate.release(); releaseSaves()
+      await work; await h.settleJoinSaves()
+    }
+  })
+
+  test('SR-9.11: an unrelated thread decision runs while a join-bearing store fsync is unfinished', async () => {
+    const io = threadFsControls(dir), h = await joined({ queueOptions: { fs: io.fs } }), t = h.threads!
+    const store = io.hold('fsync', 'alpha', { match: path => path === queuePath(dir) })
+    const event = mention(h), other = reply(THREAD_ROOTS.secondary), acks: string[] = []
+    const work = Promise.all([h.receive(event, ['alpha'], () => { acks.push('mention') }), h.receive(other, ['alpha'], () => { acks.push('drop') })])
+    try {
+      await store.reached; await t.clock.flush()
+      expect(other.ts).not.toBe(event.ts)
+      expect(h.threadMemoryReads).toEqual([['alpha', CA, THREAD_ROOTS.secondary]])
+      expect(t.memory.view('alpha', CA, THREAD_ROOTS.primary)).toBe('not-joined')
+      expect(h.queued('alpha')).toEqual([]); expect(acks).not.toContain('mention')
+      store.release(); await work
+      expect(facts(h, 'alpha')).toEqual([expected(event, 'mention')])
+      expect(h.queued('beta')).toEqual([])
+      expect(acks).toEqual(['mention', 'drop'])
+      expect(h.threadMemoryReads).toEqual([['alpha', CA, THREAD_ROOTS.secondary]])
+    } finally { store.release(); await work }
+  })
+
+  test('SR-9.11: a same-thread reply waits for its mention join and holds the unrelated decision behind it', async () => {
+    const io = threadFsControls(dir), h = await joined({ queueOptions: { fs: io.fs } }), t = h.threads!
+    const store = io.hold('fsync', 'alpha', { match: path => path === queuePath(dir) })
+    const event = mention(h), next = reply(), behind = reply(THREAD_ROOTS.secondary), acks: string[] = []
+    const atRead: string[] = [], view = t.memory.view.bind(t.memory)
+    t.memory.view = (key, channel, root) => {
+      const result = view(key, channel, root)
+      if (key === 'alpha' && channel === CA && root === THREAD_ROOTS.primary) atRead.push(result)
+      return result
+    }
+    const work = Promise.all([event, next, behind].map((ev, i) => h.receive(ev, ['alpha'], () => { acks.push(String(i)) })))
+    try {
+      await store.reached; await t.clock.flush()
+      expect(h.threadMemoryReads).toEqual([]); expect(atRead).toEqual([])
+      expect(acks).toEqual([]); expect(h.queued('alpha')).toEqual([])
+      expect(t.memory.joins('alpha')).toEqual([])
+      store.release(); await work
+      expect(h.threadMemoryReads).toEqual([['alpha', CA, THREAD_ROOTS.primary], ['alpha', CA, THREAD_ROOTS.secondary]])
+      expect(atRead).toEqual(['joined'])
+      expect(facts(h, 'alpha')).toEqual([expected(event, 'mention'), expected(next, 'thread')])
+      expect(h.queued('alpha')[1]!.accepted.hold).toBeUndefined()
+      expect(h.queued('beta')).toEqual([]); expect(acks).toEqual(['0', '1', '2'])
+    } finally { store.release(); await work }
+  })
+
   function observeIntake(h: RoutingHarness) {
     const calls: string[] = []
     const decided = h.queue.acceptDecided, plain = h.queue.accept, lookup = h.queue.lookupSlackKey
-    h.queue.acceptDecided = (key, slackKey, decide) => {
+    h.queue.acceptDecided = (key, slackKey, decide, ...context) => {
       calls.push(`serial:${key}`)
-      return decided(key, slackKey, facts => { calls.push(`decide:${key}`); return decide(facts) })
+      return decided(key, slackKey, facts => { calls.push(`decide:${key}`); return decide(facts) }, ...context)
     }
     h.queue.accept = (key, input) => { calls.push(`plain:${key}`); return plain(key, input) }
     h.queue.lookupSlackKey = (key, slackKey) => { calls.push(`lookup:${key}`); return lookup(key, slackKey) }
@@ -839,7 +929,7 @@ describe.each(['strict', 'open'] as const)('%s serial hybrid joins', mode => {
     let enter!: () => void, release!: () => void
     const entered = new Promise<void>(resolve => { enter = resolve }), gate = new Promise<void>(resolve => { release = resolve })
     const h = await joined(), real = h.queue.acceptDecided, releaseSave = h.holdJoinSaves('beta')
-    h.queue.acceptDecided = async (key, slackKey, decide) => { if (key === 'alpha') { enter(); await gate }; return real(key, slackKey, decide) }
+    h.queue.acceptDecided = async (key, slackKey, decide, ...context) => { if (key === 'alpha') { enter(); await gate }; return real(key, slackKey, decide, ...context) }
     const pending = h.receive(mention(h), ['alpha'])
     await entered
     let finished = false
@@ -2027,14 +2117,14 @@ describe.each(['strict', 'open'] as const)('%s own-message hook', mode => {
     harnesses.push(h)
     await h.ready()
     const decided = h.queue.acceptDecided, plain = h.queue.accept, lookup = h.queue.lookupSlackKey
-    h.queue.acceptDecided = (key, slackKey, decide) => {
+    h.queue.acceptDecided = (key, slackKey, decide, ...context) => {
       paths.push(`serial:${key}`)
       return decided(key, slackKey, facts => {
         paths.push(`decide:${key}`)
         // Re-select in the same turn, as a re-run of the callback would.
         if (options.rerun) { decide(facts); paths.push(`decide:${key}`) }
         return decide(facts)
-      })
+      }, ...context)
     }
     h.queue.accept = (key, input) => { paths.push(`plain:${key}`); return plain(key, input) }
     h.queue.lookupSlackKey = (key, slackKey) => { paths.push(`lookup:${key}`); return lookup(key, slackKey) }
@@ -2188,6 +2278,78 @@ describe.each(['strict', 'open'] as const)('%s Post Hold routing through real ow
       await expect(post.settle()).rejects.toThrow('reported an error')
     }))
   }
+
+  test('SR-9.11: an unrelated thread decision runs while a Post Hold store fsync is unfinished', async () => {
+    const { h, t, queueIo } = await postHarness({ threadMemory: { monotonicNow: () => 5_000, postHolds: 'record' } })
+    const post = await heldPost(h, { thread_ts: R }), store = holdStore(queueIo)
+    const first = humanReply(), other = humanReply({ thread_ts: THREAD_ROOTS.secondary })
+    const work = Promise.all([h.receive(first, ['alpha']), h.receive(other, ['alpha'])])
+    try {
+      await store.reached; await t.clock.flush()
+      expect(other.ts).not.toBe(first.ts)
+      expect(h.threadMemoryReads).toEqual([['alpha', A, R], ['alpha', A, THREAD_ROOTS.secondary]])
+      expect(h.heldPostHolds).toEqual([]); expect(h.queued('alpha')).toEqual([])
+      expect(acks(h)).toEqual([])
+      store.release(); await work
+      expect(h.queued('alpha').map(i => [i.accepted.ts, i.accepted.via, i.hold?.kind])).toEqual([[first.ts as string, 'thread', 'post']])
+      expect(h.heldPostHolds.map(r => [r.key, r.hold.seq, r.hold.threadRoot, r.storeTurn])).toEqual([['alpha', 1, R, true]])
+      expect(h.queued('beta')).toEqual([]); expect(acks(h)).toHaveLength(2)
+    } finally { store.release(); await work; await post.settle() }
+  })
+
+  test('SR-9.11: a Post Hold thread event waits for registration and holds the unrelated decision behind it', async () => {
+    const { h, t, queueIo } = await postHarness({ threadMemory: { monotonicNow: () => 5_000, postHolds: 'record' } })
+    const post = await heldPost(h, { thread_ts: R }), store = holdStore(queueIo)
+    const first = humanReply(), next = humanReply(), behind = humanReply({ thread_ts: THREAD_ROOTS.secondary })
+    const atRead: number[][] = [], view = t.memory.view.bind(t.memory)
+    t.memory.view = (key, channel, root) => {
+      if (key === 'alpha' && channel === A && root === R) atRead.push(h.heldPostHolds.map(r => r.hold.seq))
+      return view(key, channel, root)
+    }
+    const work = Promise.all([first, next, behind].map(event => h.receive(event, ['alpha'])))
+    try {
+      await store.reached; await t.clock.flush()
+      expect(h.threadMemoryReads).toEqual([['alpha', A, R]])
+      expect(atRead).toEqual([[]]); expect(h.heldPostHolds).toEqual([])
+      expect(acks(h)).toEqual([]); expect(h.queued('alpha')).toEqual([])
+      store.release(); await work
+      expect(h.threadMemoryReads).toEqual([['alpha', A, R], ['alpha', A, R], ['alpha', A, THREAD_ROOTS.secondary]])
+      expect(atRead).toEqual([[], [1]])
+      expect(h.heldPostHolds.map(r => [r.key, r.hold.seq, r.hold.threadRoot, r.storeTurn])).toEqual([['alpha', 1, R, true], ['alpha', 2, R, true]])
+      expect(h.queued('alpha').map(i => [i.accepted.ts, i.accepted.via, i.hold?.kind])).toEqual([[first.ts as string, 'thread', 'post'], [next.ts as string, 'thread', 'post']])
+      expect(h.queued('beta')).toEqual([]); expect(acks(h)).toHaveLength(3)
+    } finally { store.release(); await work; await post.settle() }
+  })
+
+  test('SR-9.11: a failed group fails every join and Post Hold store, applies no effect and preserves decisions made ahead of its fsync', async () => {
+    const { h, t, queueIo, events } = await postHarness({ threadMemory: { monotonicNow: () => 5_000, postHolds: 'record' } })
+    const post = await heldPost(h, { thread_ts: R }), store = holdStore(queueIo)
+    const roots = [THREAD_ROOTS.secondary, THREAD_ROOTS.third]
+    const mentions = roots.map(ts => makeChannelMessage({ channel: A, ts, text: mentionText(h.p('alpha').stub.identity.botUserId) }))
+    const held = humanReply(), dropped = humanReply({ thread_ts: '1700000000.000099' })
+    const inputs = [mentions[0]!, held, mentions[1]!, dropped], acked: number[] = []
+    const work = Promise.all(inputs.map((event, i) => h.receive(event, ['alpha'], () => { acked.push(i) })))
+    try {
+      await store.reached; await t.clock.flush()
+      const beforeFailure = { records: readQueue(dir), decisions: [...h.threadMemoryReads], effects: [...h.heldPostHolds], joins: t.memory.joins('alpha') }
+      expect(h.queued('alpha')).toEqual([])
+      store.fail(Object.assign(new Error('EIO SR-9.11 group fsync'), { code: 'EIO' }))
+      await work
+      // Every independent decision was already fixed before the injected failure.
+      expect(beforeFailure.records.map(r => [r.seq, r.kind === 'accepted' && !('compact' in r) ? r.thread_join?.thread_ts ?? r.hold?.on : undefined])).toEqual([[1, roots[0]], [2, 'post'], [3, roots[1]]])
+      expect(beforeFailure.decisions).toEqual([['alpha', A, R], ['alpha', A, dropped.thread_ts as string]])
+      expect(h.threadMemoryReads).toEqual(beforeFailure.decisions)
+      expect(events.filter(e => e.type === 'store-failed').map(e => e.ts)).toEqual(inputs.slice(0, 3).map(e => e.ts as string))
+      expect(events.filter(e => e.type === 'stored')).toEqual([])
+      expect(h.heldPostHolds).toEqual(beforeFailure.effects); expect(h.heldPostHolds).toEqual([])
+      expect(t.memory.joins('alpha')).toEqual(beforeFailure.joins); expect(t.memory.joins('alpha')).toEqual([])
+      expect(h.queued('alpha')).toEqual([]); expect(h.queued('beta')).toEqual([])
+      expect(readQueue(dir)).toEqual([]); expect(acked).toEqual([3])
+      for (const event of inputs) expect(h.queue.lookupSlackKey('alpha', { chat_id: A, ts: event.ts as string })).toBeUndefined()
+      // The one failed append and its rollback, without retrying any member.
+      expect(queueIo.calls.filter(c => c.op === 'fsync' && c.path === queuePath(dir))).toHaveLength(2)
+    } finally { store.release(); await work; await post.settle() }
+  })
 
   test("a reply in P's thread before Slack answers P's post there is held for that post and acknowledged while the answer waits", async () => {
     const { h, t, received, settleFeedback } = await postHarness({ sessions: [] })
@@ -2498,7 +2660,7 @@ describe.each(['strict', 'open'] as const)('%s Post Hold routing through real ow
         await receipt.advance(1_234)
         // Time passes while the delivery waits for its serial turn; the reading stays the receipt's.
         const decided = h.queue.acceptDecided
-        h.queue.acceptDecided = async (key, slackKey, decide) => { await receipt.advance(10); return decided(key, slackKey, decide) }
+        h.queue.acceptDecided = async (key, slackKey, decide, ...context) => { await receipt.advance(10); return decided(key, slackKey, decide, ...context) }
         await h.receive(humanReply({ text: 'a second reply before Slack answers' }), ['alpha'])
         expect(receipt.now()).toBe(RECEIPT_START + 1_244)
         expect(h.heldPostHolds).toEqual([registration(h, 'alpha', 0, RECEIPT_START), registration(h, 'alpha', 1, RECEIPT_START + 1_234)])

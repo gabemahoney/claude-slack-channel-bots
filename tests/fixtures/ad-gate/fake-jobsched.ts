@@ -5,7 +5,11 @@
  * writes the run.log entry.sh would print for the shard at once. Jobs end
  * immediately by default; `waitBatches` instead ends the named jobs on each
  * successive successful wait, leaving the others running. Once the batches
- * are exhausted, waits end all requested jobs. `list --json` reports the
+ * are exhausted, waits end all requested jobs. `pendingState` can report
+ * those unfinished jobs as queued instead. Job submissions and actual ends
+ * are also recorded in jobsched-events.jsonl, so tests can detect overlap
+ * without inferring completion from a wait call that may fail or end a subset.
+ * `list --json` reports the
  * scenario's slots (6, none active or queued, by default), its raw
  * `listOutput`, or, with `listFails`, fails.
  *
@@ -38,7 +42,9 @@ interface Scenario {
   readonly listFails?: boolean
   readonly badManifestLine?: Role
   readonly failWaitOnce?: boolean
+  readonly failWaitRole?: Role
   readonly waitBatches?: readonly (readonly string[])[]
+  readonly pendingState?: 'queued' | 'running'
   readonly oomKilled?: Role
   readonly noResult?: Role
   readonly wrongName?: Role
@@ -56,6 +62,7 @@ interface Job {
   readonly ended: boolean
   readonly cpus: number
   readonly cgroups: string
+  readonly scripts: readonly string[]
 }
 
 const scenarioPath = process.env['AD_GATE_FAKE_SCENARIO'] ?? ''
@@ -80,6 +87,10 @@ function readJob(id: string): Job {
     process.exit(3)
   }
   return JSON.parse(readFileSync(jobPath(id, '.json'), 'utf8')) as Job
+}
+
+function recordEvent(event: 'submit' | 'end', job: Job): void {
+  appendFileSync(join(dir, 'jobsched-events.jsonl'), `${JSON.stringify({ event, id: job.id, name: job.name, scripts: job.scripts })}\n`)
 }
 
 /** Whether `file` is one of `names`, given as test-<n> or as the file name. */
@@ -121,6 +132,7 @@ function submit(): void {
     id, name, context, role, state: passed ? 'succeeded' : 'failed', exitCode: passed ? 0 : 1, ended: scenario.waitBatches === undefined,
     cpus: Number(optionValues(options, '--cpus')[0] ?? '4'),
     cgroups: optionValues(options, '--cgroups')[0] ?? 'readonly',
+    scripts,
   }
   const oomKilled = scenario.oomKilled === role
   writeFileSync(jobPath(id, '.run.log'), runLog)
@@ -128,6 +140,8 @@ function submit(): void {
     writeFileSync(jobPath(id, '.result.json'), JSON.stringify({ oom_killed: oomKilled, oom_notes: oomKilled ? ['fixture: an OOM kill in the container'] : [] }))
   }
   writeFileSync(jobPath(id, '.json'), JSON.stringify(job))
+  recordEvent('submit', job)
+  if (job.ended) recordEvent('end', job)
   process.stdout.write(`${id}\n`)
 }
 
@@ -136,7 +150,7 @@ function status(id: string): void {
   process.stdout.write(
     JSON.stringify({
       id,
-      state: job.ended ? job.state : 'running',
+      state: job.ended ? job.state : scenario.pendingState ?? 'running',
       terminal: job.ended,
       exit_code: job.ended ? job.exitCode : null,
       name: scenario.wrongName === job.role ? `${job.name}-other` : job.name,
@@ -171,13 +185,14 @@ function results(id: string): void {
 }
 
 function wait(): void {
+  const ids = args.filter((arg) => /^j[0-9]{14}-[0-9a-f]{6}$/.test(arg))
   const marker = join(dir, 'wait-failed-once')
-  if (scenario.failWaitOnce === true && !existsSync(marker)) {
+  if (scenario.failWaitOnce === true && !existsSync(marker) &&
+      (scenario.failWaitRole === undefined || ids.some((id) => readJob(id).role === scenario.failWaitRole))) {
     writeFileSync(marker, '')
     process.stderr.write('fake jobsched: wait interrupted\n')
     process.exit(1)
   }
-  const ids = args.filter((arg) => /^j[0-9]{14}-[0-9a-f]{6}$/.test(arg))
   let batch: readonly string[] | undefined
   if (scenario.waitBatches !== undefined) {
     const countPath = join(dir, 'wait-count.json')
@@ -187,7 +202,10 @@ function wait(): void {
   }
   const ended = ids.map(readJob).flatMap((job) => {
     if (!job.ended && batch !== undefined && !batch.includes(job.name)) return []
-    if (!job.ended) writeFileSync(jobPath(job.id, '.json'), JSON.stringify({ ...job, ended: true }))
+    if (!job.ended) {
+      writeFileSync(jobPath(job.id, '.json'), JSON.stringify({ ...job, ended: true }))
+      recordEvent('end', job)
+    }
     return [{ id: job.id, state: job.state }]
   })
   process.stdout.write(JSON.stringify({ jobs: ended }))

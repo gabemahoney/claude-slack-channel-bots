@@ -13,7 +13,7 @@ import { basename, join, relative } from 'node:path'
 import { THREAD_MEMORY_LOOKUP_METHODS, MetadataCancelledError, classifyMetadataFailure, createMetadataAttempts, metadataRetryDelay,
   THREAD_MEMORY_JOIN_SAVE_WINDOW_MS as JOIN_SAVE_WINDOW_MS, THREAD_MEMORY_JOIN_SAVE_MAX_REQUESTS as JOIN_SAVE_MAX_REQUESTS,
   type MetadataFailure } from '../src/thread-memory.ts'
-import { THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MAX_MS, THREAD_MEMORY_RETRY_MIN_MS, THREAD_MEMORY_NOTICE_MAX_CHARS } from '../src/delivery-constants.ts'
+import { THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MAX_MS, THREAD_MEMORY_RETRY_MIN_MS, THREAD_MEMORY_NOTICE_MAX_CHARS, THREAD_MEMORY_REWRITE_CHUNK_BYTES } from '../src/delivery-constants.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { INITIAL_CREDENTIALS, slackHttpError, slackPlatformError, slackRateLimited } from './test-helpers/slack-stub.ts'
 import { assertNoLeak, LEAK_SENTINEL, writeCredentialsFile, fakeToken, BOT_TOKEN_PREFIX, APP_TOKEN_PREFIX, writtenFile } from './test-helpers/credentials.ts'
@@ -2594,6 +2594,20 @@ describe('Thread Memory queued join recovery', () => {
 
 describe('Thread Memory compaction in slices', () => {
   const SLICE = THREAD_MEMORY_COMPACTION_SLICE, COUNT = 2 * SLICE + 1
+  // Capture actual writes without changing the shared harness used by other owners.
+  const rewriteWrites = new WeakMap<ThreadMemoryHarness['io']['calls'][number], {
+    start: number; position: number | null | undefined; bytes: Buffer
+  }>()
+  function rewriteFixture(options: ThreadHarnessOptions = {}, dir = mkdtempSync(join(tmpdir(), 'thread-memory-'))) {
+    const io = options.fs ?? threadFsControls(dir), base = io.fs
+    const fs = { ...base, writeSync(fd: number, bytes: Uint8Array, offset: number, length: number, position?: number | null) {
+      const start = base.fstatSync(fd).size
+      const written = base.writeSync(fd, bytes, offset, length, position)
+      rewriteWrites.set(io.calls.at(-1)!, { start, position, bytes: Buffer.from(bytes.subarray(offset, offset + written)) })
+      return written
+    } } as typeof base
+    return fixture({ ...options, fs: { ...io, fs } }, dir)
+  }
   const rootOf = (i: number) => `1700000000.${100_000 + i}`
   const isTemp = (h: ThreadMemoryHarness) => (path: string) => path.startsWith(`${threadPath(h.stateDir)}.`) && path.endsWith('.tmp')
   const bySeq = (a: { seq: number }, b: { seq: number }) => a.seq - b.seq
@@ -2602,7 +2616,7 @@ describe('Thread Memory compaction in slices', () => {
    * compaction's walk (channel by channel) differs from record order; `one-primary` saves one primary join
    * first, then every other join in the secondary channel, so the walk's first slice ends past it. */
   async function large(layout: 'alternate' | 'one-primary', options: Parameters<typeof fixture>[0] = {}) {
-    const h = fixture(options)
+    const h = rewriteFixture(options)
     expect(h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha'], [C.primary, C.secondary])).kind).toBe('applied')
     await h.start()
     const facts = Array.from({ length: COUNT }, (_, i) => h.fact({
@@ -2630,11 +2644,31 @@ describe('Thread Memory compaction in slices', () => {
   const operations = (h: ThreadMemoryHarness) => h.io.calls
     .filter(c => ['writeSync', 'fsync', 'rename'].includes(c.op))
     .map(c => `${c.op}:${isTemp(h)(c.path) ? 'temp' : c.path === join(h.stateDir, 'threads') ? 'directory' : c.path === h.stateDir ? 'parent' : 'journal'}`)
-  const fullRewrite = ['writeSync:temp', 'fsync:temp', 'rename:temp', 'fsync:directory']
+  function fullRewrite(h: ThreadMemoryHarness, image: Uint8Array = journalBytes(h)) {
+    const calls = h.io.calls.filter(c => c.op === 'writeSync' && isTemp(h)(c.path))
+    expect(calls.length).toBeGreaterThan(0)
+    expect(new Set(calls.map(c => c.path)).size).toBe(1)
+    let covered = 0
+    const chunks = calls.map(call => {
+      const write = rewriteWrites.get(call)!
+      expect(write).toBeDefined()
+      expect(write.start).toBe(covered)
+      expect(write.position ?? covered).toBe(covered)
+      expect(write.bytes.length).toBeGreaterThan(0)
+      expect(write.bytes.length).toBeLessThanOrEqual(THREAD_MEMORY_REWRITE_CHUNK_BYTES)
+      expect(write.bytes.equals(image.subarray(covered, covered + write.bytes.length))).toBe(true)
+      covered += write.bytes.length
+      return write.bytes
+    })
+    expect(covered).toBe(image.length)
+    expect(Buffer.concat(chunks).equals(image)).toBe(true)
+    return [...calls.map(() => 'writeSync:temp'), 'fsync:temp', 'rename:temp', 'fsync:directory']
+  }
   function observe(h: ThreadMemoryHarness) {
     const completed: ThreadMemoryCompaction[] = [], sealed: Array<{ key: string; steps: string[] }> = []
     let eventStart = h.events.length
-    h.memory.setCompactionObserver(c => completed.push(c))
+    let nextCompletion: (() => void) | undefined
+    h.memory.setCompactionObserver(c => { completed.push(c); nextCompletion?.(); nextCompletion = undefined })
     if (h.seal) {
       const original = h.seal.entryCompacted.bind(h.seal)
       spies.push(spyOn(h.seal, 'entryCompacted').mockImplementation((key, storeId, lastRecordNumber) => {
@@ -2644,9 +2678,10 @@ describe('Thread Memory compaction in slices', () => {
     }
     return {
       completed, sealed,
+      nextCompletion: () => new Promise<void>(resolve => { nextCompletion = resolve }),
       reset() { h.io.reset(); h.sealIo.reset(); completed.length = 0; sealed.length = 0; eventStart = h.events.length },
       rewritten(prefix: string[] = []) {
-        const steps = [...prefix, ...fullRewrite]
+        const steps = [...prefix, ...fullRewrite(h)]
         expect(operations(h)).toEqual(steps)
         expect(sealed).toEqual([{ key: 'alpha', steps }])
         expect(h.sealIo.writes().length).toBeGreaterThan(0)
@@ -2682,7 +2717,7 @@ describe('Thread Memory compaction in slices', () => {
     expect(savedJoins(h)).toHaveLength(records.length + 1)
     const bytes = journalBytes(h)
     await h.close()
-    const reopened = fixture({ reopen: true }, h.stateDir); await reopened.start()
+    const reopened = rewriteFixture({ reopen: true }, h.stateDir); await reopened.start()
     expect(journalBytes(reopened)).toEqual(bytes)
     expect(readThreads(reopened.stateDir).slice(1)).toEqual(expected)
   })
@@ -2692,28 +2727,38 @@ describe('Thread Memory compaction in slices', () => {
     await h.memory.compact('alpha')
     await h.memory.saveJoins('alpha', [h.fact({ root: rootOf(COUNT) })])
     const before = journalBytes(h), expected = readThreads(h.stateDir).slice(1)
-    const notifications = spyOn(h.seal!, 'entryCompacted')
+    const sealSteps: string[][] = [], entryCompacted = h.seal!.entryCompacted.bind(h.seal!)
+    const notifications = spyOn(h.seal!, 'entryCompacted').mockImplementation((...args) => {
+      sealSteps.push(operations(h))
+      return entryCompacted(...args)
+    })
     const cause = h.io.fail('fsync', 'alpha', {
       match: failure === 'directory' ? path => path === join(h.stateDir, 'threads') : isTemp(h),
     })
+    h.io.reset()
     try {
       await h.memory.compact('alpha')
       expect(notifications).not.toHaveBeenCalled()
       expect(h.events.at(-1)).toMatchObject({ type: 'compaction-failed', error: cause })
+      if (header.kind !== 'header') throw new Error('fixture journal without its header')
+      const image = serializeThreadMemoryRecords([{ ...header, highWater: h.memory.store('alpha')!.lastRecordNumber }, ...expected.sort(bySeq)])
+      const failedSteps = fullRewrite(h, image)
+      expect(operations(h)).toEqual(failure === 'directory' ? failedSteps : failedSteps.slice(0, -2))
       if (failure === 'directory') expectSynchronousImage(h, header, expected)
       else expect(journalBytes(h)).toEqual(before)
       expect(readdirSync(join(h.stateDir, 'threads')).filter(name => name.endsWith('.tmp'))).toEqual([])
       h.io.heal(); h.io.reset()
       await h.memory.compact('alpha')
-      const steps = h.io.calls.filter(c => ['writeSync', 'fsync', 'rename'].includes(c.op))
-        .map(c => [c.op, isTemp(h)(c.path) ? 'temp' : c.path === join(h.stateDir, 'threads') ? 'directory' : 'journal'])
-      expect(steps).toEqual([['writeSync', 'temp'], ['fsync', 'temp'], ['rename', 'temp'], ['fsync', 'directory']])
+      const steps = fullRewrite(h)
+      expect(operations(h)).toEqual(steps)
+      expect(sealSteps).toEqual([steps])
+      expect(readdirSync(join(h.stateDir, 'threads')).filter(name => name.endsWith('.tmp'))).toEqual([])
       expect(notifications).toHaveBeenCalledTimes(1)
       expectSynchronousImage(h, header, expected)
     } finally { h.io.heal(); notifications.mockRestore() }
     const bytes = journalBytes(h)
     await h.crash()
-    const reopened = fixture({ reopen: true, seal: true }, h.stateDir); await reopened.start()
+    const reopened = rewriteFixture({ reopen: true, seal: true }, h.stateDir); await reopened.start()
     expect(savedJoins(reopened)).toHaveLength(records.length + 1)
     expect(journalBytes(reopened)).toEqual(bytes)
   })
@@ -2734,7 +2779,7 @@ describe('Thread Memory compaction in slices', () => {
   })
 
   test('new and earlier joins retain normalized facts and caller isolation', async () => {
-    const h = fixture(); await h.start()
+    const h = rewriteFixture(); await h.start()
     const fact = h.fact(), original = structuredClone(fact)
     expect(h.memory.addJoin('alpha', fact)).toBe(true)
     fact.stamp.incarnation = 'caller changed'; fact.root = rootOf(999)
@@ -2748,7 +2793,7 @@ describe('Thread Memory compaction in slices', () => {
 
   test('a cached image replaces earlier saved times only after append durability and drops resolved intents and unnamed held joins', async () => {
     let held: ThreadJoin[] = []
-    const h = fixture({ heldStamps: () => held }); await h.start()
+    const h = rewriteFixture({ heldStamps: () => held }); await h.start()
     const later = h.fact({ at: THREAD_TIME + 20 }), earlier = { ...later, at: THREAD_TIME + 10 }
     await h.memory.saveJoins('alpha', [later])
     const pending = h.memory.keepIntent('alpha', postIntent(later))
@@ -2781,14 +2826,14 @@ describe('Thread Memory compaction in slices', () => {
     expectSynchronousImage(h, header!, [])
     const bytes = journalBytes(h)
     await h.close()
-    const reopened = fixture({ reopen: true }, h.stateDir); await reopened.start()
+    const reopened = rewriteFixture({ reopen: true }, h.stateDir); await reopened.start()
     expect(journalBytes(reopened)).toEqual(bytes)
     expect(reopened.memory.unresolvedIntents('alpha')).toEqual([])
   })
 
   test('loaded records with equal sequence numbers retain the original stable walk order across stamp changes', async () => {
     let held: ThreadJoin[] = []
-    const h = fixture({ heldStamps: () => held })
+    const h = rewriteFixture({ heldStamps: () => held })
     h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha'], [C.primary, C.secondary]))
     const primary = h.fact(), secondary = h.fact({ channel: C.secondary })
     const a = joinRecord(primary, 2), b = joinRecord(secondary, 2)
@@ -2860,7 +2905,7 @@ describe('Thread Memory compaction in slices', () => {
     expect(h.events.filter(e => e.type === 'compaction-failed')).toEqual([])
     expect(probe.completed).toEqual([]); expect(probe.sealed).toEqual([])
     await h.crash()
-    const next = fixture({ reopen: true, seal: true }, h.stateDir), restarted = observe(next)
+    const next = rewriteFixture({ reopen: true, seal: true }, h.stateDir), restarted = observe(next)
     await next.start()
     expect(readThreads(next.stateDir).slice(1)).toEqual(records)
     expect(restarted.completed.map(c => c.outcome)).toEqual(['rewritten'])
@@ -2920,24 +2965,29 @@ describe('Thread Memory compaction in slices', () => {
 
   describe('maintenance compaction proof', () => {
     async function established(options: ThreadHarnessOptions = {}) {
-      const h = fixture({ ...options, seal: true }); await h.start()
+      const h = rewriteFixture({ ...options, seal: true }); await h.start()
       await h.memory.saveJoins('alpha', [h.fact()]); await h.memory.compact('alpha')
       const probe = observe(h); probe.reset()
       return { h, probe }
     }
-    async function maintenance(h: ThreadMemoryHarness) {
+    async function maintenance(h: ThreadMemoryHarness, probe?: ReturnType<typeof observe>) {
+      const completed = probe?.nextCompletion()
       h.memory.startMaintenance()
       await h.clock.advance(QUEUE_COMPACT_INTERVAL_MS)
+      // Observe completion without flush(), which would also retry kept appends.
+      if (completed) await completed
+      else await h.memory.flush('alpha') // Observer-unset/throwing cases have no kept append to retry.
+      await h.clock.flush()
     }
 
     test.each(['graceful', 'crash'] as const)('repeated skips preserve journal and seal identity through a %s restart', async end => {
       const { h, probe } = await established(), before = identity(h), seal = sealEntry(h)
       for (let pass = 0; pass < 2; pass++) {
-        probe.reset(); await maintenance(h); probe.skipped(before)
+        probe.reset(); await maintenance(h, probe); probe.skipped(before)
         expect(sealEntry(h)).toEqual(seal)
       }
       if (end === 'graceful') await h.close(); else await h.crash()
-      const next = fixture({ reopen: true, seal: true }, h.stateDir)
+      const next = rewriteFixture({ reopen: true, seal: true }, h.stateDir)
       const restarted = observe(next)
       await next.start()
       expect(journalBytes(next)).toEqual(before.bytes)
@@ -2957,7 +3007,7 @@ describe('Thread Memory compaction in slices', () => {
         if (change === 'move saved join into hold') expect(h.choose('mentions').kind).toBe('applied')
         else { held = []; h.memory.pruneHeldJoins('alpha') }
       }
-      await maintenance(h); probe.skipped(before)
+      await maintenance(h, probe); probe.skipped(before)
       expect(savedJoins(h)).toHaveLength(1)
     })
 
@@ -2984,7 +3034,7 @@ describe('Thread Memory compaction in slices', () => {
       }
       if (failed) expect(journalBytes(h)).toEqual(before)
       h.io.heal(); probe.reset()
-      await maintenance(h); probe.rewritten()
+      await maintenance(h, probe); probe.rewritten()
       expect(sealEntry(h).lastRecordNumber).toBe(h.memory.store('alpha')!.lastRecordNumber)
     })
 
@@ -2998,12 +3048,12 @@ describe('Thread Memory compaction in slices', () => {
         expect(savedJoins(h)).toHaveLength(1)
         held = []; h.memory.pruneHeldJoins('alpha')
       }
-      probe.reset(); await maintenance(h); probe.rewritten()
+      probe.reset(); await maintenance(h, probe); probe.rewritten()
       expect(savedJoins(h)).toEqual([])
     })
 
     test.each(['saved header', 'failed header', 'existing empty file'] as const)('creation from %s certifies no maintenance skip', async creation => {
-      const h = fixture({ seal: true }), probe = observe(h)
+      const h = rewriteFixture({ seal: true }), probe = observe(h)
       if (creation === 'existing empty file') seedThreads(h.stateDir, [])
       if (creation === 'failed header') h.io.fail('writeSync', 'alpha', { times: 1 })
       await h.start()
@@ -3013,17 +3063,17 @@ describe('Thread Memory compaction in slices', () => {
       }
       expect(h.memory.store('alpha')?.created).toBe(true)
       expect(probe.completed.map(c => c.outcome)).toEqual(creation === 'existing empty file' ? ['rewritten'] : [])
-      probe.reset(); await maintenance(h); probe.rewritten()
+      probe.reset(); await maintenance(h, probe); probe.rewritten()
     })
 
     test('a retry read requires a full maintenance rewrite before it can skip', async () => {
       const { h } = await established(); await h.close()
-      const next = fixture({ reopen: true, seal: true }, h.stateDir), probe = observe(next)
+      const next = rewriteFixture({ reopen: true, seal: true }, h.stateDir), probe = observe(next)
       next.io.fail('readFileSync'); await next.start()
       expect(probe.completed).toEqual([])
       next.io.heal(); expect(await next.memory.retryRead('alpha')).toBe('read')
       expect(probe.completed).toEqual([])
-      probe.reset(); await maintenance(next); probe.rewritten(['fsync:parent'])
+      probe.reset(); await maintenance(next, probe); probe.rewritten(['fsync:parent'])
     })
 
     test.each(['write', 'file fsync', 'rename', 'directory fsync'] as const)('a rewrite failing at %s certifies nothing for the next maintenance pass', async step => {
@@ -3033,7 +3083,7 @@ describe('Thread Memory compaction in slices', () => {
       await h.memory.compact('alpha')
       expect(probe.completed).toEqual([]); expect(probe.sealed).toEqual([])
       expect(h.events.at(-1)).toMatchObject({ type: 'compaction-failed', error })
-      h.io.heal(); probe.reset(); await maintenance(h); probe.rewritten()
+      h.io.heal(); probe.reset(); await maintenance(h, probe); probe.rewritten()
     })
 
     test.each(['slice', 'awaited fsync'] as const)('saved evidence changed during a %s cannot certify the next maintenance pass', async boundary => {
@@ -3048,7 +3098,7 @@ describe('Thread Memory compaction in slices', () => {
       await rewrite
       expect(changed).toBe(true)
       expect(probe.completed.map(c => c.outcome)).toEqual(['rewritten'])
-      probe.reset(); await maintenance(h); await h.memory.flush('alpha'); probe.rewritten()
+      probe.reset(); await maintenance(h, probe); await h.memory.flush('alpha'); probe.rewritten()
       expectSynchronousImage(h, header, records.filter(r => r.kind === 'join' && r.channel === C.secondary))
     })
 
@@ -3057,21 +3107,22 @@ describe('Thread Memory compaction in slices', () => {
       const { h } = await large('alternate', { seal: true, canRun: () => allowed })
       await h.memory.compact('alpha')
       await h.memory.saveJoins('alpha', Array.from({ length: SLICE }, (_, i) => h.fact({ root: rootOf(COUNT + i) })))
-      const probe = observe(h), before = identity(h)
+      const expected = readThreads(h.stateDir), probe = observe(h), before = identity(h)
       probe.reset()
       setImmediate(() => { allowed = false; cancelled = true })
       await h.memory.compact('alpha')
       expect(cancelled).toBe(true); expect(probe.completed).toEqual([]); expect(probe.sealed).toEqual([])
       expect(identity(h)).toEqual(before); expect(h.io.writes()).toEqual([])
-      allowed = true; probe.reset(); await maintenance(h); probe.rewritten()
+      allowed = true; probe.reset(); await maintenance(h, probe); probe.rewritten()
+      expectSynchronousImage(h, expected[0]!, expected.slice(1))
     })
 
     test('legacy equal sequence records never certify an ordered-image skip', async () => {
-      const h = fixture({ seal: true }), first = joinRecord(h.fact(), 2), second = joinRecord(h.fact({ root: R.secondary }), 2)
+      const h = rewriteFixture({ seal: true }), first = joinRecord(h.fact(), 2), second = joinRecord(h.fact({ root: R.secondary }), 2)
       seedThreads(h.stateDir, [threadHeader(), first, second]); await h.start()
       const probe = observe(h)
       for (let pass = 0; pass < 2; pass++) {
-        probe.reset(); await maintenance(h); probe.rewritten()
+        probe.reset(); await maintenance(h, probe); probe.rewritten()
         expect(savedJoins(h)).toEqual([first, second])
       }
     })
@@ -3083,7 +3134,7 @@ describe('Thread Memory compaction in slices', () => {
 
     test('an observer installed before start times every startup and later loadKey rewrite inside its writer turn', async () => {
       let now = 10
-      const h = fixture({ seal: true, monotonicNow: () => now++ })
+      const h = rewriteFixture({ seal: true, monotonicNow: () => now++ })
       h.unsubscribe() // Configure the startup fixture without scheduling a publication-driven loadKey.
       h.apply(threadConfig(h.stateDir, 'thread_hybrid', ['alpha', 'beta']))
       for (const key of ['alpha', 'beta']) seedThreads(h.stateDir, [threadHeader(), joinRecord(h.fact({}, key))], key)
@@ -3113,7 +3164,7 @@ describe('Thread Memory compaction in slices', () => {
 
     test('startup cancelled between slices emits no completion', async () => {
       const { h } = await large('alternate', { seal: true }); await h.close()
-      const next = fixture({ reopen: true, seal: true }, h.stateDir), probe = observe(next), before = journalBytes(next)
+      const next = rewriteFixture({ reopen: true, seal: true }, h.stateDir), probe = observe(next), before = journalBytes(next)
       let stopping: Promise<void> | undefined
       next.memory.readAtStart(); await next.seal!.loadAtStart(next.memory.journalFacts())
       setImmediate(() => { stopping = next.memory.stop() })
@@ -3124,7 +3175,7 @@ describe('Thread Memory compaction in slices', () => {
     })
 
     test.each(['not live', 'dry run', 'unreadable', 'absent', 'empty non-hybrid', 'seal without header'] as const)('early return for %s emits no completed compaction', async reason => {
-      const h = fixture({ seal: true, dryRun: reason === 'dry run' })
+      const h = rewriteFixture({ seal: true, dryRun: reason === 'dry run' })
       if (reason === 'absent' || reason === 'empty non-hybrid') h.choose('mentions')
       if (reason !== 'absent') seedThreads(h.stateDir, reason === 'empty non-hybrid' || reason === 'seal without header' ? [] : [threadHeader()])
       if (reason === 'unreadable') h.io.fail('readFileSync')

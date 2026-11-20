@@ -28,5 +28,11 @@ export const OWN_ROOT_CLOCK_SKEW_MS = 120_000
 export const THREAD_REPLY_HOLD_MS = 3_000
 /** Bound a Thread Memory loss report, including the notifier's persona prefix. */
 export const THREAD_MEMORY_NOTICE_MAX_CHARS = 4000
+/** Give acceptance stores a quiet window without starving maintenance. With
+ * the burst tests' 250 ms cadence this starts a waiting rewrite by 750 ms,
+ * inside even the measured 1.7 s roots phase, leaving time to finish it. */
+export const THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS = 500
+/** Bound each synchronous temp-image write before yielding to socket I/O. */
+export const THREAD_MEMORY_REWRITE_CHUNK_BYTES = 256 * 1024
 /** Bound shared-state notices; their diagnostics retain the entire channel list. */
 export const SHARED_STATE_NOTICE_MAX_CHANNELS = 20

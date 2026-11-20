@@ -6907,12 +6907,13 @@ describe('Thread Memory server lifecycle wiring', () => {
     const props = onlyCallProps(factory)
     expect(Object.fromEntries(props)).toEqual({
       stateDir: 'STATE_DIR', dryRun: 'isDryRun()', seal: 'threadMemorySeal',
+      acceptanceBacklog: '{ has: key => deliveryQueue?.hasAcceptanceBacklog?.(key) ?? false, onCleared: (key, callback) => deliveryQueue?.onAcceptanceBacklogCleared?.(key, callback) ?? (() => {}), }',
       canRun: 'threadMemoryWorkAllowed',
       appliedKeys: '() => personaConfig?.personas.map(persona => persona.key) ?? []',
       stamp: '(key, channel) => reloadController?.sharedChannels()?.channelStamp(key, channel)',
       stampFacts: '() => reloadController?.sharedChannels()?.stampFacts()',
       authorityReady: '() => reloadController?.sharedChannels() !== undefined',
-      heldStamps: 'key => deliveryQueue?.unresolvedHolds(key).filter(hold => hold.memoryDependent).map(hold => ({ channel: hold.channel, stamp: hold.stamp })) ?? []',
+      heldStamps: 'key => deliveryQueue?.memoryHoldStamps?.(key) ?? deliveryQueue?.unresolvedHolds(key).filter(hold => hold.memoryDependent).map(hold => ({ channel: hold.channel, stamp: hold.stamp })) ?? []',
       unsavedOwnPosts: 'key => ownPostJoins?.unsavedDeferredPosts(key) ?? 0',
       threadHybridChannels: 'key => reloadController?.sharedChannels()?.threadView().threadHybridChannels(key) ?? []',
       markerKeys: '() => reloadController?.sharedChannels()?.threadMemoryCreatedKeys() ?? []',
@@ -6934,6 +6935,70 @@ describe('Thread Memory server lifecycle wiring', () => {
       .toBe('threadMemory.readAtStart() await threadMemorySeal.loadAtStart(threadMemory.journalFacts()) if (shuttingDown) return await deliveryQueue.start()')
     expect(SERVER_CODE.slice(onlyCallOf('deliveryQueue\\.startMaintenance'), onlyCallOf('threadMemory\\.startMaintenance')).replace(/\s+/g, ' ').trim()).toBe('deliveryQueue.startMaintenance(testTimers.queueCompactIntervalMs)')
     expect(onlyCallArgs('threadMemory\\.startMaintenance')).toEqual(['testTimers.queueCompactIntervalMs'])
+  })
+
+  test('actual backlog and held-stamp adapters read the live queue and its retention-only stamps', async () => {
+    const props = onlyCallProps(factory)
+    const adapter = expression<() => {
+      backlog: NonNullable<ThreadMemoryModule.ThreadMemoryOptions['acceptanceBacklog']>
+      held: NonNullable<ThreadMemoryModule.ThreadMemoryOptions['heldStamps']>
+      set(queue?: Pick<DeliveryQueue, 'hasAcceptanceBacklog' | 'onAcceptanceBacklogCleared' | 'memoryHoldStamps' | 'unresolvedHolds'>): void
+    }>(`() => { let deliveryQueue;
+      const backlog = (${props.get('acceptanceBacklog')}), held = (${props.get('heldStamps')});
+      return { backlog, held, set: value => { deliveryQueue = value } };
+    }`, {})()
+    const key = THREAD_PERSONAS.primary, other = THREAD_PERSONAS.secondary, fact = threadJoin()
+    const cleared: string[] = []
+    expect(adapter.backlog.has(key)).toBe(false)
+    adapter.backlog.onCleared(key, () => cleared.push('absent'))()
+    expect(adapter.held(key)).toEqual([])
+    const root = mkdtempSync(join(tmpdir(), 'cscb-backlog-wiring-'))
+    const reached = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
+    const io = durableIo({ before(step) {
+      if (step.op === 'fsync' && step.path === queuePath(root, key)) {
+        reached.resolve(); return release.promise
+      }
+    } })
+    const queue = await makeQueue(root, { fs: io.fs })
+    let pending: ReturnType<DeliveryQueue['acceptDecided']> | undefined
+    try {
+      adapter.set(queue)
+      expect(adapter.backlog.has(key)).toBe(queue.hasAcceptanceBacklog!(key))
+      expect(adapter.backlog.has(key)).toBe(false)
+      const input = heldSlackInput(memoryHold(fact.at, { stamp: fact.stamp }), { channel: fact.channel })
+      pending = queue.acceptDecided(key, input.key, () => ({ store: input }))
+      await reached.promise
+      expect(adapter.backlog.has(key)).toBe(queue.hasAcceptanceBacklog!(key))
+      expect(adapter.backlog.has(key)).toBe(true)
+      expect(adapter.backlog.has(other)).toBe(false)
+      const stamps = [{ channel: fact.channel, stamp: fact.stamp }]
+      expect(adapter.held(key)).toEqual(queue.memoryHoldStamps!(key))
+      expect(adapter.held(key)).toEqual(stamps)
+      expect(adapter.held(other)).toEqual([])
+      const unsubscribe = adapter.backlog.onCleared(key, () => cleared.push(key))
+      adapter.backlog.onCleared(key, () => cleared.push('cancelled'))()
+      adapter.backlog.onCleared(other, () => cleared.push(other))()
+      expect(cleared).toEqual([other])
+      release.resolve(); expect((await pending).status).toBe('accepted')
+      expect(adapter.backlog.has(key)).toBe(false)
+      expect(adapter.backlog.has(key)).toBe(queue.hasAcceptanceBacklog!(key))
+      expect(cleared).toEqual([other, key])
+      unsubscribe()
+      expect(adapter.held(key)).toEqual(stamps)
+      // A replacement live holder exposes stamps absent from unresolvedHolds.
+      const retained = [...stamps, { channel: THREAD_CHANNELS.secondary, stamp: fact.stamp }]
+      const reads: string[] = []
+      adapter.set({ memoryHoldStamps: k => { reads.push(k); return retained },
+        unresolvedHolds: () => { throw new Error('retention adapter must use memoryHoldStamps') } })
+      expect(adapter.held(key)).toEqual(retained)
+      expect(reads).toEqual([key])
+      adapter.set()
+      expect(adapter.backlog.has(key)).toBe(false)
+      expect(adapter.held(key)).toEqual([])
+    } finally {
+      release.resolve(); await pending; await queue.stop()
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 
   test('thread-view subscription and awaited activation follow the recovered choice adapter and precede membership, connections and bring-up', () => {

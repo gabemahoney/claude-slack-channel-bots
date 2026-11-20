@@ -2991,12 +2991,16 @@ export async function main(): Promise<void> {
   })
   threadMemory = createThreadMemory({
     stateDir: STATE_DIR, dryRun: isDryRun(), seal: threadMemorySeal,
+    acceptanceBacklog: {
+      has: key => deliveryQueue?.hasAcceptanceBacklog?.(key) ?? false,
+      onCleared: (key, callback) => deliveryQueue?.onAcceptanceBacklogCleared?.(key, callback) ?? (() => {}),
+    },
     canRun: threadMemoryWorkAllowed,
     appliedKeys: () => personaConfig?.personas.map(persona => persona.key) ?? [],
     stamp: (key, channel) => reloadController?.sharedChannels()?.channelStamp(key, channel),
     stampFacts: () => reloadController?.sharedChannels()?.stampFacts(),
     authorityReady: () => reloadController?.sharedChannels() !== undefined,
-    heldStamps: key => deliveryQueue?.unresolvedHolds(key).filter(hold => hold.memoryDependent).map(hold => ({ channel: hold.channel, stamp: hold.stamp })) ?? [],
+    heldStamps: key => deliveryQueue?.memoryHoldStamps?.(key) ?? deliveryQueue?.unresolvedHolds(key).filter(hold => hold.memoryDependent).map(hold => ({ channel: hold.channel, stamp: hold.stamp })) ?? [],
     unsavedOwnPosts: key => ownPostJoins?.unsavedDeferredPosts(key) ?? 0,
     threadHybridChannels: key => reloadController?.sharedChannels()?.threadView().threadHybridChannels(key) ?? [],
     markerKeys: () => reloadController?.sharedChannels()?.threadMemoryCreatedKeys() ?? [],
