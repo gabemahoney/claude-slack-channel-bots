@@ -105,6 +105,34 @@ export function assertSameConversationReplyPermission(
     'resumed AD row lacks the exact reply permission pair')
 }
 
+/** The request token of the recorded Deny click for this instance; the
+ * action_id is `perm_deny_<instance>_<token>` (src/permission-action-id.ts). */
+export function denyClickToken(click: any, instance: string): string {
+  const actions = click?.interactive?.actions
+  check(Array.isArray(actions) && actions.length === 1, 'deny click has no single action')
+  const id = actions[0]?.action_id, prefix = `perm_deny_${instance}_`
+  check(typeof id === 'string' && id.startsWith(prefix), 'deny click is not a Deny for this instance')
+  const token = id.slice(prefix.length)
+  check(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(token), 'deny click has no request token')
+  return token
+}
+
+/** agent-director >= 0.18 (00418da2): a Claude subagent's denied request is
+ * proven gone (`turn_end`) at its SubagentStop, so the live row holds no
+ * dialog. `permission` is `get-permission` for the token, read before `row`. */
+export function assertSubagentProvenGone(token: string, permission: any, row: any, instance: string) {
+  check(permission?.request_token === token, 'denied request read has the wrong token')
+  check(permission.decision === 'deny', 'denied subagent request is not recorded as denied')
+  check(typeof permission.tool_input === 'string' && permission.tool_input.includes('subagent-deny-probe'),
+    'denied request is not the subagent probe')
+  check(permission.proven_gone_how === 'turn_end' && typeof permission.proven_gone_at === 'string'
+    && Number.isFinite(Date.parse(permission.proven_gone_at)) && permission.unproven_since === null,
+    'denied subagent request was not proven gone at turn end')
+  check(row?.instance_id === instance && row.state === 'waiting', 'AD row is not the waiting persona')
+  check(Array.isArray(row.unproven_requests) && row.unproven_requests.length === 0, 'AD row still holds an unproven request')
+  return { proven_gone_at: permission.proven_gone_at, decided_at: permission.decided_at ?? null }
+}
+
 /** Bind first-waiting evidence to this persona and its durable AD session. */
 export function assertFirstLaunchWaiting(waiting: LaunchObservation[], sent: { session_id?: string; at: number }[], key: string, start: number, textAt: number): LaunchObservation {
   check(waiting.some(r => r.key === key && r.at >= start && r.at <= textAt), 'actual first-waiting launch observation missing')
@@ -499,12 +527,16 @@ try {
     check(p,'relay action was not sent')
     check(calls().some(c=>c.at>=Date.parse(p.ts)&&c.words.includes('decide')&&c.words[c.words.indexOf('--decision')+1]===arg2),'CSCB did not decide the relayed permission action')
     console.log('recorded: permission '+arg2+' flowed through CSCB relay')
-  } else if(command==='dialog-notice') {
-    const posts=jsonLines(arg).filter(r=>r.event==='api'&&r.method==='chat.postMessage'&&r.label===arg2)
-    const notice=posts.find(r=>r.text?.includes('*Delivery stuck*')&&r.text.includes("a subagent's denied prompt stays held until the bot ends")&&r.text.includes("Restart the persona's bot."))
-    check(notice,'dialog-hold Delivery stuck was not actually posted to Slack')
-    check(readFileSync(join(state!,'server.log'),'utf8').split('\n').some(l=>l.includes('delivery-stuck:')&&l.includes('(key='+key+')')&&l.includes('reason=dialog-hold')),'dialog-hold diagnostic missing')
-    console.log('recorded: actual dialog-hold notice '+JSON.stringify({channel:notice.channel,text:notice.text}))
+  } else if(command==='deny-token') {
+    let click:unknown;try{click=JSON.parse(readFileSync(arg,'utf8'))}catch{click=undefined}
+    console.log(denyClickToken(click,'cscb_'+key))
+  } else if(command==='subagent-proven-gone') {
+    // arg: the Deny click; arg2: get-permission for its token; arg3: get for the row, read after.
+    const read=(path:string)=>{try{return JSON.parse(readFileSync(path,'utf8'))}catch{throw new Error('subagent proof AD reads could not be read')}}
+    let click:unknown;try{click=JSON.parse(readFileSync(arg,'utf8'))}catch{click=undefined}
+    const token=denyClickToken(click,'cscb_'+key)
+    const proof=assertSubagentProvenGone(token,read(arg2),read(arg3),'cscb_'+key)
+    console.log('recorded: denied subagent request proven gone at turn end '+JSON.stringify(proof))
   } else if(command==='no-stuck') {
     check(!readFileSync(join(state!,'server.log'),'utf8').includes('delivery-stuck:'),'permission prompt raised Delivery stuck')
   } else if(command==='mention-body') {

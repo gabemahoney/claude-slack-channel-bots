@@ -87,10 +87,15 @@ profile_collect() {
 }
 profile_cleanup() { profile_collect "${PROFILE_CLEANUP_STOP_S}"; }
 if [[ "${CSCB_TEST_DIAGNOSTICS:-}" == 1 ]]; then on_before_cleanup profile_cleanup; fi
-real_prepare
+# An unrequested acknowledgement (a react or an edit) must not open a native
+# permission prompt nothing here answers. Reply stays allowed only by CSCB's
+# launch pair, which reply-permission-resume proves on the resumed row.
+real_prepare "${REAL_AGENT_CLAUDE_VERSION:-2.1.296}" \
+    mcp__slack-channel-router__react mcp__slack-channel-router__edit_message
 # Real reply calls resolve candidates before the next measured DM. This
-# replaces real_persona's default no-tool acknowledgement instruction.
-real_persona order 'For every relayed Slack message, call the Slack reply tool with text exactly OK and copy chat_id and message_id from the message; include thread_ts only when present.'
+# replaces real_persona's default no-tool acknowledgement instruction; the
+# thread personas reuse it.
+real_persona order 'For every relayed Slack message, call the Slack reply tool with text exactly OK and copy chat_id and message_id from the message; include thread_ts only when present. Call no other tool.'
 real_write_config '{"session_restart_delay":0}'
 real_start_stub
 start_server --live

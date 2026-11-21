@@ -2275,7 +2275,7 @@ and the covered restart notice below.
   This means the persona's current transcript, or an earlier session's that exists but can't be read; CSCB ignores a removed earlier-session transcript, because it can hold no new receipt.
 - `queue-unwritable`: CSCB can't write its queue file, so it types nothing more for this persona until it can. Check the server's disk.
 - `not-taken-in`: It doesn't take the message in: CSCB has typed it 3 times and keeps offering it. Attach with `tmux attach -t =slack_bot_<key>` to see why, or restart the persona's bot.
-- `dialog-hold`: agent-director won't type into it until it can prove an answered permission prompt is gone; a subagent's denied prompt stays held until the bot ends. Restart the persona's bot.
+- `dialog-hold`: agent-director won't type into it until it can prove an answered permission prompt is gone. A Codex subagent's denied prompt stays held until the bot ends; from agent-director 0.18 a Claude subagent's clears when that subagent stops. Restart the persona's bot.
 
 The notice is suppressed while the persona is not up, pending or held, during
 an authoritative AD permission/working state, an outage, or an existing

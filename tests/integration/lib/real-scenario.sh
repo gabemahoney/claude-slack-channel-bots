@@ -189,6 +189,9 @@ real_wait_latency_admission() {
     # waiting. Poll evidence under a watchdog; elapsed time never grants entry.
     _scenario_check_timeout "${REAL_DELIVERY_WAIT_S}" real_wait_latency_admission
     if _scenario_poll_until "${REAL_DELIVERY_WAIT_S}" _real_latency_admission "$1" "$2"; then return 0; fi
+    local row="${SCENARIO_ROOT}/ac76-timeout-row.json"
+    real_ad get --instance-id "$(real_instance "$1")" > "${row}" 2>/dev/null || printf '{}\n' > "${row}"
+    bun "${REAL_RECEIPTS%/*}/ac76-admission.ts" row "${row}" || echo 'recorded: AC76 AD row unavailable'
     fail 'AC76 pre-sample admission timed out (see reason codes and counts)'
 }
 real_record_state() {

@@ -43,7 +43,7 @@ export function deliveryStuckRemedy(reason: DeliveryStuckReason, key: string, co
     case 'transcript': return `Its transcript can't be read, so CSCB can't confirm delivery and keeps offering the message. Check that the transcript exists and that the server's user can read it.`
     case 'queue-unwritable': return `CSCB can't write its queue file, so it types nothing more for this persona until it can. Check the server's disk.`
     case 'not-taken-in': return `It doesn't take the message in: CSCB has typed it ${count} times and keeps offering it. Attach with ${attach} to see why, or restart the persona's bot.`
-    case 'dialog-hold': return `agent-director won't type into it until it can prove an answered permission prompt is gone; a subagent's denied prompt stays held until the bot ends. Restart the persona's bot.`
+    case 'dialog-hold': return `agent-director won't type into it until it can prove an answered permission prompt is gone. A Codex subagent's denied prompt stays held until the bot ends; from agent-director 0.18 a Claude subagent's clears when that subagent stops. Restart the persona's bot.`
   }
 }
 export function buildDeliveryStuckNotice(persona: string, key: string, count: number, ageMs: number, reason: DeliveryStuckReason, typedCount: number, partialReceipt = false): string {

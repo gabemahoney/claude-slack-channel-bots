@@ -19,7 +19,7 @@ import { cannedGetResult } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { promptEntry } from './test-helpers/working-row-panes.ts'
 import { auditReceipts, deliveryFailureEvidence, jsonLines, readTranscripts, receiptJournal, receiptProgress, threadLatency, threadSampleIntervals, THREAD_N2_MIN_SAMPLES, THREAD_N2_TYPING_MS, THREAD_N2_DELIVERY_MS, workloadItem, workloadItems, type ShimSend, type ThreadLatencyOptions } from './integration/fixtures/transcript-receipts.ts'
-import { checkAc76Admission, connectionVersion, type AdmissionAdapters, type AdmissionOptions } from './integration/fixtures/ac76-admission.ts'
+import { checkAc76Admission, connectionVersion, projectAdmissionRow, type AdmissionAdapters, type AdmissionOptions } from './integration/fixtures/ac76-admission.ts'
 import { runFixture, runRealSlice, runTest33Slice, SITE_SLICES, type RealSlice, type Site, type Test33Leg, type Test33Result } from './test-helpers/test33-receipt-boundary.ts'
 
 const cleanups: (() => Promise<void>)[] = []
@@ -1126,7 +1126,9 @@ test.each(['historical only', 'other persona', 'latest disconnected', 'disconnec
 test.each([
   ['instance', { instance_id: 'cscb_beta' }], ['session', { session_id: 'other' }],
   ['row start', { started_at: 'other' }], ['launch', { launch_started_at: 'other' }],
-  ['tag prompt', { labels: {} }], ['ended', { state: 'ended' }],
+  ['tag prompt', { labels: {} }],
+  // A changed life outranks its state: a new session at a prompt is still a changed life.
+  ['session at a prompt', { session_id: 'other', state: 'check_permission' }],
 ] as const)('admission rejects changed %s before replay and after audit', async (_name, changed) => {
   const h = await fixture(false)
   await h.send(injectedInput())
@@ -1138,6 +1140,44 @@ test.each([
       .toMatchObject({ ready: false, reason: 'life-changed' })
     expect(reads).toBe(at)
   }
+})
+
+test.each([
+  ['check_permission', 'ad-state:check_permission'], ['ask_user', 'ad-state:ask_user'], ['ended', 'ad-state:ended'],
+  ['paused', 'ad-state:paused'], ['Check Permission', 'ad-state:unreadable'], [7, 'ad-state:unreadable'],
+] as const)('admission reports the same life in AD state %p as %s before replay and after audit', async (state, reason) => {
+  const h = await fixture(false)
+  await h.send(injectedInput())
+  h.options.expectedCount = 1
+  const a = admissionFor(h)
+  for (const at of [1, 2]) {
+    let reads = 0
+    expect(await a.check({ getRow: async () => ++reads === at ? { ...a.row, state: state as string } : a.row }))
+      .toEqual({ ready: false, reason, candidates: at === 1 ? null : 0, open: at === 1 ? null : 0 })
+    expect(reads).toBe(at)
+  }
+})
+
+test('admission timeout row projection keeps state and request tools, never payloads', () => {
+  const row = {
+    instance_id: 'cscb_alpha', state: 'check_permission', state_changed_at: '2026-11-21T04:59:31.700Z',
+    family_state: 'live', labels: { tag_prompt: '1' }, agent_args: ['--secret-looking', 'value'],
+    permission_requests: [{ request_token: 'tok', tool_name: 'mcp__slack-channel-router__react',
+      tool_input: '{"emoji":"white_check_mark"}', requested_at: '2026-11-21T04:59:31.690Z', decision: null }],
+    unproven_requests: [],
+  }
+  const projected = projectAdmissionRow(row)
+  expect(projected).toEqual({
+    state: 'check_permission', state_changed_at: '2026-11-21T04:59:31.700Z', family_state: 'live', tag_prompt: '1',
+    permission_requests: [{ tool_name: 'mcp__slack-channel-router__react', requested_at: '2026-11-21T04:59:31.690Z', decision: null }],
+    unproven_requests: [],
+  })
+  expect(JSON.stringify(projected)).not.toContain('white_check_mark')
+  expect(JSON.stringify(projected)).not.toContain('tok')
+  expect(projectAdmissionRow({ state: 'x y', permission_requests: [{ tool_name: 'a b' }, 3], unproven_requests: 'no' }))
+    .toEqual({ state: 'unreadable', state_changed_at: null, family_state: null, tag_prompt: null,
+      permission_requests: [{ tool_name: 'unreadable', requested_at: null, decision: null }, 'unreadable'], unproven_requests: 'unreadable' })
+  for (const bad of [null, [], 'row']) expect(projectAdmissionRow(bad)).toEqual({ unavailable: true })
 })
 
 test.each(['working', 'AD rejection', 'missing journal', 'wrong original count', 'missing receipt'] as const)(
@@ -1167,7 +1207,8 @@ test('unresolved candidate without observed working reaches the watchdog without
   const a = admissionFor(h), bytes = readFileSync(h.journal)
   expect(h.audit().items).toBe(34)
   expect(h.queue.replyReminderItems('alpha')).toHaveLength(1)
-  let polls = 0, attempts = 0, dms = 0
+  let polls = 0, attempts = 0, dms = 0, reads = 0, dumps = 0
+  const row = JSON.stringify({ instance_id: 'cscb_alpha', state: 'check_permission' })
   await firstLatencyAdmission(h.options.stateDir, async request => {
     if (request === 'now') return String(polls * 1000)
     if (request === 'poll') { polls++; return 'ok' }
@@ -1177,11 +1218,16 @@ test('unresolved candidate without observed working reaches the watchdog without
       return 'wait'
     }
     if (request === 'dm') { dms++; return 'ok' }
+    // The timeout reads the AD row once, after the last attempt, and projects it.
+    if (request === 'ad') { expect(attempts).toBe(5); reads++; return row }
+    if (request === 'row') { expect(reads).toBe(1); dumps++; return 'ok' }
     throw new Error(`Unexpected test boundary: ${request}`)
   }, true)
   expect(polls).toBe(3)
   expect(attempts).toBe(5) // Initial, polling, and the actual shell's final deadline check.
   expect(dms).toBe(0)
+  expect({ reads, dumps }).toEqual({ reads: 1, dumps: 1 })
+  expect(readFileSync(join(h.options.stateDir, 'ac76-timeout-row.json'), 'utf8')).toBe(`${row}\n`)
   expect(readFileSync(h.journal)).toEqual(bytes)
   expect(h.queue.replyReminderItems('alpha')).toHaveLength(1)
 })

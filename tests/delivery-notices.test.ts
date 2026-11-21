@@ -273,7 +273,7 @@ test('delivery notices and all nine fixed remedies keep their required wording',
     "Its transcript can't be read, so CSCB can't confirm delivery and keeps offering the message. Check that the transcript exists and that the server's user can read it.",
     "CSCB can't write its queue file, so it types nothing more for this persona until it can. Check the server's disk.",
     "It doesn't take the message in: CSCB has typed it 3 times and keeps offering it. Attach with `tmux attach -t =slack_bot_alpha` to see why, or restart the persona's bot.",
-    "agent-director won't type into it until it can prove an answered permission prompt is gone; a subagent's denied prompt stays held until the bot ends. Restart the persona's bot.",
+    "agent-director won't type into it until it can prove an answered permission prompt is gone. A Codex subagent's denied prompt stays held until the bot ends; from agent-director 0.18 a Claude subagent's clears when that subagent stops. Restart the persona's bot.",
   ])
   expect(buildDeliveryStuckNotice('Alpha', 'alpha', 2, DELIVERY_STUCK_AFTER_MS, 'refused', 3)).toBe(
     ':warning: *Delivery stuck* — 2 message(s) for Alpha are waiting; the oldest has waited 5m. ' + deliveryStuckRemedy('refused', 'alpha', 3) + ' ' + CONFLICT_NOTICE_HUMAN_ONLY_LINE)

@@ -68,13 +68,21 @@ wait_until 180 'Deny click did not reach CSCB relay' case_assert relay-decision 
 wait_until 180 'denied subagent did not settle after successful relay response' \
     busy_denial_settled
 real_wait_idle "${REAL_KEY}"
+# agent-director >= 0.18 proves a Claude subagent's requests gone at its
+# SubagentStop (turn_end): read the denied request first, then the row.
+DENY_TOKEN="$(case_assert deny-token "${SCENARIO_ROOT}/deny-click.json")"
+real_ad get-permission --request-token "${DENY_TOKEN}" > "${SCENARIO_ROOT}/denied-request.json"
+real_ad get --instance-id "$(real_instance "${REAL_KEY}")" > "${SCENARIO_ROOT}/denied-row.json"
+case_assert subagent-proven-gone "${SCENARIO_ROOT}/deny-click.json" "${SCENARIO_ROOT}/denied-request.json" "${SCENARIO_ROOT}/denied-row.json"
 real_dm "${REAL_LABEL}" 'message after denied subagent request'
-wait_until 180 'dialog-hold Delivery stuck was not posted' case_assert dialog-notice "${SCENARIO_SLACK_RECORD}" "${REAL_LABEL}"
+real_wait_delivery "${REAL_KEY}" 6
+case_assert no-stuck
 echo 'recorded: busy kill/recovery started'
 real_kill_and_reconcile "${REAL_KEY}"
 start_server --live
 real_wait_relaunch "${REAL_KEY}"
-real_wait_delivery "${REAL_KEY}" 6
+real_dm "${REAL_LABEL}" 'message after busy recovery'
+real_wait_delivery "${REAL_KEY}" 7
 echo 'recorded: busy kill/recovery completed'
 
 case_assert launches

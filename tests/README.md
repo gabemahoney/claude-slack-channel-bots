@@ -978,7 +978,11 @@ original inputs for sample `n`: one unmeasured warm-up DM, then the earlier
 samples. Its admission row is the AD row read after `real_wait_launch`, and
 its connection cursor is the `server.log` line count before `start_server`.
 Both tests give their persona the reply-tool instruction, so each DM's real
-reply resolves its reminder candidate before the next sample.
+reply resolves its reminder candidate before the next sample. Test 32's
+instruction also says to call no other tool, and its `real_prepare` pre-allows
+the router's `react` and `edit_message`, so an unrequested acknowledgement
+cannot leave a native permission prompt nothing answers. Reply stays allowed
+only by CSCB's launch pair, which `reply-permission-resume` still checks.
 
 Admission reads AD before replay and freshly after the audit. Both rows must
 match the retained admission row's instance, session, row-start and launch
@@ -989,9 +993,15 @@ after replay/stop and after the final AD read.
 
 Closed attempts print `recorded: AC76 admission` with `ready`, a fixed `reason`
 code and `candidates`/`open` counts (null until available), never raw journal,
-AD or error payloads. The helper polls under a 180 s watchdog and fails without
-sending the next DM if admission stays closed, including for a candidate with
-no observed working transition; elapsed time alone cannot admit a sample.
+AD or error payloads. A row of the same life in any state but `waiting` or
+`working` closes as `ad-state:<state>` (`ad-state:unreadable` for a malformed
+state), not `life-changed`. The helper polls under a 180 s watchdog and fails
+without sending the next DM if admission stays closed, including for a
+candidate with no observed working transition; elapsed time alone cannot admit
+a sample. On that timeout it records one `recorded: AC76 AD row` line: a
+bounded projection of the persona's AD row (state, its change time, family
+state, `tag_prompt`, and each permission and unproven request's tool, request
+time and decision), never tool input or other payloads.
 The import-safe fixture uses installed-package queue/receipt adapters in its
 guarded CLI and bounds each AD read to 10 s.
 
@@ -1047,7 +1057,7 @@ observer; the shared `real-case-assertions.ts` comparator is unchanged.
 
 | Script | Checks |
 |---|---|
-| `test-101-fmk-real-busy.sh` | Active pre-allowed tool, permission hold and subagent denial/dialog-hold recovery |
+| `test-101-fmk-real-busy.sh` | Active pre-allowed tool, permission hold, subagent denial proven gone at SubagentStop, and kill/recovery |
 | `test-102-fmk-real-replies.sh` | DM, mention and thread reply destinations; three fresh-launch first messages |
 | `test-103-fmk-real-latency100.sh` | The 100-DM latency step: reply-tool persona, one unmeasured warm-up DM, AC76 admission before each sample; p95 limits over the last 100 inputs, receipt/FIFO audit over all 101 |
 | `test-104-fmk-real-idle-compact.sh` | Uncertain AD text outcome with three ordered receipt-confirmed queued messages |
@@ -1377,8 +1387,19 @@ the completion-observer sweep are recorded in
 Test 101 then runs
 the existing `real_wait_idle` AD waiting check. This preparation uses
 only the Slack stub record and own native transcripts; the permission hold,
-Allow, Agent Deny, actual `dialog-hold` notice, restart and six-delivery
-assertions retain their bounds. The persona prompt and deny-step message reserve
+Allow, Agent Deny, restart and delivery assertions retain their bounds.
+From agent-director 0.18 a Claude subagent's denied request is proven gone
+(`turn_end`) at its `SubagentStop`, so no dialog hold follows (b.88t; AD's
+`docs/permissions.md`, The dialog hold). Test 101 reads the denied request with
+`get-permission` (its token from the recorded Deny click), then the row with
+`get`, and `case_assert subagent-proven-gone` requires the deny verdict on the
+subagent probe, `proven_gone_how` `turn_end` with a time, no `unproven_since`,
+and a waiting row with an empty `unproven_requests`. Message six must then be
+delivered with no `delivery-stuck` line. The kill/recovery leg follows
+unchanged and proves a seventh message delivered after the relaunch. A Codex
+subagent's request still holds until the bot ends; Test 101 has no Codex
+variant, and the `dialog-hold` notice itself stays covered without a model by
+`tests/delivery-notices.test.ts`. The persona prompt and deny-step message reserve
 `printf subagent-deny-probe` for the subagent. A main-session Bash call of that
 command fails immediately as `main agent ran the denied probe itself`, through
 the observer's terminal exit 2; incomplete evidence exits 1 and keeps polling
