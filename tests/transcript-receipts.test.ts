@@ -19,7 +19,7 @@ import { cannedGetResult } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { promptEntry } from './test-helpers/working-row-panes.ts'
 import { auditReceipts, deliveryFailureEvidence, jsonLines, readTranscripts, receiptJournal, receiptProgress, threadLatency, threadSampleIntervals, THREAD_N2_MIN_SAMPLES, THREAD_N2_TYPING_MS, THREAD_N2_DELIVERY_MS, workloadItem, workloadItems, type ShimSend, type ThreadLatencyOptions } from './integration/fixtures/transcript-receipts.ts'
-import { checkAc76Admission, connectionVersion, projectAdmissionRow, type AdmissionAdapters, type AdmissionOptions } from './integration/fixtures/ac76-admission.ts'
+import { ADMISSION_ROW_MAX_REQUESTS, checkAc76Admission, connectionVersion, projectAdmissionRow, type AdmissionAdapters, type AdmissionOptions } from './integration/fixtures/ac76-admission.ts'
 import { runFixture, runRealSlice, runTest33Slice, SITE_SLICES, type RealSlice, type Site, type Test33Leg, type Test33Result } from './test-helpers/test33-receipt-boundary.ts'
 
 const cleanups: (() => Promise<void>)[] = []
@@ -759,6 +759,9 @@ async function firstLatencyAdmission(home: string, reply: (request: string) => P
     'REAL_KEY=alpha', 'REAL_LABEL=alpha', 'REAL_CONNECTION_LINE_BASE=0', 'REAL_RECEIPTS=receipts',
     'bun() { local answer; answer="$(bridge "$2")"; if [[ "$2" == progress ]]; then echo "$answer"; else [[ "$answer" == ok ]]; fi; }',
     'real_dm() { bridge dm >/dev/null; exit 0; }',
+    'require_scenario_home() { :; }',
+    // The timeout's diagnostic read must be the real AD binary under a 10 s bound.
+    'timeout() { local answer; [[ "$1" == 10 && "$2" == "$SCENARIO_AD_ROOT/bin/agent-director.real" ]] || { echo "unbounded diagnostic read" >&2; exit 9; }; shift 2; answer="$(bridge ad "$@")"; [[ "$answer" != FAIL ]] || return 124; printf "%s\\n" "$answer"; }',
   ], script.slice(start, end), ([request]) => reply(request!))
   expect({ code: result.code, signal: result.signal }).toEqual({ code: timeout ? 1 : 0, signal: null })
   expect(result.stderr).toBe(timeout ? 'AC76 pre-sample admission timed out (see reason codes and counts)\n' : '')
@@ -1169,15 +1172,27 @@ test('admission timeout row projection keeps state and request tools, never payl
   const projected = projectAdmissionRow(row)
   expect(projected).toEqual({
     state: 'check_permission', state_changed_at: '2026-11-21T04:59:31.700Z', family_state: 'live', tag_prompt: '1',
-    permission_requests: [{ tool_name: 'mcp__slack-channel-router__react', requested_at: '2026-11-21T04:59:31.690Z', decision: null }],
-    unproven_requests: [],
+    permission_requests: { total: 1, shown: [{ tool_name: 'mcp__slack-channel-router__react', requested_at: '2026-11-21T04:59:31.690Z', decision: null }] },
+    unproven_requests: { total: 0, shown: [] },
   })
   expect(JSON.stringify(projected)).not.toContain('white_check_mark')
   expect(JSON.stringify(projected)).not.toContain('tok')
   expect(projectAdmissionRow({ state: 'x y', permission_requests: [{ tool_name: 'a b' }, 3], unproven_requests: 'no' }))
     .toEqual({ state: 'unreadable', state_changed_at: null, family_state: null, tag_prompt: null,
-      permission_requests: [{ tool_name: 'unreadable', requested_at: null, decision: null }, 'unreadable'], unproven_requests: 'unreadable' })
+      permission_requests: { total: 2, shown: [{ tool_name: 'unreadable', requested_at: null, decision: null }, 'unreadable'] }, unproven_requests: 'unreadable' })
   for (const bad of [null, [], 'row']) expect(projectAdmissionRow(bad)).toEqual({ unavailable: true })
+})
+
+test('admission timeout row projection caps each request list and keeps its total', () => {
+  const request = (i: number) => ({ tool_name: `tool_${i}`, tool_input: 'x'.repeat(1000), requested_at: '2026-11-21T04:59:31Z', decision: 'allow' })
+  const many = Array.from({ length: 10000 }, (_, i) => request(i))
+  const projected = projectAdmissionRow({ state: 'waiting', permission_requests: many, unproven_requests: many }) as any
+  for (const list of [projected.permission_requests, projected.unproven_requests]) {
+    expect(list.total).toBe(10000)
+    expect(list.shown).toHaveLength(ADMISSION_ROW_MAX_REQUESTS)
+    expect(list.shown.at(-1).tool_name).toBe(`tool_${ADMISSION_ROW_MAX_REQUESTS - 1}`)
+  }
+  expect(JSON.stringify(projected).length).toBeLessThan(8192)
 })
 
 test.each(['working', 'AD rejection', 'missing journal', 'wrong original count', 'missing receipt'] as const)(
@@ -1199,7 +1214,8 @@ test.each(['working', 'AD rejection', 'missing journal', 'wrong original count',
   },
 )
 
-test('unresolved candidate without observed working reaches the watchdog without a DM or cancellation', async () => {
+test.each(['readable row', 'row over 1 MB', 'failed read'] as const)(
+  'unresolved candidate without observed working reaches the watchdog without a DM or cancellation: %s', async mode => {
   const h = await fixture(false)
   await h.send(slackInput())
   for (let i = 1; i < 34; i++) await h.send(injectedInput())
@@ -1208,7 +1224,8 @@ test('unresolved candidate without observed working reaches the watchdog without
   expect(h.audit().items).toBe(34)
   expect(h.queue.replyReminderItems('alpha')).toHaveLength(1)
   let polls = 0, attempts = 0, dms = 0, reads = 0, dumps = 0
-  const row = JSON.stringify({ instance_id: 'cscb_alpha', state: 'check_permission' })
+  const row = JSON.stringify({ instance_id: 'cscb_alpha', state: 'check_permission',
+    ...(mode === 'row over 1 MB' ? { padding: 'x'.repeat(1048576) } : {}) })
   await firstLatencyAdmission(h.options.stateDir, async request => {
     if (request === 'now') return String(polls * 1000)
     if (request === 'poll') { polls++; return 'ok' }
@@ -1219,7 +1236,7 @@ test('unresolved candidate without observed working reaches the watchdog without
     }
     if (request === 'dm') { dms++; return 'ok' }
     // The timeout reads the AD row once, after the last attempt, and projects it.
-    if (request === 'ad') { expect(attempts).toBe(5); reads++; return row }
+    if (request === 'ad') { expect(attempts).toBe(5); reads++; return mode === 'failed read' ? 'FAIL' : row }
     if (request === 'row') { expect(reads).toBe(1); dumps++; return 'ok' }
     throw new Error(`Unexpected test boundary: ${request}`)
   }, true)
@@ -1227,7 +1244,9 @@ test('unresolved candidate without observed working reaches the watchdog without
   expect(attempts).toBe(5) // Initial, polling, and the actual shell's final deadline check.
   expect(dms).toBe(0)
   expect({ reads, dumps }).toEqual({ reads: 1, dumps: 1 })
-  expect(readFileSync(join(h.options.stateDir, 'ac76-timeout-row.json'), 'utf8')).toBe(`${row}\n`)
+  // An oversized or failed read is recorded as unavailable; the timeout fails either way.
+  expect(readFileSync(join(h.options.stateDir, 'ac76-timeout-row.json'), 'utf8'))
+    .toBe(mode === 'readable row' ? `${row}\n` : '{}\n')
   expect(readFileSync(h.journal)).toEqual(bytes)
   expect(h.queue.replyReminderItems('alpha')).toHaveLength(1)
 })

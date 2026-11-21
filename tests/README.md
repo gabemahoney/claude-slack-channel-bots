@@ -1001,7 +1001,10 @@ candidate with no observed working transition; elapsed time alone cannot admit
 a sample. On that timeout it records one `recorded: AC76 AD row` line: a
 bounded projection of the persona's AD row (state, its change time, family
 state, `tag_prompt`, and each permission and unproven request's tool, request
-time and decision), never tool input or other payloads.
+time and decision), never tool input or other payloads. Each request list
+shows at most 20 entries with its total. The row read is bounded like the
+admission's own: 10 s on the real binary and 1 MB; a failed, timed-out or
+oversize read records the row as unavailable, and the timeout still fails.
 The import-safe fixture uses installed-package queue/receipt adapters in its
 guarded CLI and bounds each AD read to 10 s.
 
@@ -1057,7 +1060,7 @@ observer; the shared `real-case-assertions.ts` comparator is unchanged.
 
 | Script | Checks |
 |---|---|
-| `test-101-fmk-real-busy.sh` | Active pre-allowed tool, permission hold, subagent denial proven gone at SubagentStop, and kill/recovery |
+| `test-101-fmk-real-busy.sh` | Active pre-allowed tool, permission hold, subagent denial proven gone at SubagentStop, and kill/recovery of a message held behind an open prompt |
 | `test-102-fmk-real-replies.sh` | DM, mention and thread reply destinations; three fresh-launch first messages |
 | `test-103-fmk-real-latency100.sh` | The 100-DM latency step: reply-tool persona, one unmeasured warm-up DM, AC76 admission before each sample; p95 limits over the last 100 inputs, receipt/FIFO audit over all 101 |
 | `test-104-fmk-real-idle-compact.sh` | Uncertain AD text outcome with three ordered receipt-confirmed queued messages |
@@ -1390,13 +1393,22 @@ only the Slack stub record and own native transcripts; the permission hold,
 Allow, Agent Deny, restart and delivery assertions retain their bounds.
 From agent-director 0.18 a Claude subagent's denied request is proven gone
 (`turn_end`) at its `SubagentStop`, so no dialog hold follows (b.88t; AD's
-`docs/permissions.md`, The dialog hold). Test 101 reads the denied request with
+`docs/permissions.md`, The dialog hold). That proof covers only a request
+created before the whole UTC second the `SubagentStop` hook started, and the
+subagent cannot stop before its Deny arrives. So Test 101 sends the Deny only
+once `case_assert denial-eligible` sees, through `get-permission`, the
+still-open subagent probe with its recorded second passed (polled for at most
+10 s). After the subagent settles, Test 101 reads the denied request with
 `get-permission` (its token from the recorded Deny click), then the row with
 `get`, and `case_assert subagent-proven-gone` requires the deny verdict on the
 subagent probe, `proven_gone_how` `turn_end` with a time, no `unproven_since`,
 and a waiting row with an empty `unproven_requests`. Message six must then be
-delivered with no `delivery-stuck` line. The kill/recovery leg follows
-unchanged and proves a seventh message delivered after the relaunch. A Codex
+delivered with no `delivery-stuck` line. The kill must still find queued work:
+message seven asks the main agent to run `printf permission-probe` again, and
+once that prompt is open (`prompt-again`: a third relayed prompt and a second
+main-agent probe) message eight is accepted, still open and untyped. The
+kill/recovery leg then runs as before, and recovery must deliver message eight
+with no new DM. A Codex
 subagent's request still holds until the bot ends; Test 101 has no Codex
 variant, and the `dialog-hold` notice itself stays covered without a model by
 `tests/delivery-notices.test.ts`. The persona prompt and deny-step message reserve

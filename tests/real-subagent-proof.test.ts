@@ -3,7 +3,7 @@ import { afterEach, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { assertSubagentProvenGone, denyClickToken } from './integration/fixtures/real-case-assertions.ts'
+import { assertDenialEligible, assertPromptAgain, assertSubagentProvenGone, denyClickToken } from './integration/fixtures/real-case-assertions.ts'
 import { runFixture } from './test-helpers/test33-receipt-boundary.ts'
 
 const roots: string[] = []
@@ -65,6 +65,48 @@ test.each([
   expect(() => assertSubagentProvenGone(TOKEN, request, adRow, INSTANCE)).toThrow(reason)
 })
 
+// AD stores created_at in whole seconds; get-permission prints it as RFC 3339.
+const open = (changes: Record<string, unknown> = {}) => permission({ requested_at: '2026-11-21T04:57:18Z', decision: null,
+  decision_reason: null, decided_at: null, proven_gone_at: null, proven_gone_how: null, unproven_since: '2026-11-21T04:57:18Z', ...changes })
+const REQUESTED_MS = Date.parse('2026-11-21T04:57:18Z')
+
+test('regression: Deny waits until the request\'s recorded second has passed (AD turn_end cuts at the hook\'s whole second)', () => {
+  expect(assertDenialEligible(TOKEN, open(), REQUESTED_MS + 1000))
+    .toEqual({ requested_at: '2026-11-21T04:57:18Z', denied_after_ms: REQUESTED_MS + 1000 })
+  expect(() => assertDenialEligible(TOKEN, open(), REQUESTED_MS + 2500)).not.toThrow()
+  // Same second as the request: a SubagentStop starting now could not prove it.
+  for (const now of [REQUESTED_MS, REQUESTED_MS + 1, REQUESTED_MS + 999])
+    expect(() => assertDenialEligible(TOKEN, open(), now)).toThrow('denial pending')
+  // A fractional requested_at still compares by its whole second.
+  expect(() => assertDenialEligible(TOKEN, open({ requested_at: '2026-11-21T04:57:18.900Z' }), REQUESTED_MS + 999)).toThrow('denial pending')
+  expect(() => assertDenialEligible(TOKEN, open({ requested_at: '2026-11-21T04:57:18.900Z' }), REQUESTED_MS + 1000)).not.toThrow()
+})
+
+test.each([
+  ['another token', open({ request_token: 'other' }), 'wrong token'],
+  ['main-agent probe', open({ tool_input: '{"command":"printf permission-probe"}' }), 'not the subagent probe'],
+  ['already decided', open({ decision: 'deny' }), 'no longer open'],
+  ['already proven', open({ proven_gone_at: '2026-11-21T04:57:19Z' }), 'no longer open'],
+  ['requested_at missing', open({ requested_at: null }), 'no readable requested_at'],
+  ['requested_at unreadable', open({ requested_at: 'soon' }), 'no readable requested_at'],
+  ['unreadable read', undefined, 'wrong token'],
+] as const)('denial eligibility rejects %s', (_name, request, reason) => {
+  expect(() => assertDenialEligible(TOKEN, request, REQUESTED_MS + 5000)).toThrow(reason)
+})
+
+const prompt = { event: 'api', method: 'chat.postMessage', text: '🤖🛠️ permission request: Bash' }
+const probe = (command: string) => [{ type: 'tool_use', name: 'Bash', input: { command } }]
+test('recovery hold needs a third relayed prompt and a second main-agent probe', () => {
+  const posts = [prompt, prompt, prompt], calls = [probe('printf permission-probe'), probe('printf subagent-deny-probe'), probe('printf permission-probe')]
+  expect(() => assertPromptAgain(posts, calls)).not.toThrow()
+  expect(() => assertPromptAgain([prompt, prompt], calls)).toThrow('has not posted the recovery request')
+  expect(() => assertPromptAgain([...posts.slice(0, 2), { ...prompt, method: 'chat.update' }], calls)).toThrow('has not posted the recovery request')
+  expect(() => assertPromptAgain(posts, calls.slice(0, 2))).toThrow('recovery permission tool not observed')
+  // The subagent's probe is not a main-agent probe.
+  expect(() => assertPromptAgain(posts, [probe('printf permission-probe'), probe('printf subagent-deny-probe'), probe('printf subagent-deny-probe')]))
+    .toThrow('recovery permission tool not observed')
+})
+
 function files(values: { click?: unknown; request?: unknown; row?: unknown }) {
   const root = mkdtempSync(join(tmpdir(), 'subagent-proof-')); roots.push(root)
   const path = (name: string, value: unknown) => {
@@ -87,6 +129,20 @@ test('CLI deny-token prints only the token; subagent-proven-gone records the pro
   expect(proof.out.join('\n')).toContain('recorded: denied subagent request proven gone at turn end {"proven_gone_at":"2026-11-21T04:57:22.230Z"')
 })
 
+test('CLI denial-eligible passes once the recorded second has passed and fails while it has not', async () => {
+  const past = files({ request: open() })
+  const ok = await cli(past, 'denial-eligible', past.click, past.request)
+  expect(ok.code).toBe(0)
+  expect(ok.out.join('\n')).toContain('recorded: subagent denial eligible for turn-end proof {"requested_at":"2026-11-21T04:57:18Z"')
+  const now = new Date(Date.now() + 60_000).toISOString().replace(/\.\d+Z$/, 'Z')
+  const pending = files({ request: open({ requested_at: now }) })
+  expect((await cli(pending, 'denial-eligible', pending.click, pending.request)).code).toBe(1)
+  const decided = files({ request: open({ decision: 'deny' }) })
+  expect((await cli(decided, 'denial-eligible', decided.click, decided.request)).code).toBe(1)
+  const unreadable = files({ request: 'nope' })
+  expect((await cli(unreadable, 'denial-eligible', unreadable.click, unreadable.request)).code).toBe(1)
+})
+
 test.each([
   ['malformed click', { click: '{' }, 'deny-token'],
   ['unproven request', { request: permission({ proven_gone_at: null, proven_gone_how: null }) }, 'subagent-proven-gone'],
@@ -97,6 +153,45 @@ test.each([
   const h = files(values)
   const result = await cli(h, command, h.click, h.request, h.row)
   expect(result.code).toBe(1)
+})
+
+test('test-101 sends its Deny only after the request\'s recorded second has passed', async () => {
+  const text = await Bun.file(join(import.meta.dir, 'real-agent/test-101-fmk-real-busy.sh')).text()
+  const opened = text.indexOf("case_assert subagent-permission")
+  const at = (needle: string) => { const i = text.indexOf(needle, opened); expect(i).toBeGreaterThan(opened); return i }
+  const recorded = at('> "${SCENARIO_ROOT}/deny-click.json"')
+  const token = at('DENY_TOKEN="$(case_assert deny-token "${SCENARIO_ROOT}/deny-click.json")"')
+  const eligible = at("wait_until 10 'subagent request never became eligible for its turn-end proof' denial_eligible")
+  const push = at('"${SCENARIO_SLACK_STUB_URL}/_push" > "${SCENARIO_ROOT}/deny-action.json"')
+  expect([recorded, token, eligible, push]).toEqual([recorded, token, eligible, push].sort((a, b) => a - b))
+  const helper = text.slice(text.indexOf('denial_eligible() {'), eligible)
+  expect(helper).toContain('real_ad get-permission --request-token "${DENY_TOKEN}"')
+  expect(helper).toContain('case_assert denial-eligible "${SCENARIO_ROOT}/deny-click.json"')
+  expect(text.match(/DENY_TOKEN=/g)).toHaveLength(1)
+})
+
+test('test-101 kills with an accepted, undelivered item held behind an open prompt and requires that item after recovery', async () => {
+  const text = await Bun.file(join(import.meta.dir, 'real-agent/test-101-fmk-real-busy.sh')).text()
+  const six = text.indexOf('real_wait_delivery "${REAL_KEY}" 6')
+  const at = (needle: string) => { const i = text.indexOf(needle, six); expect(i).toBeGreaterThan(six); return i }
+  const order = [
+    at('case_assert no-stuck'),
+    at("real_dm \"${REAL_LABEL}\" 'Use Bash to run printf permission-probe again. Wait for approval.'"),
+    at('real_wait_delivery "${REAL_KEY}" 7'),
+    at('case_assert prompt-again "${SCENARIO_SLACK_RECORD}"'),
+    at('MARK="$(date +%s%3N)"'),
+    at("real_dm \"${REAL_LABEL}\" 'message held across busy recovery'"),
+    at('case_assert accepted 8'),
+    at('case_assert open 8'),
+    at('case_assert no-send "${MARK}"'),
+    at('real_kill_and_reconcile "${REAL_KEY}"'),
+    at('start_server --live'),
+    at('real_wait_relaunch "${REAL_KEY}"'),
+    at('real_wait_delivery "${REAL_KEY}" 8'),
+  ]
+  expect(order).toEqual([...order].sort((a, b) => a - b))
+  // Nothing new is sent after the kill: recovery must deliver the held item itself.
+  expect(text.slice(order.at(-4)!, order.at(-1)!)).not.toContain('real_dm')
 })
 
 test('test-101 reads the denied request, then the row, before its next DM, and the next DM is delivered without a stuck notice', async () => {
@@ -112,9 +207,9 @@ test('test-101 reads the denied request, then the row, before its next DM, and t
   const kill = at('real_kill_and_reconcile')
   expect(at('real_wait_idle "${REAL_KEY}"')).toBeLessThan(permissionRead)
   expect([permissionRead, rowRead, proof, dm, delivered, noStuck, kill]).toEqual([permissionRead, rowRead, proof, dm, delivered, noStuck, kill].sort((a, b) => a - b))
-  // The recovery leg keeps its relaunch and proves a delivery after it.
+  // The recovery leg keeps its relaunch and proves the held delivery after it.
   const relaunch = at('real_wait_relaunch "${REAL_KEY}"')
-  expect(text.indexOf('real_wait_delivery "${REAL_KEY}" 7', relaunch)).toBeGreaterThan(relaunch)
+  expect(text.indexOf('real_wait_delivery "${REAL_KEY}" 8', relaunch)).toBeGreaterThan(relaunch)
   expect(text).not.toContain('dialog-notice')
 })
 

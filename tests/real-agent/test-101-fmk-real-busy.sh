@@ -61,6 +61,15 @@ real_dm "${REAL_LABEL}" 'Use Agent to ask a subagent to run Bash printf subagent
 wait_until 180 'subagent permission not opened' case_assert subagent-permission "${SCENARIO_SLACK_RECORD}"
 ACTION="$(case_assert relay-action "${SCENARIO_SLACK_RECORD}" deny "${REAL_USER}")"
 printf '%s\n' "${ACTION}" > "${SCENARIO_ROOT}/deny-click.json"
+# AD's turn_end proof covers only a request created before the whole second
+# its SubagentStop hook starts. The subagent cannot stop before the Deny, so
+# deny only once the request's recorded second has passed.
+DENY_TOKEN="$(case_assert deny-token "${SCENARIO_ROOT}/deny-click.json")"
+denial_eligible() {
+    real_ad get-permission --request-token "${DENY_TOKEN}" > "${SCENARIO_ROOT}/deny-eligible.json" \
+        && case_assert denial-eligible "${SCENARIO_ROOT}/deny-click.json" "${SCENARIO_ROOT}/deny-eligible.json"
+}
+wait_until 10 'subagent request never became eligible for its turn-end proof' denial_eligible
 curl -fsS --max-time 20 -X POST -H 'Content-Type: application/json' --data-binary "${ACTION}" "${SCENARIO_SLACK_STUB_URL}/_push" > "${SCENARIO_ROOT}/deny-action.json"
 wait_until 180 'Deny click did not reach CSCB relay' case_assert relay-decision "${SCENARIO_SLACK_RECORD}" deny
 # A Stop can precede background Agent completion. Observe the actual matching
@@ -70,19 +79,27 @@ wait_until 180 'denied subagent did not settle after successful relay response' 
 real_wait_idle "${REAL_KEY}"
 # agent-director >= 0.18 proves a Claude subagent's requests gone at its
 # SubagentStop (turn_end): read the denied request first, then the row.
-DENY_TOKEN="$(case_assert deny-token "${SCENARIO_ROOT}/deny-click.json")"
 real_ad get-permission --request-token "${DENY_TOKEN}" > "${SCENARIO_ROOT}/denied-request.json"
 real_ad get --instance-id "$(real_instance "${REAL_KEY}")" > "${SCENARIO_ROOT}/denied-row.json"
 case_assert subagent-proven-gone "${SCENARIO_ROOT}/deny-click.json" "${SCENARIO_ROOT}/denied-request.json" "${SCENARIO_ROOT}/denied-row.json"
 real_dm "${REAL_LABEL}" 'message after denied subagent request'
 real_wait_delivery "${REAL_KEY}" 6
 case_assert no-stuck
+# The kill must find accepted, undelivered work: hold message eight behind an
+# open main-agent prompt (as message four was held), so recovery must deliver it.
+real_dm "${REAL_LABEL}" 'Use Bash to run printf permission-probe again. Wait for approval.'
+real_wait_delivery "${REAL_KEY}" 7
+wait_until 180 'recovery permission prompt never opened' case_assert prompt-again "${SCENARIO_SLACK_RECORD}"
+MARK="$(date +%s%3N)"
+real_dm "${REAL_LABEL}" 'message held across busy recovery'
+wait_until 180 'recovery-held message not accepted' case_assert accepted 8
+case_assert open 8
+case_assert no-send "${MARK}"
 echo 'recorded: busy kill/recovery started'
 real_kill_and_reconcile "${REAL_KEY}"
 start_server --live
 real_wait_relaunch "${REAL_KEY}"
-real_dm "${REAL_LABEL}" 'message after busy recovery'
-real_wait_delivery "${REAL_KEY}" 7
+real_wait_delivery "${REAL_KEY}" 8
 echo 'recorded: busy kill/recovery completed'
 
 case_assert launches

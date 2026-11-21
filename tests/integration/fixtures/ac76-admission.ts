@@ -49,18 +49,22 @@ function stateReason(row: AdmissionRow): AdmissionReason | undefined {
   return `ad-state:${typeof row.state === 'string' && /^[a-z_]{1,32}$/.test(row.state) ? row.state : 'unreadable'}`
 }
 
+export const ADMISSION_ROW_MAX_REQUESTS = 20
+
 /** Bounded AD row projection for an admission timeout: state, family and
  * request tools/verdicts only; no tool input, arguments or other payloads. */
 export function projectAdmissionRow(row: unknown): Record<string, unknown> {
   if (!row || typeof row !== 'object' || Array.isArray(row)) return { unavailable: true }
   const value = row as Record<string, unknown>
   const word = (v: unknown, pattern: RegExp) => typeof v === 'string' && pattern.test(v) ? v : v === null || v === undefined ? null : 'unreadable'
+  // At most ADMISSION_ROW_MAX_REQUESTS entries per list, each a few bounded
+  // words, with the list's total: the line stays a few KB whatever AD holds.
   const requests = (list: unknown) => Array.isArray(list)
-    ? list.map(r => r && typeof r === 'object' ? {
+    ? { total: list.length, shown: list.slice(0, ADMISSION_ROW_MAX_REQUESTS).map(r => r && typeof r === 'object' ? {
         tool_name: word((r as any).tool_name, /^[A-Za-z0-9_.:-]{1,128}$/),
         requested_at: word((r as any).requested_at, /^[0-9T:.+Z-]{1,40}$/),
         decision: word((r as any).decision, /^[a-z_]{1,32}$/),
-      } : 'unreadable')
+      } : 'unreadable') }
     : list === undefined ? null : 'unreadable'
   return {
     state: word(value.state, /^[a-z_]{1,32}$/),

@@ -117,6 +117,37 @@ export function denyClickToken(click: any, instance: string): string {
   return token
 }
 
+/** AD's turn_end proof covers only a request created before the whole UTC
+ * second its SubagentStop hook started (AD internal/store/request_proof.go,
+ * TestTurnEndCutsAtTheHookStart). The subagent cannot stop before its Deny
+ * arrives, so a Deny sent once the request's recorded second has passed makes
+ * the request eligible. Throws `denial pending` until then; anything but the
+ * still-undecided subagent probe of this token is a hard mismatch. */
+export function assertDenialEligible(token: string, permission: any, nowMs: number) {
+  check(permission?.request_token === token, 'subagent request read has the wrong token')
+  check(typeof permission.tool_input === 'string' && permission.tool_input.includes('subagent-deny-probe'),
+    'subagent request is not the subagent probe')
+  check(permission.decision === null && permission.proven_gone_at === null, 'subagent request is no longer open')
+  const requested = typeof permission.requested_at === 'string' ? Date.parse(permission.requested_at) : NaN
+  check(Number.isFinite(requested), 'subagent request has no readable requested_at')
+  check(Number.isFinite(nowMs) && Math.floor(nowMs / 1000) > Math.floor(requested / 1000),
+    'denial pending: the request\'s recorded second has not passed')
+  return { requested_at: permission.requested_at, denied_after_ms: nowMs }
+}
+
+/** Test 101's recovery hold: a later main-agent probe has opened its own
+ * prompt. Three relayed prompts (main, subagent, this one) and a second
+ * `permission-probe` tool_use. `records` are Slack stub records; `entries`
+ * are each transcript entry's assistant content blocks. */
+export function assertPromptAgain(records: any[], entries: any[][]) {
+  const prompts = records.filter(r => r?.event === 'api' && r.method === 'chat.postMessage'
+    && typeof r.text === 'string' && r.text.startsWith('🤖🛠️ permission request:'))
+  check(prompts.length >= 3, 'permission relay has not posted the recovery request')
+  const probes = entries.filter(content => content.some((b: any) => b?.type === 'tool_use'
+    && typeof b.input?.command === 'string' && b.input.command.includes('printf permission-probe')))
+  check(probes.length >= 2, 'recovery permission tool not observed')
+}
+
 /** agent-director >= 0.18 (00418da2): a Claude subagent's denied request is
  * proven gone (`turn_end`) at its SubagentStop, so the live row holds no
  * dialog. `permission` is `get-permission` for the token, read before `row`. */
@@ -530,6 +561,13 @@ try {
   } else if(command==='deny-token') {
     let click:unknown;try{click=JSON.parse(readFileSync(arg,'utf8'))}catch{click=undefined}
     console.log(denyClickToken(click,'cscb_'+key))
+  } else if(command==='denial-eligible') {
+    // arg: the Deny click (not yet sent); arg2: get-permission for its token, read now.
+    let click:unknown;try{click=JSON.parse(readFileSync(arg,'utf8'))}catch{click=undefined}
+    let request:unknown;try{request=JSON.parse(readFileSync(arg2,'utf8'))}catch{throw new Error('subagent request read could not be read')}
+    console.log('recorded: subagent denial eligible for turn-end proof '+JSON.stringify(assertDenialEligible(denyClickToken(click,'cscb_'+key),request,Date.now())))
+  } else if(command==='prompt-again') {
+    assertPromptAgain(jsonLines(arg),(await entries()).map(blocks))
   } else if(command==='subagent-proven-gone') {
     // arg: the Deny click; arg2: get-permission for its token; arg3: get for the row, read after.
     const read=(path:string)=>{try{return JSON.parse(readFileSync(path,'utf8'))}catch{throw new Error('subagent proof AD reads could not be read')}}
