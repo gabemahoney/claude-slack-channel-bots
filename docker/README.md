@@ -1230,15 +1230,28 @@ still-valid recorded runner/script caller and outside the current measured
 server tree. Any failed condition is `missing`, including exit, reuse or a
 changed program with the same start identity.
 
-Accepted clients add to `harness_members`, never persona stub/MCP evidence.
-`stop_clients` clears the list, and an absent file leaves other burst scripts
-unchanged.
+Accepted clients still add to `harness_members`; non-qualifying clients cannot
+fill a missing persona MCP. For a silent persona, a listed client may supply
+MCP evidence only if both validations above also find its current ancestry
+outside the owned tmux tree and its NUL-terminated argv after the interpreter
+is exactly `${SCENARIO_ROOT}/bin/stub-mcp-session.ts ${SCENARIO_ROOT}/home/.claude/slack-mcp.json <dir>`,
+with no extra arguments. `<dir>` must match a configured persona's
+`working_directory` spelling exactly, without normalization or dependence on
+client cwd; the association captured at the main scan must still match at
+the final recheck.
 
-Each configured persona needs a complete stub/MCP pair, revalidated in that
-tmux tree; recognized live duplicates outside it or the harness fail unless
-they are listed fixture clients satisfying the full invariant above.
-Recorded server/Slack/tmux and runner/script identities must remain
-live and unchanged through the final check.
+Every configured persona still needs its stub in the tmux tree. A
+tree/fixture collision or two qualifying listed clients for one directory
+is `missing`; each directory requires exactly one MCP evidence source, from
+the tree or a qualifying fixture. `persona_mcps` remains
+tree-only, while `persona_fixture_mcps` counts qualifying fixture directories
+and is 0 when the list is absent or none qualify.
+
+`stop_clients` clears the list, and an absent file leaves other burst scripts
+unchanged. Recognized live duplicates outside the tmux tree or harness fail
+unless they pass the required listed-client validation above. Recorded
+server/Slack/tmux and runner/script identities must remain live and unchanged
+through the final check.
 
 A non-required server child or harness/tmux helper is skipped only when it
 genuinely exits between enumeration and a later read with no contradiction
@@ -1252,10 +1265,10 @@ persona's only stub/MCP remain `missing`. Unrelated processes may have
 inaccessible cwd/command metadata when readable identity and group establish
 that they are outside the measured trees.
 
-Ten placement fields follow the unchanged `limit=2 verdict=…` text:
+Eleven placement fields follow the unchanged `limit=2 verdict=…` text:
 `harness_cgroup`, `harness_cpus`, `runner_cgroup`, `script_cgroup`,
 `tmux_cgroup`, `persona_stubs`, `persona_mcps`, `harness_members`,
-`slack_cgroup` and `server_members`.
+`slack_cgroup`, `server_members` and `persona_fixture_mcps`.
 This checks placement, quotas and permissions, not throttling or contention
 outside the container (see [Thread Memory performance runs](../docs/testing-guide.md#thread-memory-performance-runs)).
 

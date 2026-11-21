@@ -252,11 +252,9 @@ measurement_mark="$(byte_mark "${MEASUREMENTS}")"
 start_ready measured
 sr8_verdicts seal measured "${CONTEXT[@]}" "${LOG}" "${measured_log_mark}" "${CONFIG}"
 
-start_pending_post() {
-    local key="$1" request facts
-    # Startup notices can already have their own intents in the destination
-    # channel. Bind this tool call to a newly observed operation only.
-    capture_posts "${key}" "${EVIDENCE}/${key}.prior-posts.jsonl"
+start_fixture_client() {
+    local key="$1"
+    [[ -z "${CLIENT[${key}]:-}" ]] || return 0
     # A fresh separate MCP fixture uses roots/list for this exact configured
     # directory. The silent AD row stays pending, so no delivery is enabled.
     bun "${SCENARIO_BIN}/stub-mcp-session.ts" "${HOME}/.claude/slack-mcp.json" "${WORK[${key}]}" \
@@ -264,6 +262,63 @@ start_pending_post() {
     CLIENT[${key}]=$!
     track_pid "${CLIENT[${key}]}"
     _scenario_placement_identity clients "${CLIENT[${key}]}"
+}
+wait_fixture_client() {
+    local key="$1" file
+    file="$(_scenario_session_file "${WORK[${key}]}" sessions)" || fail "fixture MCP ${key}: cannot locate session observations"
+    # event=connected is emitted only after the server accepts roots/list.
+    # Watch the existing record and this exact process's exit, with no sleep.
+    python3 - "${file}" "${CLIENT[${key}]}" <<'PY' || fail "fixture MCP ${key}: readiness barrier failed"
+import ctypes, json, os, select, sys, time
+from pathlib import Path
+try:
+    path, pid = Path(sys.argv[1]), int(sys.argv[2])
+    deadline = time.monotonic() + 30
+    try:
+        process = os.pidfd_open(pid)
+    except ProcessLookupError:
+        raise RuntimeError('client exited before readiness')
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.inotify_init1.argtypes, libc.inotify_init1.restype = [ctypes.c_int], ctypes.c_int
+    libc.inotify_add_watch.argtypes, libc.inotify_add_watch.restype = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int
+    changed = libc.inotify_init1(os.O_CLOEXEC | os.O_NONBLOCK)
+    # IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE: install before
+    # reading, so creation/append/replacement cannot race the observation.
+    if changed < 0 or libc.inotify_add_watch(changed, os.fsencode(path.parent), 0x18a) < 0:
+        raise OSError(ctypes.get_errno(), 'cannot watch session observations')
+    while True:
+        if select.select([process], [], [], 0)[0]:
+            raise RuntimeError('client exited before readiness')
+        rows = path.read_bytes().split(b'\n')[:-1] if path.exists() else []
+        ready = any(isinstance(row, dict) and row.get('event') == 'connected'
+                    and row.get('pid') == pid and row.get('reason') == 'start'
+                    and isinstance(row.get('session_id'), str) and row['session_id']
+                    for row in (json.loads(line) for line in rows))
+        if ready:
+            if time.monotonic() >= deadline:
+                raise RuntimeError('no connected/roots observation within 30s')
+            if select.select([process], [], [], 0)[0]:
+                raise RuntimeError('client exited before readiness')
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError('no connected/roots observation within 30s')
+        readable = select.select([process, changed], [], [], remaining)[0]
+        if process in readable:
+            raise RuntimeError('client exited before readiness')
+        if changed in readable:
+            os.read(changed, 65536)
+except (OSError, ValueError, RuntimeError) as error:
+    print(str(error), file=sys.stderr)
+    sys.exit(1)
+PY
+}
+start_pending_post() {
+    local key="$1" request facts
+    # Startup notices can already have their own intents in the destination
+    # channel. Bind this tool call to a newly observed operation only.
+    capture_posts "${key}" "${EVIDENCE}/${key}.prior-posts.jsonl"
+    start_fixture_client "${key}"
     slack_stub_post_lost "${key}" "${HOLD_CHANNEL}" false times=100000
     slack_stub_history_fault "${key}" history hang "channel=${HOLD_CHANNEL}" times=100000
     request="$(stub_session_submit "${WORK[${key}]}" reply \
@@ -361,6 +416,9 @@ case "${CASE}" in
         mkdir -p "${RESULTS}"
         key="${KEYS[0]}"
         start_pending_post "${key}"
+        # Every silent persona needs its own MCP, but only the first posts.
+        for persona in "${KEYS[@]}"; do start_fixture_client "${persona}"; done
+        for persona in "${KEYS[@]}"; do wait_fixture_client "${persona}"; done
         # Keep the long-window probes' root newer than the pending post too.
         # shellcheck disable=SC2119 # scenario_ts explicitly rejects every argument.
         HOLD_ROOT="$(scenario_ts)"

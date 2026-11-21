@@ -676,9 +676,10 @@ unreadable live candidates and observed placement/identity contradictions make
 it `missing`; an optional helper's proven exit is skipped only without a
 contradiction, with zombies requiring the same recorded start identity.
 
-Test 44 records required fixture MCP client identities in `harness-clients`,
-clears the list on stop and counts these clients only as harness members,
-never persona evidence. Burst starts go through the fixed server-start broker
+Test 44 records required fixture MCP client identities in `harness-clients`
+and clears the list on stop; they remain harness members, and qualifying
+clients may supply a silent persona's otherwise absent MCP evidence under
+the rules linked below. Burst starts go through the fixed server-start broker
 after the harness establishes its own persistent scenario tmux server;
 ordinary shards and host starts keep their original path. See
 [Burst-driver shards](../docker/README.md#burst-driver-shards)

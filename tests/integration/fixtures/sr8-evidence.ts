@@ -2408,11 +2408,12 @@ export function guardedCgroups(server: string | undefined, drivers: (string | un
 /** Content-free placement evidence. The tmux PID/start identity is captured
  * before CSCB starts; inspect its live descendants, never any TUI or environ.
  * Every configured persona needs both its stub and its MCP client. Explicit
- * script-owned fixture clients are required harness members, never persona proof. */
+ * script-owned fixture clients remain required harness members. Only exact
+ * fixture argv can supply a silent persona's otherwise absent tree MCP. */
 export function harnessCpuEvidence(root: string | undefined, state: string | undefined, record: string, expected: number,
   read: CgroupRead, proc = HARNESS_PROC_ROOT, serverPid?: number): Result {
   const stats: Result['stats'] = { harness_cgroup: '/shard/harness', harness_cpus: 'unknown', runner_cgroup: 'unknown', script_cgroup: 'unknown',
-    tmux_cgroup: 'unknown', persona_stubs: 0, persona_mcps: 0, harness_members: 0, slack_cgroup: 'unknown', server_members: 0 }
+    tmux_cgroup: 'unknown', persona_stubs: 0, persona_mcps: 0, harness_members: 0, slack_cgroup: 'unknown', server_members: 0, persona_fixture_mcps: 0 }
   const answer = (good: boolean) => result('harness-cpu', Number(stats.harness_members), stats, SR8_SERVER_CPUS, good ? 'pass' : 'missing')
   try {
     const cpus = cgroupChain('/shard/harness').map(path => cpuMaxCpus(read(path, 'cpu.max')))
@@ -2506,7 +2507,7 @@ export function harnessCpuEvidence(root: string | undefined, state: string | und
     // Walk fresh ancestry all the way to PID 1/0, so a caller below the
     // measured server cannot authorize its descendants. No snapshot tree
     // grants authority after reparenting, exec or a cgroup move.
-    const validClient = (member: number, current: ReturnType<typeof info>) => {
+    const validClient = (member: number, current: ReturnType<typeof info>, outsideTmux = false) => {
       const start = clients.get(member)
       if (start === undefined || !current || current.zombie || current.start !== start
         || group(member) !== '/shard/harness'
@@ -2514,7 +2515,7 @@ export function harnessCpuEvidence(root: string | undefined, state: string | und
       const seen = new Set<number>()
       let ancestor = member, node: ReturnType<typeof info> = current, caller = false
       while (!seen.has(ancestor)) {
-        if (ancestor === server.pid || !node || node.zombie) return false
+        if (ancestor === server.pid || (outsideTmux && ancestor === pid) || !node || node.zombie) return false
         const before = processes.get(ancestor)
         if (before && node.start !== before.start) return false
         if (callerPids.has(ancestor)) {
@@ -2526,6 +2527,17 @@ export function harnessCpuEvidence(root: string | undefined, state: string | und
       }
       return false
     }
+    // SCENARIO_HOME and SCENARIO_BIN are fixed children of SCENARIO_ROOT.
+    // Compare all argv after the interpreter, preserving config's directory
+    // spelling exactly, independently of the script-launched client's cwd.
+    const fixtureDirectory = (member: number): string | undefined => {
+      const raw = textFile(join(proc, String(member), 'cmdline'))
+      if (!raw?.endsWith('\0')) return undefined
+      const argv = raw.slice(0, -1).split('\0').slice(1)
+      return argv.length === 3 && argv[0] === join(root, 'bin/stub-mcp-session.ts')
+        && argv[1] === join(root, 'home/.claude/slack-mcp.json') && dirs.includes(argv[2]) ? argv[2] : undefined
+    }
+    const fixtureCandidates = new Map<number, string>()
     const stubs = new Set<string>(), mcps = new Set<string>()
     const candidates = new Map<number, { cwd: string; entry: string; start: string }>()
     for (const member of descendants) {
@@ -2558,7 +2570,8 @@ export function harnessCpuEvidence(root: string | undefined, state: string | und
       if (after && after.start !== before.start) return answer(false)
       if (vanished(member, after, before.start)) continue
       if (cwd === undefined || !raw || !g || !after || after.zombie) return answer(false)
-      if (fixtureClient && !validClient(member, after)) return answer(false)
+      const directory = fixtureClient ? fixtureDirectory(member) : undefined
+      if (fixtureClient && !validClient(member, after, directory !== undefined)) return answer(false)
       if (descendants.has(member) || fixtureClient) {
         if (g !== '/shard/harness') return answer(false)
         stats.harness_members = Number(stats.harness_members) + 1
@@ -2567,7 +2580,10 @@ export function harnessCpuEvidence(root: string | undefined, state: string | und
         if (g !== '/shard/server') return answer(false)
         stats.server_members = Number(stats.server_members) + 1
       }
-      if (fixtureClient) continue
+      if (fixtureClient) {
+        if (directory !== undefined) fixtureCandidates.set(member, directory)
+        continue
+      }
       if (!['claude', 'stub-mcp-session.ts'].includes(entry)) continue
       if (!dirs.includes(cwd)) return answer(false)
       if (!descendants.has(member) || g !== '/shard/harness') return answer(false)
@@ -2584,12 +2600,24 @@ export function harnessCpuEvidence(root: string | undefined, state: string | und
       ;(candidate.entry === 'claude' ? stubs : mcps).add(candidate.cwd)
     }
     stats.persona_stubs = stubs.size; stats.persona_mcps = mcps.size
-    // Recheck after scanning: a lost/reused server cannot pass on stale metadata.
-    return answer(stubs.size === expected && mcps.size === expected
-      && [...required].every(([member, start]) => {
-        const current = info(member)
-        return current?.start === start && !current.zombie && (!clients.has(member) || validClient(member, current))
-      }))
+    // Recheck every required identity and listed-client invariant before
+    // combining the disjoint tree/fixture evidence for each configured dir.
+    const fixtureMcps = new Set<string>()
+    const valid = [...required].every(([member, start]) => {
+      const current = info(member)
+      if (current?.start !== start || current.zombie) return false
+      if (!clients.has(member)) return true
+      const directory = fixtureDirectory(member)
+      if (directory !== fixtureCandidates.get(member)) return false
+      if (!validClient(member, current, directory !== undefined)) return false
+      if (directory !== undefined) {
+        if (!stubs.has(directory) || mcps.has(directory) || fixtureMcps.has(directory)) return false
+        fixtureMcps.add(directory)
+      }
+      return true
+    })
+    stats.persona_fixture_mcps = fixtureMcps.size
+    return answer(valid && stubs.size === expected && dirs.every(directory => mcps.has(directory) !== fixtureMcps.has(directory)))
   } catch { return answer(false) }
 }
 

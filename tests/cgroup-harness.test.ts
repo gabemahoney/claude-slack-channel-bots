@@ -184,12 +184,156 @@ function placement(personas = 2) {
   put(50, 1, '/shard/server', 'cli.ts'); put(51, 50, '/shard/server', 'helper')
   dirs.forEach((cwd, i) => { put(30 + i, 20, '/shard/harness', 'claude', cwd); put(40 + i, 30 + i, '/shard/harness', 'stub-mcp-session.ts', cwd) })
   const limits: Record<string, string> = { '/': '500000 100000', '/shard': 'max 100000', '/shard/harness': '100000 100000' }
-  return { proc, state, limits, put, run: () => collect(root, state, join(root, 'record'), personas, (path: string) => limits[path], proc, 50) }
+  return { proc, state, limits, put, personas, run: () => collect(root, state, join(root, 'record'), personas, (path: string) => limits[path], proc, 50) }
 }
 function fixtureClient(p: ReturnType<typeof placement>, parent = 11, cwd = root) {
   p.put(70, parent, '/shard/harness', 'stub-mcp-session.ts', cwd)
   writeFileSync(join(root, 'harness-clients'), '70\t99\n')
 }
+function personaFixtureClient(p: ReturnType<typeof placement>, directory = join(root, 'alpha'), pid = 70) {
+  p.put(pid, 11, '/shard/harness', 'stub-mcp-session.ts')
+  writeFileSync(join(p.proc, String(pid), 'cmdline'), ['/bin/tool', join(root, 'bin/stub-mcp-session.ts'),
+    join(root, 'home/.claude/slack-mcp.json'), directory, ''].join('\0'))
+  const file = join(root, 'harness-clients')
+  writeFileSync(file, (existsSync(file) ? readFileSync(file, 'utf8') : '') + `${pid}\t99\n`)
+}
+test('round24 fixture MCP: one silent persona reproduces the test-44 placement and passes', () => {
+  const p = placement(1)
+  rmSync(join(p.proc, '40'), { recursive: true }); rmSync(join(p.proc, '51'), { recursive: true })
+  p.put(60, 20, '/shard/harness', 'helper'); personaFixtureClient(p)
+  expect(p.run()).toMatchObject({ verdict: 'pass', stats: { persona_stubs: 1, persona_mcps: 0, persona_fixture_mcps: 1,
+    harness_members: 4, server_members: 1, runner_cgroup: '/shard/harness', script_cgroup: '/shard/harness',
+    tmux_cgroup: '/shard/harness', slack_cgroup: '/shard/harness' } })
+  const child = placementCLI(p)()
+  expect(child.error).toBeUndefined(); expect(child.status).toBe(0)
+  expect(child.stdout).toContain('persona_stubs=1 persona_mcps=0 harness_members=4')
+  expect(child.stdout).toContain('persona_fixture_mcps=1')
+})
+test('round24 fixture MCP: mixed tree and fixture MCPs each cover their own persona', () => {
+  const p = placement(); rmSync(join(p.proc, '40'), { recursive: true }); personaFixtureClient(p)
+  expect(p.run()).toMatchObject({ verdict: 'pass', stats: { persona_stubs: 2, persona_mcps: 1, persona_fixture_mcps: 1 } })
+})
+test('round24 fixture MCP: two silent personas each have one distinct listed client', () => {
+  const p = placement(); for (const pid of [40, 41]) rmSync(join(p.proc, String(pid)), { recursive: true })
+  personaFixtureClient(p); personaFixtureClient(p, join(root, 'beta'), 71)
+  expect(p.run()).toMatchObject({ verdict: 'pass', stats: { persona_stubs: 2, persona_mcps: 0, persona_fixture_mcps: 2 } })
+})
+test('round24 fixture MCP: a listed client already inside tmux is not fixture evidence', () => {
+  const p = placement(1); rmSync(join(p.proc, '40'), { recursive: true }); personaFixtureClient(p)
+  writeFileSync(join(p.proc, '20/stat'), readFileSync(join(p.proc, '20/stat'), 'utf8').replace(') S 1 ', ') S 11 '))
+  writeFileSync(join(p.proc, '70/stat'), readFileSync(join(p.proc, '70/stat'), 'utf8').replace(') S 11 ', ') S 30 '))
+  expect(p.run().verdict).toBe('missing')
+})
+test('round24 fixture MCP: pending branch starts one client per silent persona and posts only on the first', () => {
+  const script = readFileSync(join(import.meta.dir, 'integration/test-44-fmk-thread-burst.sh'), 'utf8')
+  const pending = script.match(/^    pending\)[\s\S]*?(?=        # Keep the long-window probes)/m)?.[0]
+  expect(pending).toBeDefined()
+  const child = shell([
+    'EVIDENCE="$HOME"; SCENARIO_BIN="$HOME/bin"; KEYS=(alpha beta); declare -A CLIENT WORK=([alpha]="$HOME/alpha" [beta]="$HOME/beta")',
+    'bun() { printf "%s\\n" "$@" > "$3.argv"; }',
+    'track_pid() { echo track >> "$HOME/calls"; }',
+    '_scenario_placement_identity() { [[ "$1" == clients ]]; echo identity >> "$HOME/calls"; }',
+    declaration(script, 'start_fixture_client'),
+    'wait_fixture_client() { :; }',
+    'start_pending_post() { start_fixture_client "$1"; echo "post=$1" >> "$HOME/calls"; }',
+    `case pending in\n${pending}\n;; esac`,
+    '[[ ${#CLIENT[@]} == 2 ]]; for client in "${CLIENT[@]}"; do wait "$client"; done',
+    'cat "$HOME/calls"',
+  ].join('\n'))
+  expect(child.error).toBeUndefined(); expect(child.status).toBe(0)
+  expect(child.stdout).toBe('track\nidentity\npost=alpha\ntrack\nidentity\n')
+  for (const key of ['alpha', 'beta']) expect(readFileSync(join(root, `${key}.argv`), 'utf8')).toBe(
+    `${join(root, 'bin/stub-mcp-session.ts')}\n${join(root, '.claude/slack-mcp.json')}\n${join(root, key)}\n`)
+})
+
+function fixtureReadinessSetup(script: string, expire = false) {
+  return [
+    'EVIDENCE="$HOME"; SCENARIO_BIN="$HOME/bin"; KEYS=(alpha beta); declare -A CLIENT WORK=([alpha]="$HOME/alpha" [beta]="$HOME/beta")',
+    'mkfifo "$HOME/observed" "$HOME/client-gate"; exec 9<> "$HOME/observed"; exec 8<> "$HOME/client-gate"',
+    'mkdir "$HOME/sessions"; : > "$HOME/sessions/beta.jsonl"',
+    'trap \'for key in alpha beta; do if [[ -f "$HOME/$key.pid" ]]; then kill "$(cat "$HOME/$key.pid")" 2>/dev/null || :; fi; done\' EXIT',
+    'bun() { read -r unused <&8; }',
+    'track_pid() { :; }',
+    '_scenario_placement_identity() { echo "$2" > "$HOME/${key}.pid"; }',
+    '_scenario_session_file() { echo "$HOME/sessions/${1##*/}.jsonl"; }',
+    'fail() { echo "$*" >&2; exit 1; }',
+    // Observe the real blocking select, with no delay or production test hook.
+    `python3() { command python3 -c '
+import os, select, sys, time
+${expire ? 'time.monotonic = iter([0, 0, 31]).__next__' : ''}
+original_select = select.select
+def observed(*args):
+    if len(args) == 4 and args[3] != 0:
+        os.write(9, b"waiting\\n")
+${expire ? '        return ([], [], [])' : ''}
+    return original_select(*args)
+select.select = observed
+sys.argv = sys.argv[1:]
+exec(compile(sys.stdin.read(), "fixture readiness", "exec"))
+' "$@"; }`,
+    declaration(script, 'start_fixture_client'),
+    script.match(/^wait_fixture_client\(\) \{[\s\S]*?^\}/m)?.[0] ?? '',
+  ]
+}
+test('round25 readiness: held beta cannot reach measurement until its own connected record', () => {
+  const script = readFileSync(join(import.meta.dir, 'integration/test-44-fmk-thread-burst.sh'), 'utf8')
+  const pending = script.match(/^    pending\)[\s\S]*?(?=        # Keep the long-window probes)/m)?.[0]
+  expect(pending).toBeDefined()
+  const child = shell([...fixtureReadinessSetup(script),
+    'start_pending_post() { start_fixture_client "$1"; printf \'{"event":"connected","pid":%s,"session_id":"alpha-session","reason":"start"}\\n\' "${CLIENT[$1]}" > "$HOME/sessions/$1.jsonl"; echo "post=$1"; }',
+    `( case pending in\n${pending}\n;; esac; echo measured > "$HOME/measured"; echo measurement >&9 ) & setup=$!`,
+    'read -r -t 5 event <&9; if [[ "$event" != waiting ]]; then echo advanced-before-ready; wait "$setup"; exit 0; fi',
+    '[[ ! -e "$HOME/measured" ]]; echo held',
+    'pid="$(cat "$HOME/beta.pid")"; printf \'{"event":"connected","pid":%s,"session_id":"wrong-client","reason":"start"}\\n\' "$((pid + 1))" >> "$HOME/sessions/beta.jsonl"',
+    'read -r -t 5 event <&9; [[ "$event" == waiting && ! -e "$HOME/measured" ]]; echo wrong-pid-held',
+    'printf \'{"event":"connected","pid":%s,"session_id":"beta-session","reason":"start"}\\n\' "$pid" >> "$HOME/sessions/beta.jsonl"',
+    'while read -r -t 5 event <&9; do [[ "$event" != measurement ]] || break; done; [[ "$event" == measurement ]]; wait "$setup"; cat "$HOME/measured"',
+  ].join('\n'))
+  expect(child.error).toBeUndefined(); expect(child.status).toBe(0)
+  expect(child.stderr).toBe('')
+  expect(child.stdout).toBe('post=alpha\nheld\nwrong-pid-held\nmeasured\n')
+})
+test.each(['before wait', 'during wait'] as const)('round25 readiness: client exit %s fails before measurement', when => {
+  const script = readFileSync(join(import.meta.dir, 'integration/test-44-fmk-thread-burst.sh'), 'utf8')
+  const child = shell([...fixtureReadinessSetup(script),
+    'start_fixture_client beta; pid="${CLIENT[beta]}"',
+    ...(when === 'before wait' ? ['kill "$pid"; wait "$pid" 2>/dev/null || :'] : []),
+    '( wait_fixture_client beta; echo measured > "$HOME/measured" ) & setup=$!',
+    ...(when === 'during wait' ? ['read -r -t 5 event <&9; [[ "$event" == waiting ]]; kill "$pid"; wait "$pid" 2>/dev/null || :'] : []),
+    'rc=0; wait "$setup" || rc=$?; echo "exit=$rc"; [[ ! -e "$HOME/measured" ]]',
+  ].join('\n'))
+  expect(child.error).toBeUndefined(); expect(child.status).toBe(0)
+  expect(child.stdout).toBe('exit=1\n')
+  expect(child.stderr).toContain('fixture MCP beta')
+  expect(child.stderr).toContain('exited before readiness')
+})
+test('round25 readiness: a live client without connection evidence fails at the deadline', () => {
+  const script = readFileSync(join(import.meta.dir, 'integration/test-44-fmk-thread-burst.sh'), 'utf8')
+  const child = shell([...fixtureReadinessSetup(script, true),
+    'start_fixture_client beta; wait_fixture_client beta; echo measured',
+  ].join('\n'))
+  expect(child.error).toBeUndefined(); expect(child.status).toBe(1)
+  expect(child.stdout).toBe('')
+  expect(child.stderr).toContain('no connected/roots observation within 30s')
+  expect(child.stderr).toContain('fixture MCP beta: readiness barrier failed')
+})
+test.each(['another persona', 'unconfigured directory', 'duplicate', 'missing stub', 'unlisted', 'tree MCP', 'wrong config', 'extra argument', 'wrong script', 'missing argv terminator'] as const)
+('round24 fixture MCP: %s cannot supply a silent persona MCP', fault => {
+  const p = placement(); rmSync(join(p.proc, '40'), { recursive: true })
+  const directory = fault === 'another persona' ? join(root, 'beta') : fault === 'unconfigured directory' ? join(root, 'elsewhere') : join(root, 'alpha')
+  if (fault === 'another persona') rmSync(join(p.proc, '41'), { recursive: true })
+  personaFixtureClient(p, directory)
+  if (fault === 'duplicate') personaFixtureClient(p, directory, 71)
+  if (fault === 'missing stub') rmSync(join(p.proc, '30'), { recursive: true })
+  if (fault === 'unlisted') rmSync(join(root, 'harness-clients'))
+  if (fault === 'tree MCP') p.put(40, 30, '/shard/harness', 'stub-mcp-session.ts', directory)
+  const file = join(p.proc, '70/cmdline'), argv = readFileSync(file, 'utf8')
+  if (fault === 'wrong config') writeFileSync(file, argv.replace('/home/.claude/slack-mcp.json', '/home/wrong.json'))
+  if (fault === 'extra argument') writeFileSync(file, argv + 'extra\0')
+  if (fault === 'wrong script') writeFileSync(file, argv.replace('/bin/stub-mcp-session.ts', '/elsewhere/stub-mcp-session.ts'))
+  if (fault === 'missing argv terminator') writeFileSync(file, argv.slice(0, -1))
+  expect(p.run().verdict).toBe('missing')
+})
 test.each([1, 2])('round21 client: listed script client passes beside %s persona pairs without counting as a persona', personas => {
   const p = placement(personas); fixtureClient(p)
   expect(p.run()).toMatchObject({ verdict: 'pass', stats: { persona_stubs: personas, persona_mcps: personas, harness_members: personas * 2 + 2 } })
@@ -243,7 +387,8 @@ test('round21 client: an empty list after stop preserves the original placement 
   const p = placement(); writeFileSync(join(root, 'harness-clients'), '')
   expect(p.run()).toMatchObject({ verdict: 'pass', stats: { persona_stubs: 2, persona_mcps: 2, harness_members: 5 } })
 })
-test('round21 client: a listed client in the persona cwd cannot replace its missing tmux MCP', () => {
+// This client's argv lacks the config/directory pair required by decision 14.
+test('round21 client: a non-qualifying listed client in the persona cwd cannot replace its missing tmux MCP', () => {
   const p = placement(); fixtureClient(p, 11, join(root, 'alpha')); rmSync(join(p.proc, '40'), { recursive: true })
   expect(p.run()).toMatchObject({ verdict: 'missing', stats: { persona_stubs: 2, persona_mcps: 1 } })
 })
@@ -279,7 +424,7 @@ function placementCLI(p: ReturnType<typeof placement>, instrument?: (source: str
     .replace("const HARNESS_PROC_ROOT = '/proc'", `const HARNESS_PROC_ROOT = ${JSON.stringify(p.proc)}`)
     .replace('textFile(`/proc/${pid}/cgroup`)', `textFile(join(${JSON.stringify(p.proc)}, String(pid), 'cgroup'))`)
   writeFileSync(file, instrument ? instrument(source) : source)
-  return () => spawnSync(process.execPath, [file, 'driver-cpu', 'test-placement', 'strict', '0', '2', '50', join(root, 'record')], {
+  return () => spawnSync(process.execPath, [file, 'driver-cpu', 'test-placement', 'strict', '0', String(p.personas), '50', join(root, 'record')], {
     env: hostSafeChildEnv(root, { tools: [], extras: { SCENARIO_ROOT: root, SLACK_STATE_DIR: p.state } }), encoding: 'utf8', timeout: 5000,
   })
 }
@@ -332,6 +477,8 @@ test('tmux, measured server and Slack stub reused identities are missing', () =>
 type ScanBoundary = 'group' | 'cwd' | 'cmdline' | 'identity' | 'tmux-loop' | 'candidate-identity' | 'required-identity'
 type ScanMutation = 'vanished' | 'unreadable' | 'reused' | 'zombie' | 'reused-zombie' | 'reused-exit' | 'wrong-group-exit'
   | 'group-move' | 'reparented' | 'exec-changed' | 'server-parent' | 'caller-move'
+  | 'fixture-config-change' | 'fixture-dir-change' | 'fixture-extra-arg'
+  | 'tmux-parent'
 // Only copied CLI file reads are instrumented. No sleeps, global fs mocks or
 // collector API changes: the same read boundaries exist in the before fixture.
 function scanMutation(p: ReturnType<typeof placement>, pid: number, boundary: ScanBoundary,
@@ -362,6 +509,13 @@ function scanRead(path, link=false) {
   else if(mutation==='unreadable') removeProcess(path);
   else if(mutation==='group-move') traceProcess(dir+'/cgroup','0::/shard/server\\n');
   else if(mutation==='exec-changed') traceProcess(dir+'/cmdline','/bin/tool\\0/helper\\0');
+  else if(mutation==='tmux-parent') traceProcess(dir+'/stat',originalReadFileSync(dir+'/stat','utf8').replace(/\\) S \\d+ /,') S 30 '));
+  else if(mutation.startsWith('fixture-')) {
+    const old=originalReadFileSync(dir+'/cmdline','utf8');
+    const next=mutation==='fixture-config-change' ? old.replace('/home/.claude/slack-mcp.json','/home/wrong.json')
+      : mutation==='fixture-dir-change' ? old.replace(${JSON.stringify(join(root, 'alpha'))},${JSON.stringify(join(root, 'beta'))}) : old+'extra\\0';
+    traceProcess(dir+'/cmdline',next);
+  }
   else if(mutation==='caller-move') traceProcess(${JSON.stringify(join(p.proc, '11/cgroup'))},'0::/shard/server\\n');
   else if(mutation==='reparented' || mutation==='server-parent') {
     const old=originalReadFileSync(dir+'/stat','utf8');
@@ -404,6 +558,26 @@ test.each((['identity', 'required-identity'] as const).flatMap(boundary =>
   const p = placement(); p.put(69, 11, '/shard/harness', 'helper'); fixtureClient(p, 69)
   expect(p.run().verdict).toBe('pass')
   const child = placementCLI(p, scanMutation(p, 70, boundary, mutation))()
+  expect(readFileSync(join(root, 'scan-fired'), 'utf8')).toBe('yes')
+  expect(readFileSync(join(p.proc, '70/stat'), 'utf8')).toEndWith(' 99\n')
+  expect(child.error).toBeUndefined(); expect(child.status).toBe(1)
+  expect(child.stdout).toContain('limit=2 verdict=missing')
+})
+test.each((['identity', 'required-identity'] as const).flatMap(boundary =>
+  (['fixture-config-change', 'fixture-dir-change', 'fixture-extra-arg'] as const).map(mutation => [mutation, boundary] as const)))
+('round24 fixture MCP: %s at %s stays missing', (mutation, boundary) => {
+  const p = placement(); rmSync(join(p.proc, '40'), { recursive: true }); personaFixtureClient(p)
+  expect(p.run().verdict).toBe('pass')
+  const child = placementCLI(p, scanMutation(p, 70, boundary, mutation))()
+  expect(readFileSync(join(root, 'scan-fired'), 'utf8')).toBe('yes')
+  expect(child.error).toBeUndefined(); expect(child.status).toBe(1)
+  expect(child.stdout).toContain('limit=2 verdict=missing')
+})
+test.each(['identity', 'required-identity'] as const)('round24 fixture MCP: reparent into tmux at %s stays missing', boundary => {
+  const p = placement(); rmSync(join(p.proc, '40'), { recursive: true }); personaFixtureClient(p)
+  writeFileSync(join(p.proc, '20/stat'), readFileSync(join(p.proc, '20/stat'), 'utf8').replace(') S 1 ', ') S 11 '))
+  expect(p.run().verdict).toBe('pass')
+  const child = placementCLI(p, scanMutation(p, 70, boundary, 'tmux-parent'))()
   expect(readFileSync(join(root, 'scan-fired'), 'utf8')).toBe('yes')
   expect(readFileSync(join(p.proc, '70/stat'), 'utf8')).toEndWith(' 99\n')
   expect(child.error).toBeUndefined(); expect(child.status).toBe(1)
