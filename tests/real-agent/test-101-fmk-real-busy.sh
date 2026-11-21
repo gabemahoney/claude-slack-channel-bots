@@ -85,16 +85,17 @@ case_assert subagent-proven-gone "${SCENARIO_ROOT}/deny-click.json" "${SCENARIO_
 real_dm "${REAL_LABEL}" 'message after denied subagent request'
 real_wait_delivery "${REAL_KEY}" 6
 case_assert no-stuck
-# The kill must find accepted, undelivered work: hold message eight behind an
-# open main-agent prompt (as message four was held), so recovery must deliver it.
-real_dm "${REAL_LABEL}" 'Use Bash to run printf permission-probe again. Wait for approval.'
-real_wait_delivery "${REAL_KEY}" 7
-wait_until 180 'recovery permission prompt never opened' case_assert prompt-again "${SCENARIO_SLACK_RECORD}"
-MARK="$(date +%s%3N)"
+# The kill must find accepted, undelivered work. A pre-allowed sleep keeps the
+# agent inside one tool call, so message eight is accepted but cannot be taken
+# in before the kill, and no prompt is left for the resumed session to re-ask.
+real_dm "${REAL_LABEL}" 'Run exactly sleep 60 with Bash now.'
+wait_until 180 'recovery sleep never observed active' case_assert active-tool 'sleep 60' "${SCENARIO_ROOT}/recovery-tool.json"
 real_dm "${REAL_LABEL}" 'message held across busy recovery'
 wait_until 180 'recovery-held message not accepted' case_assert accepted 8
+# Fresh evidence just before the kill: the sleep still has no result, so
+# message eight cannot have been taken in, and it is still open.
+case_assert active-tool 'sleep 60' "${SCENARIO_ROOT}/recovery-tool-at-kill.json"
 case_assert open 8
-case_assert no-send "${MARK}"
 echo 'recorded: busy kill/recovery started'
 real_kill_and_reconcile "${REAL_KEY}"
 start_server --live

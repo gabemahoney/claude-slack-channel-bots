@@ -193,8 +193,8 @@ real_wait_latency_admission() {
     # any failure records the row as unavailable and the timeout still fails.
     local row="${SCENARIO_ROOT}/ac76-timeout-row.json"
     require_scenario_home real_wait_latency_admission
-    timeout 10 "${SCENARIO_AD_ROOT}/bin/agent-director.real" get --instance-id "$(real_instance "$1")" > "${row}" 2>/dev/null \
-        || printf '{}\n' > "${row}"
+    ( set -o pipefail; timeout 10 "${SCENARIO_AD_ROOT}/bin/agent-director.real" get --instance-id "$(real_instance "$1")" 2>/dev/null \
+        | head -c 1048577 > "${row}" ) || printf '{}\n' > "${row}"
     [[ "$(wc -c < "${row}")" -le 1048576 ]] || printf '{}\n' > "${row}"
     bun "${REAL_RECEIPTS%/*}/ac76-admission.ts" row "${row}" || echo 'recorded: AC76 AD row unavailable'
     fail 'AC76 pre-sample admission timed out (see reason codes and counts)'

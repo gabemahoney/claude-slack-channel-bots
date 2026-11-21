@@ -135,19 +135,6 @@ export function assertDenialEligible(token: string, permission: any, nowMs: numb
   return { requested_at: permission.requested_at, denied_after_ms: nowMs }
 }
 
-/** Test 101's recovery hold: a later main-agent probe has opened its own
- * prompt. Three relayed prompts (main, subagent, this one) and a second
- * `permission-probe` tool_use. `records` are Slack stub records; `entries`
- * are each transcript entry's assistant content blocks. */
-export function assertPromptAgain(records: any[], entries: any[][]) {
-  const prompts = records.filter(r => r?.event === 'api' && r.method === 'chat.postMessage'
-    && typeof r.text === 'string' && r.text.startsWith('🤖🛠️ permission request:'))
-  check(prompts.length >= 3, 'permission relay has not posted the recovery request')
-  const probes = entries.filter(content => content.some((b: any) => b?.type === 'tool_use'
-    && typeof b.input?.command === 'string' && b.input.command.includes('printf permission-probe')))
-  check(probes.length >= 2, 'recovery permission tool not observed')
-}
-
 /** agent-director >= 0.18 (00418da2): a Claude subagent's denied request is
  * proven gone (`turn_end`) at its SubagentStop, so the live row holds no
  * dialog. `permission` is `get-permission` for the token, read before `row`. */
@@ -566,8 +553,6 @@ try {
     let click:unknown;try{click=JSON.parse(readFileSync(arg,'utf8'))}catch{click=undefined}
     let request:unknown;try{request=JSON.parse(readFileSync(arg2,'utf8'))}catch{throw new Error('subagent request read could not be read')}
     console.log('recorded: subagent denial eligible for turn-end proof '+JSON.stringify(assertDenialEligible(denyClickToken(click,'cscb_'+key),request,Date.now())))
-  } else if(command==='prompt-again') {
-    assertPromptAgain(jsonLines(arg),(await entries()).map(blocks))
   } else if(command==='subagent-proven-gone') {
     // arg: the Deny click; arg2: get-permission for its token; arg3: get for the row, read after.
     const read=(path:string)=>{try{return JSON.parse(readFileSync(path,'utf8'))}catch{throw new Error('subagent proof AD reads could not be read')}}

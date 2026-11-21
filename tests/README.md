@@ -1003,8 +1003,9 @@ bounded projection of the persona's AD row (state, its change time, family
 state, `tag_prompt`, and each permission and unproven request's tool, request
 time and decision), never tool input or other payloads. Each request list
 shows at most 20 entries with its total. The row read is bounded like the
-admission's own: 10 s on the real binary and 1 MB; a failed, timed-out or
-oversize read records the row as unavailable, and the timeout still fails.
+admission's own: 10 s on the real binary, and at most 1 MB plus one byte is
+captured, so an endless row stops; a failed, timed-out or oversize read
+records the row as unavailable, and the timeout still fails.
 The import-safe fixture uses installed-package queue/receipt adapters in its
 guarded CLI and bounds each AD read to 10 s.
 
@@ -1060,7 +1061,7 @@ observer; the shared `real-case-assertions.ts` comparator is unchanged.
 
 | Script | Checks |
 |---|---|
-| `test-101-fmk-real-busy.sh` | Active pre-allowed tool, permission hold, subagent denial proven gone at SubagentStop, and kill/recovery of a message held behind an open prompt |
+| `test-101-fmk-real-busy.sh` | Active pre-allowed tool, permission hold, subagent denial proven gone at SubagentStop, and kill/recovery of a message accepted during a running pre-allowed tool |
 | `test-102-fmk-real-replies.sh` | DM, mention and thread reply destinations; three fresh-launch first messages |
 | `test-103-fmk-real-latency100.sh` | The 100-DM latency step: reply-tool persona, one unmeasured warm-up DM, AC76 admission before each sample; p95 limits over the last 100 inputs, receipt/FIFO audit over all 101 |
 | `test-104-fmk-real-idle-compact.sh` | Uncertain AD text outcome with three ordered receipt-confirmed queued messages |
@@ -1404,11 +1405,14 @@ still-open subagent probe with its recorded second passed (polled for at most
 subagent probe, `proven_gone_how` `turn_end` with a time, no `unproven_since`,
 and a waiting row with an empty `unproven_requests`. Message six must then be
 delivered with no `delivery-stuck` line. The kill must still find queued work:
-message seven asks the main agent to run `printf permission-probe` again, and
-once that prompt is open (`prompt-again`: a third relayed prompt and a second
-main-agent probe) message eight is accepted, still open and untyped. The
+message seven asks for the pre-allowed `sleep 60`, and once `active-tool` sees
+it running, message eight is sent and accepted. Just before the kill,
+`active-tool` runs once more (the sleep still has no result, so message eight
+cannot have been taken in) and item eight must still be open. The
 kill/recovery leg then runs as before, and recovery must deliver message eight
-with no new DM. A Codex
+with no new DM. The hold is a running pre-allowed tool rather than an open
+prompt, because a resumed session re-asks an unanswered prompt and would never
+reach waiting. A Codex
 subagent's request still holds until the bot ends; Test 101 has no Codex
 variant, and the `dialog-hold` notice itself stays covered without a model by
 `tests/delivery-notices.test.ts`. The persona prompt and deny-step message reserve

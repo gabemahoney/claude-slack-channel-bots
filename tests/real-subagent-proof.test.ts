@@ -3,7 +3,7 @@ import { afterEach, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { assertDenialEligible, assertPromptAgain, assertSubagentProvenGone, denyClickToken } from './integration/fixtures/real-case-assertions.ts'
+import { assertDenialEligible, assertSubagentProvenGone, denyClickToken } from './integration/fixtures/real-case-assertions.ts'
 import { runFixture } from './test-helpers/test33-receipt-boundary.ts'
 
 const roots: string[] = []
@@ -94,19 +94,6 @@ test.each([
   expect(() => assertDenialEligible(TOKEN, request, REQUESTED_MS + 5000)).toThrow(reason)
 })
 
-const prompt = { event: 'api', method: 'chat.postMessage', text: '🤖🛠️ permission request: Bash' }
-const probe = (command: string) => [{ type: 'tool_use', name: 'Bash', input: { command } }]
-test('recovery hold needs a third relayed prompt and a second main-agent probe', () => {
-  const posts = [prompt, prompt, prompt], calls = [probe('printf permission-probe'), probe('printf subagent-deny-probe'), probe('printf permission-probe')]
-  expect(() => assertPromptAgain(posts, calls)).not.toThrow()
-  expect(() => assertPromptAgain([prompt, prompt], calls)).toThrow('has not posted the recovery request')
-  expect(() => assertPromptAgain([...posts.slice(0, 2), { ...prompt, method: 'chat.update' }], calls)).toThrow('has not posted the recovery request')
-  expect(() => assertPromptAgain(posts, calls.slice(0, 2))).toThrow('recovery permission tool not observed')
-  // The subagent's probe is not a main-agent probe.
-  expect(() => assertPromptAgain(posts, [probe('printf permission-probe'), probe('printf subagent-deny-probe'), probe('printf subagent-deny-probe')]))
-    .toThrow('recovery permission tool not observed')
-})
-
 function files(values: { click?: unknown; request?: unknown; row?: unknown }) {
   const root = mkdtempSync(join(tmpdir(), 'subagent-proof-')); roots.push(root)
   const path = (name: string, value: unknown) => {
@@ -170,28 +157,35 @@ test('test-101 sends its Deny only after the request\'s recorded second has pass
   expect(text.match(/DENY_TOKEN=/g)).toHaveLength(1)
 })
 
-test('test-101 kills with an accepted, undelivered item held behind an open prompt and requires that item after recovery', async () => {
+test('test-101 kills while message eight is accepted and still open inside a pre-allowed sleep, and requires it after recovery', async () => {
   const text = await Bun.file(join(import.meta.dir, 'real-agent/test-101-fmk-real-busy.sh')).text()
   const six = text.indexOf('real_wait_delivery "${REAL_KEY}" 6')
   const at = (needle: string) => { const i = text.indexOf(needle, six); expect(i).toBeGreaterThan(six); return i }
+  const sleep = "case_assert active-tool 'sleep 60' "
   const order = [
     at('case_assert no-stuck'),
-    at("real_dm \"${REAL_LABEL}\" 'Use Bash to run printf permission-probe again. Wait for approval.'"),
-    at('real_wait_delivery "${REAL_KEY}" 7'),
-    at('case_assert prompt-again "${SCENARIO_SLACK_RECORD}"'),
-    at('MARK="$(date +%s%3N)"'),
+    at("real_dm \"${REAL_LABEL}\" 'Run exactly sleep 60 with Bash now.'"),
+    at(`wait_until 180 'recovery sleep never observed active' ${sleep}"\${SCENARIO_ROOT}/recovery-tool.json"`),
     at("real_dm \"${REAL_LABEL}\" 'message held across busy recovery'"),
     at('case_assert accepted 8'),
+    // Fresh evidence just before the kill: the sleep has no result yet, and eight is open.
+    at(`${sleep}"\${SCENARIO_ROOT}/recovery-tool-at-kill.json"`),
     at('case_assert open 8'),
-    at('case_assert no-send "${MARK}"'),
     at('real_kill_and_reconcile "${REAL_KEY}"'),
     at('start_server --live'),
     at('real_wait_relaunch "${REAL_KEY}"'),
     at('real_wait_delivery "${REAL_KEY}" 8'),
   ]
   expect(order).toEqual([...order].sort((a, b) => a - b))
-  // Nothing new is sent after the kill: recovery must deliver the held item itself.
-  expect(text.slice(order.at(-4)!, order.at(-1)!)).not.toContain('real_dm')
+  // The pre-kill check runs once, bare (not retried in a wait), right before the kill.
+  expect(text[order[5]! - 1]).toBe('\n')
+  expect(text.slice(order[5]!, order[7]!).split('\n').filter(line => line && !line.startsWith('#')))
+    .toEqual([`${sleep}"\${SCENARIO_ROOT}/recovery-tool-at-kill.json"`, 'case_assert open 8', "echo 'recorded: busy kill/recovery started'"])
+  // Nothing new is sent after the eighth DM: recovery must deliver it itself.
+  expect(text.slice(order[3]! + 1, order.at(-1)!)).not.toContain('real_dm')
+  // The sleep is pre-allowed, so no prompt is left open for the resumed session.
+  expect(text).toContain("real_prepare \"${REAL_AGENT_CLAUDE_VERSION:-2.1.296}\" 'Bash(sleep *)'")
+  expect(text).not.toContain('permission-probe again')
 })
 
 test('test-101 reads the denied request, then the row, before its next DM, and the next DM is delivered without a stuck notice', async () => {

@@ -761,7 +761,8 @@ async function firstLatencyAdmission(home: string, reply: (request: string) => P
     'real_dm() { bridge dm >/dev/null; exit 0; }',
     'require_scenario_home() { :; }',
     // The timeout's diagnostic read must be the real AD binary under a 10 s bound.
-    'timeout() { local answer; [[ "$1" == 10 && "$2" == "$SCENARIO_AD_ROOT/bin/agent-director.real" ]] || { echo "unbounded diagnostic read" >&2; exit 9; }; shift 2; answer="$(bridge ad "$@")"; [[ "$answer" != FAIL ]] || return 124; printf "%s\\n" "$answer"; }',
+    // STREAM writes without end: only a capture bounded while reading lets it stop.
+    'timeout() { local answer; [[ "$1" == 10 && "$2" == "$SCENARIO_AD_ROOT/bin/agent-director.real" ]] || { echo "unbounded diagnostic read" >&2; exit 9; }; shift 2; answer="$(bridge ad "$@")"; [[ "$answer" != FAIL ]] || return 124; if [[ "$answer" == STREAM ]]; then printf "{\\"pad\\":\\""; while :; do printf "%04096d" 0; done; fi; printf "%s\\n" "$answer"; }',
   ], script.slice(start, end), ([request]) => reply(request!))
   expect({ code: result.code, signal: result.signal }).toEqual({ code: timeout ? 1 : 0, signal: null })
   expect(result.stderr).toBe(timeout ? 'AC76 pre-sample admission timed out (see reason codes and counts)\n' : '')
@@ -1214,7 +1215,7 @@ test.each(['working', 'AD rejection', 'missing journal', 'wrong original count',
   },
 )
 
-test.each(['readable row', 'row over 1 MB', 'failed read'] as const)(
+test.each(['readable row', 'row over 1 MB', 'endless row', 'failed read'] as const)(
   'unresolved candidate without observed working reaches the watchdog without a DM or cancellation: %s', async mode => {
   const h = await fixture(false)
   await h.send(slackInput())
@@ -1236,7 +1237,7 @@ test.each(['readable row', 'row over 1 MB', 'failed read'] as const)(
     }
     if (request === 'dm') { dms++; return 'ok' }
     // The timeout reads the AD row once, after the last attempt, and projects it.
-    if (request === 'ad') { expect(attempts).toBe(5); reads++; return mode === 'failed read' ? 'FAIL' : row }
+    if (request === 'ad') { expect(attempts).toBe(5); reads++; return mode === 'failed read' ? 'FAIL' : mode === 'endless row' ? 'STREAM' : row }
     if (request === 'row') { expect(reads).toBe(1); dumps++; return 'ok' }
     throw new Error(`Unexpected test boundary: ${request}`)
   }, true)
@@ -1244,7 +1245,7 @@ test.each(['readable row', 'row over 1 MB', 'failed read'] as const)(
   expect(attempts).toBe(5) // Initial, polling, and the actual shell's final deadline check.
   expect(dms).toBe(0)
   expect({ reads, dumps }).toEqual({ reads: 1, dumps: 1 })
-  // An oversized or failed read is recorded as unavailable; the timeout fails either way.
+  // An oversized, endless or failed read is recorded as unavailable; the timeout fails either way.
   expect(readFileSync(join(h.options.stateDir, 'ac76-timeout-row.json'), 'utf8'))
     .toBe(mode === 'readable row' ? `${row}\n` : '{}\n')
   expect(readFileSync(h.journal)).toEqual(bytes)
