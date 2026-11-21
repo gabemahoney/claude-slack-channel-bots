@@ -22,7 +22,7 @@ function declaration(text: string, name: string) {
 }
 function shell(program: string, timeout = 10000) {
   return spawnSync('bash', ['-c', `set -euo pipefail\nexport SCENARIO_ROOT="$HOME"\n${program}`], {
-    env: hostSafeChildEnv(root, { tools: ['bash', 'bun', 'tmux', 'sleep', 'python3', 'find', 'realpath', 'flock', 'mkfifo', 'timeout', 'cat', 'chmod', 'id'] }),
+    env: hostSafeChildEnv(root, { tools: ['bash', 'bun', 'tmux', 'sleep', 'python3', 'find', 'realpath', 'flock', 'mkfifo', 'timeout', 'cat', 'chmod', 'id', 'jq'] }),
     encoding: 'utf8', timeout,
   })
 }
@@ -190,12 +190,12 @@ function fixtureClient(p: ReturnType<typeof placement>, parent = 11, cwd = root)
   p.put(70, parent, '/shard/harness', 'stub-mcp-session.ts', cwd)
   writeFileSync(join(root, 'harness-clients'), '70\t99\n')
 }
-function personaFixtureClient(p: ReturnType<typeof placement>, directory = join(root, 'alpha'), pid = 70) {
+function personaFixtureClient(p: ReturnType<typeof placement>, directory = join(root, 'alpha'), pid = 70, record = true) {
   p.put(pid, 11, '/shard/harness', 'stub-mcp-session.ts')
   writeFileSync(join(p.proc, String(pid), 'cmdline'), ['/bin/tool', join(root, 'bin/stub-mcp-session.ts'),
     join(root, 'home/.claude/slack-mcp.json'), directory, ''].join('\0'))
   const file = join(root, 'harness-clients')
-  writeFileSync(file, (existsSync(file) ? readFileSync(file, 'utf8') : '') + `${pid}\t99\n`)
+  if (record) writeFileSync(file, (existsSync(file) ? readFileSync(file, 'utf8') : '') + `${pid}\t99\n`)
 }
 test('round24 fixture MCP: one silent persona reproduces the test-44 placement and passes', () => {
   const p = placement(1)
@@ -317,6 +317,80 @@ test('round25 readiness: a live client without connection evidence fails at the 
   expect(child.stderr).toContain('no connected/roots observation within 30s')
   expect(child.stderr).toContain('fixture MCP beta: readiness barrier failed')
 })
+// The native R26 probe found an empty, correctly recorded tmux tree and a
+// retained AD pending row after --stop-bots; the measured start deferred it.
+// Drive the script's real seal/stop/restart sequence and identity writer.
+function sealRestart(mode: 'valid' | 'no-worker' | 'pending' | 'query-error' | 'bad-rows' = 'valid', terminal = 'missing') {
+  const p = placement(1), script = readFileSync(join(import.meta.dir, 'integration/test-44-fmk-thread-burst.sh'), 'utf8')
+  rmSync(join(p.proc, '40'), { recursive: true }); rmSync(join(p.proc, '51'), { recursive: true })
+  p.put(60, 20, '/shard/harness', 'sleep')
+  const setup = script.match(/^# Decision 24:[\s\S]*?(?=\nstart_fixture_client\(\))/m)?.[0]
+  if (!setup) throw new Error('missing seal/restart sequence')
+  const child = shell([
+    `mode='${mode}'; terminal='${terminal}'; generation=98`,
+    'population=10000; KEYS=(alpha); declare -A CLIENT; CONTEXT=(); SCENARIO_PORT=1234',
+    'SLACK_STATE_DIR="$HOME/state"; SR8="$HOME/sr8.ts"; CONFIG="$HOME/state/config.json"; LOG="$HOME/server.log"; MEASUREMENTS="$HOME/measurements.jsonl"',
+    'mkdir "$HOME/broker"; mkfifo "$HOME/broker/requests"',
+    'fail() { echo "$*" >&2; exit 1; }',
+    'bun() { [[ "$2" == seed ]]; echo seed >> "$HOME/trace"; }',
+    'byte_mark() { echo "mark:${1##*/}" >> "$HOME/trace"; echo 0; }',
+    '_scenario_proc_starttime() { if [[ "$1" == 70 ]]; then echo 101; else echo "$generation"; fi; }',
+    declaration(scenario, '_scenario_placement_identity').replaceAll('/run/cscb-burst-driver-server', `${root}/broker`),
+    'start_ready() { generation=$((generation + 1)); local up=0 state; if [[ "$generation" == 99 ]]; then up=1; echo pending > "$HOME/row-state"; else state="$(<"$HOME/row-state")"; if [[ "$state" == ended || "$state" == missing ]] && [[ "$mode" != no-worker ]]; then up=1; fi; echo "$up" > "$HOME/measured-worker"; fi; _scenario_placement_identity server 50; printf "20\\t99\\t%s/tmux/default\\n" "$HOME" > "$HOME/harness-tmux"; echo "start:${1:-seal}:$up" >> "$HOME/trace"; }',
+    'stop_tracked_pid() { fail "seal start unexpectedly had a fixture client"; }',
+    declaration(script, 'stop_clients'), declaration(script, 'clean_stop'),
+    script.match(/^seal_rows_finished\(\) \{[\s\S]*?^\}/m)?.[0] ?? '',
+    'stop_server() { [[ "$1" == --stop-bots && -f "$HOME/harness-clients" && ! -s "$HOME/harness-clients" ]]; echo pending > "$HOME/row-state"; echo "stop:$1" >> "$HOME/trace"; }',
+    'port_closed() { echo port-closed >> "$HOME/trace"; }',
+    'sr8_verdicts() { echo "verdict:$1:$2" >> "$HOME/trace"; }',
+    'ad_capture() { [[ "$*" == "list --label service=cscb" ]]; AD_OUT="$HOME/ad-rows.json"; AD_RC=0; local state="$(<"$HOME/row-state")"; if [[ "$mode" == query-error ]]; then AD_RC=1; state=missing; fi; if [[ "$mode" == bad-rows ]]; then echo \'{"spawns":{}}\' > "$AD_OUT"; else printf \'{"spawns":[{"state":"%s"}]}\\n\' "$state" > "$AD_OUT"; fi; echo "ad:$state" >> "$HOME/trace"; }',
+    // Virtual liveness expiry after the first read: no real delay or AD binary.
+    'wait_until() { local bound="$1" step="$2" tick; shift 2; echo "barrier:$bound" >> "$HOME/trace"; for tick in 1 2 3; do if "$@"; then return 0; fi; if [[ "$mode" != pending ]]; then echo "$terminal" > "$HOME/row-state"; fi; done; fail "$step (not within ${bound}s)"; }',
+    setup, '_scenario_placement_identity clients 70', 'cat "$HOME/trace"',
+  ].join('\n'))
+  // Fold the observed restart into fake /proc. The seal worker is gone;
+  // only a successful measured launch can supply the new worker generation.
+  for (const pid of [30, 60]) rmSync(join(p.proc, String(pid)), { recursive: true })
+  const measured = join(root, 'measured-worker')
+  if (existsSync(measured) && readFileSync(measured, 'utf8').trim() === '1') {
+    p.put(30, 20, '/shard/harness', 'claude', join(root, 'alpha')); p.put(60, 20, '/shard/harness', 'sleep')
+    for (const pid of [30, 60]) {
+      const file = join(p.proc, String(pid), 'stat'); writeFileSync(file, readFileSync(file, 'utf8').replace(/ 99\n$/, ' 100\n'))
+    }
+  }
+  if (child.status === 0) {
+    const server = join(p.proc, '50/stat'); writeFileSync(server, readFileSync(server, 'utf8').replace(/ 99\n$/, ' 100\n'))
+    personaFixtureClient(p, join(root, 'alpha'), 70, false)
+    const client = join(p.proc, '70/stat'); writeFileSync(client, readFileSync(client, 'utf8').replace(/ 99\n$/, ' 101\n'))
+  }
+  return { p, child, measured }
+}
+test.each(['ended', 'missing'])('round26 restart: %s seal row finishes before the measured worker launches', terminal => {
+  const { p, child } = sealRestart('valid', terminal)
+  expect(child.error).toBeUndefined(); expect(child.status).toBe(0)
+  expect(p.run()).toMatchObject({ verdict: 'pass', stats: { persona_stubs: 1, persona_mcps: 0, persona_fixture_mcps: 1,
+    harness_members: 4, server_members: 1, tmux_cgroup: '/shard/harness' } })
+  expect(child.stdout.trim().split('\n')).toEqual(['seed', 'mark:server.log', 'start:seal:1', 'verdict:seal:first',
+    'stop:--stop-bots', 'port-closed', 'barrier:150', 'ad:pending', `ad:${terminal}`,
+    'mark:server.log', 'mark:measurements.jsonl', 'start:measured:1', 'verdict:seal:measured'])
+  expect(child.stderr).toBe('')
+  expect(readFileSync(join(root, 'harness-server'), 'utf8')).toBe('50\t100\n')
+  expect(readFileSync(join(root, 'harness-clients'), 'utf8')).toBe('70\t101\n')
+})
+test('round26 restart: a genuinely absent measured worker remains missing with a finished AD row', () => {
+  const { p, child } = sealRestart('no-worker')
+  expect(child.error).toBeUndefined(); expect(child.status).toBe(0)
+  expect(child.stdout).toContain('ad:missing\nmark:server.log\nmark:measurements.jsonl\nstart:measured:0')
+  expect(p.run()).toMatchObject({ verdict: 'missing', stats: { persona_stubs: 0, persona_mcps: 0,
+    persona_fixture_mcps: 0, harness_members: 2, server_members: 1 } })
+})
+test.each(['pending', 'query-error', 'bad-rows'] as const)('round26 restart: %s cannot cross the setup barrier', mode => {
+  const { child, measured } = sealRestart(mode)
+  expect(child.error).toBeUndefined(); expect(child.status).toBe(1)
+  expect(existsSync(measured)).toBe(false)
+  expect(child.stderr).toContain('seal-start rows did not finish in agent-director (not within 150s)')
+})
+
 test.each(['another persona', 'unconfigured directory', 'duplicate', 'missing stub', 'unlisted', 'tree MCP', 'wrong config', 'extra argument', 'wrong script', 'missing argv terminator'] as const)
 ('round24 fixture MCP: %s cannot supply a silent persona MCP', fault => {
   const p = placement(); rmSync(join(p.proc, '40'), { recursive: true })

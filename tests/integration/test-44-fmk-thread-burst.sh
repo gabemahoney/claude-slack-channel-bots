@@ -183,6 +183,12 @@ clean_stop() {
     stop_server --stop-bots
     port_closed "${SCENARIO_PORT}" || fail 'server still listening after stop'
 }
+seal_rows_finished() {
+    ad_capture list --label service=cscb
+    (( AD_RC == 0 )) || return 1
+    jq -e '.spawns | type == "array" and all(.[]; .state == "ended" or .state == "missing")' \
+        "${AD_OUT}" > /dev/null 2>&1
+}
 closing_assertions() {
     assert_no_server_tmux
     assert_no_cscb_include_finished
@@ -246,6 +252,11 @@ if [[ "${population}" != 0 ]]; then
     start_ready
     sr8_verdicts seal first "${CONTEXT[@]}" "${LOG}" "${first_mark}" "${CONFIG}"
     clean_stop
+    # Silent workers never report in. Killing them can leave AD's old row
+    # pending until its liveness protection expires; a restart correctly
+    # defers that row instead of launching a new worker. Observe it finished
+    # before either measurement mark or the measured server start.
+    wait_until 150 'seal-start rows did not finish in agent-director' seal_rows_finished
 fi
 measured_log_mark="$(byte_mark "${LOG}")"
 measurement_mark="$(byte_mark "${MEASUREMENTS}")"
