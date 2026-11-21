@@ -162,11 +162,11 @@ test('ordinary run_start keeps the original start path and never bootstraps tmux
 // Access through the namespace so the before context still typechecks when
 // it restores HEAD's fixture, which predates this exported evidence collector.
 const collect = (...args: unknown[]): evidence.Result => (evidence as unknown as Record<string, (...args: unknown[]) => evidence.Result>).harnessCpuEvidence(...args)
-function placement() {
+function placement(personas = 2) {
   const proc = join(root, 'proc'), state = join(root, 'state'), socket = join(root, 'tmux/default')
   mkdirSync(state); mkdirSync(join(root, 'tmux'))
   sockets.push(Bun.serve({ unix: socket, fetch: () => new Response('') }))
-  const dirs = ['alpha', 'beta'].map(name => join(root, name))
+  const dirs = ['alpha', 'beta'].slice(0, personas).map(name => join(root, name))
   writeFileSync(join(state, 'config.json'), JSON.stringify({ personas: dirs.map(working_directory => ({ working_directory })) }))
   writeFileSync(join(root, 'record.harness'), '10 11\n')
   writeFileSync(join(root, 'harness-tmux'), `20\t99\t${socket}\n`)
@@ -184,8 +184,69 @@ function placement() {
   put(50, 1, '/shard/server', 'cli.ts'); put(51, 50, '/shard/server', 'helper')
   dirs.forEach((cwd, i) => { put(30 + i, 20, '/shard/harness', 'claude', cwd); put(40 + i, 30 + i, '/shard/harness', 'stub-mcp-session.ts', cwd) })
   const limits: Record<string, string> = { '/': '500000 100000', '/shard': 'max 100000', '/shard/harness': '100000 100000' }
-  return { proc, state, limits, put, run: () => collect(root, state, join(root, 'record'), 2, (path: string) => limits[path], proc, 50) }
+  return { proc, state, limits, put, run: () => collect(root, state, join(root, 'record'), personas, (path: string) => limits[path], proc, 50) }
 }
+function fixtureClient(p: ReturnType<typeof placement>, parent = 11, cwd = root) {
+  p.put(70, parent, '/shard/harness', 'stub-mcp-session.ts', cwd)
+  writeFileSync(join(root, 'harness-clients'), '70\t99\n')
+}
+test.each([1, 2])('round21 client: listed script client passes beside %s persona pairs without counting as a persona', personas => {
+  const p = placement(personas); fixtureClient(p)
+  expect(p.run()).toMatchObject({ verdict: 'pass', stats: { persona_stubs: personas, persona_mcps: personas, harness_members: personas * 2 + 2 } })
+})
+test('round21 client: a listed indirect runner descendant in a persona cwd passes', () => {
+  const p = placement(); p.put(69, 10, '/shard/harness', 'helper'); fixtureClient(p, 69, join(root, 'alpha'))
+  expect(p.run()).toMatchObject({ verdict: 'pass', stats: { persona_stubs: 2, persona_mcps: 2, harness_members: 6 } })
+})
+test('round21 client: multiple recorded clients count only as harness members', () => {
+  const p = placement(); fixtureClient(p); p.put(71, 11, '/shard/harness', 'stub-mcp-session.ts', join(root, 'beta'))
+  writeFileSync(join(root, 'harness-clients'), '70\t99\n71\t99\n')
+  expect(p.run()).toMatchObject({ verdict: 'pass', stats: { persona_stubs: 2, persona_mcps: 2, harness_members: 7 } })
+})
+test('round21 client: shared identity writer appends clients and stop_clients clears them before restart', () => {
+  const script = readFileSync(join(import.meta.dir, 'integration/test-44-fmk-thread-burst.sh'), 'utf8')
+  const writer = declaration(scenario, '_scenario_placement_identity').replace('/run/cscb-burst-driver-server/requests', '"$HOME/requests"')
+  const child = shell([
+    'mkfifo "$HOME/requests"', 'fail() { echo "$*" >&2; exit 1; }',
+    '_scenario_proc_starttime() { printf "%s\\n" "$((100 + $1))"; }', writer,
+    '_scenario_placement_identity server 50; _scenario_placement_identity slack 12',
+    '_scenario_placement_identity clients 70; _scenario_placement_identity clients 71',
+    'cat "$HOME/harness-server" "$HOME/harness-slack" "$HOME/harness-clients"',
+    'declare -A CLIENT=([alpha]=70 [beta]=71); KEYS=(alpha beta)',
+    'stop_tracked_pid() { printf "stopped=%s\\n" "$1"; }', declaration(script, 'stop_clients'),
+    'stop_clients; [[ ! -s "$HOME/harness-clients" && ${#CLIENT[@]} == 0 ]]',
+    '_scenario_placement_identity clients 72; cat "$HOME/harness-clients"',
+  ].join('\n'))
+  expect(child.error).toBeUndefined(); expect(child.status).toBe(0)
+  expect(child.stdout).toBe('50\t150\n12\t112\n70\t170\n71\t171\nstopped=70\nstopped=71\n72\t172\n')
+})
+test.each(['unlisted', 'server group', 'server tree', 'unrelated parent', 'unreadable stat', 'exited', 'reused', 'zombie', 'wrong entry'] as const)
+('round21 client: %s fixture client is missing', fault => {
+  const p = placement(); fixtureClient(p)
+  if (fault === 'unlisted') rmSync(join(root, 'harness-clients'))
+  if (fault === 'server group') writeFileSync(join(p.proc, '70/cgroup'), '0::/shard/server\n')
+  if (fault === 'server tree') { rmSync(join(p.proc, '70'), { recursive: true }); fixtureClient(p, 50) }
+  if (fault === 'unrelated parent') { rmSync(join(p.proc, '70'), { recursive: true }); fixtureClient(p, 1) }
+  if (fault === 'unreadable stat') rmSync(join(p.proc, '70/stat'))
+  if (fault === 'exited') rmSync(join(p.proc, '70'), { recursive: true })
+  if (fault === 'reused') writeFileSync(join(root, 'harness-clients'), '70\t98\n')
+  if (fault === 'zombie') writeFileSync(join(p.proc, '70/stat'), readFileSync(join(p.proc, '70/stat'), 'utf8').replace(') S ', ') Z '))
+  if (fault === 'wrong entry') writeFileSync(join(p.proc, '70/cmdline'), '/bin/tool\0/helper\0')
+  expect(p.run().verdict).toBe('missing')
+})
+test.each(['70 99\n', '70\t99', '70\t99\textra\n', '0\t99\n', '70\tx\n', '70\t99\n\n', '70\t99\n70\t99\n'])
+('round21 client: malformed identity list %j is missing', rows => {
+  const p = placement(); fixtureClient(p); writeFileSync(join(root, 'harness-clients'), rows)
+  expect(p.run().verdict).toBe('missing')
+})
+test('round21 client: an empty list after stop preserves the original placement verdict', () => {
+  const p = placement(); writeFileSync(join(root, 'harness-clients'), '')
+  expect(p.run()).toMatchObject({ verdict: 'pass', stats: { persona_stubs: 2, persona_mcps: 2, harness_members: 5 } })
+})
+test('round21 client: a listed client in the persona cwd cannot replace its missing tmux MCP', () => {
+  const p = placement(); fixtureClient(p, 11, join(root, 'alpha')); rmSync(join(p.proc, '40'), { recursive: true })
+  expect(p.run()).toMatchObject({ verdict: 'missing', stats: { persona_stubs: 2, persona_mcps: 1 } })
+})
 test('harness placement: two personas and MCP clients pass with the runner, script and recorded tmux', () => {
   const p = placement(), row = p.run()
   expect(row.verdict).toBe('pass')
@@ -268,8 +329,9 @@ test('tmux, measured server and Slack stub reused identities are missing', () =>
   }
 })
 
-type ScanBoundary = 'group' | 'cwd' | 'cmdline' | 'identity' | 'tmux-loop' | 'candidate-identity'
+type ScanBoundary = 'group' | 'cwd' | 'cmdline' | 'identity' | 'tmux-loop' | 'candidate-identity' | 'required-identity'
 type ScanMutation = 'vanished' | 'unreadable' | 'reused' | 'zombie' | 'reused-zombie' | 'reused-exit' | 'wrong-group-exit'
+  | 'group-move' | 'reparented' | 'exec-changed' | 'server-parent' | 'caller-move'
 // Only copied CLI file reads are instrumented. No sleeps, global fs mocks or
 // collector API changes: the same read boundaries exist in the before fixture.
 function scanMutation(p: ReturnType<typeof placement>, pid: number, boundary: ScanBoundary,
@@ -279,7 +341,7 @@ function scanMutation(p: ReturnType<typeof placement>, pid: number, boundary: Sc
     const imports = 'readFileSync, readlinkSync,'
     expect(source.split(imports)).toHaveLength(2)
     return `import { rmSync as removeProcess, writeFileSync as traceProcess } from 'node:fs';
-let scanGroups=0, scanCommand=false, scanFired=false, scanRemoveAfter='';
+let scanGroups=0, scanIdentities=0, scanCommand=false, scanFired=false, scanRemoveAfter='';
 function scanRead(path, link=false) {
   path=String(path);
   const dir=${JSON.stringify(dir)}, boundary=${JSON.stringify(boundary)};
@@ -290,13 +352,21 @@ function scanRead(path, link=false) {
     (boundary==='cwd' && link && path===dir+'/cwd') ||
     (boundary==='cmdline' && path===dir+'/cmdline') ||
     (boundary==='identity' && scanCommand && path===dir+'/stat') ||
-    (boundary==='candidate-identity' && scanGroups>=3 && path===dir+'/stat'));
+    (boundary==='candidate-identity' && scanGroups>=3 && path===dir+'/stat') ||
+    (boundary==='required-identity' && scanCommand && path===dir+'/stat' && ++scanIdentities===2));
   if(path===dir+'/cmdline') scanCommand=true;
   if(!fire) return;
   scanFired=true; traceProcess(${JSON.stringify(marker)},'yes');
   const mutation=${JSON.stringify(mutation)};
   if(mutation==='vanished') removeProcess(dir,{recursive:true});
   else if(mutation==='unreadable') removeProcess(path);
+  else if(mutation==='group-move') traceProcess(dir+'/cgroup','0::/shard/server\\n');
+  else if(mutation==='exec-changed') traceProcess(dir+'/cmdline','/bin/tool\\0/helper\\0');
+  else if(mutation==='caller-move') traceProcess(${JSON.stringify(join(p.proc, '11/cgroup'))},'0::/shard/server\\n');
+  else if(mutation==='reparented' || mutation==='server-parent') {
+    const old=originalReadFileSync(dir+'/stat','utf8');
+    traceProcess(dir+'/stat',old.replace(/\\) S \\d+ /,') S '+(mutation==='server-parent' ? '50' : '1')+' '));
+  }
   else if(mutation==='wrong-group-exit') {
     traceProcess(dir+'/cgroup',${JSON.stringify(`0::${wrongGroup}\n`)}); scanRemoveAfter=path;
   }
@@ -319,6 +389,26 @@ const readlinkSync=(...args)=>{scanRead(args[0],true); return scanAfter(args[0],
 ` + source.replace(imports, 'readFileSync as originalReadFileSync, readlinkSync as originalReadlinkSync,')
   }
 }
+test.each((['identity', 'required-identity'] as const).flatMap(boundary =>
+  (['vanished', 'unreadable', 'reused', 'zombie', 'reused-zombie'] as const).map(mutation => [boundary, mutation] as const)))
+('round21 client: required fixture at %s with %s stays missing', (boundary, mutation) => {
+  const p = placement(); fixtureClient(p)
+  const child = placementCLI(p, scanMutation(p, 70, boundary, mutation))()
+  expect(readFileSync(join(root, 'scan-fired'), 'utf8')).toBe('yes')
+  expect(child.error).toBeUndefined(); expect(child.status).toBe(1)
+  expect(child.stdout).toContain('limit=2 verdict=missing')
+})
+test.each((['identity', 'required-identity'] as const).flatMap(boundary =>
+  (['group-move', 'reparented', 'exec-changed', 'server-parent', 'caller-move'] as const).map(mutation => [mutation, boundary] as const)))
+('round22 client freshness: %s at %s stays missing', (mutation, boundary) => {
+  const p = placement(); p.put(69, 11, '/shard/harness', 'helper'); fixtureClient(p, 69)
+  expect(p.run().verdict).toBe('pass')
+  const child = placementCLI(p, scanMutation(p, 70, boundary, mutation))()
+  expect(readFileSync(join(root, 'scan-fired'), 'utf8')).toBe('yes')
+  expect(readFileSync(join(p.proc, '70/stat'), 'utf8')).toEndWith(' 99\n')
+  expect(child.error).toBeUndefined(); expect(child.status).toBe(1)
+  expect(child.stdout).toContain('limit=2 verdict=missing')
+})
 const scanCases = (['server child', 'harness helper'] as const).flatMap(role =>
   (['group', 'cwd', 'cmdline', 'identity', 'tmux-loop'] as const).map(boundary => [role, boundary] as const))
 function scanPlacement(role: 'server child' | 'harness helper', boundary: ScanBoundary) {

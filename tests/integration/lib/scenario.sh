@@ -2342,11 +2342,15 @@ _scenario_harness_tmux() {
 _scenario_placement_identity() {
     [[ -p /run/cscb-burst-driver-server/requests ]] || return 0
     local role="$1" pid="$2" st
-    [[ "${role}" == server || "${role}" == slack ]] || fail 'invalid placement role'
+    [[ "${role}" == server || "${role}" == slack || "${role}" == clients ]] || fail 'invalid placement role'
     [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || fail 'invalid placement PID'
     st="$(_scenario_proc_starttime "${pid}")"
     [[ "${st}" =~ ^[0-9]+$ ]] || fail 'unavailable placement identity'
-    printf '%s\t%s\n' "${pid}" "${st}" > "${SCENARIO_ROOT}/harness-${role}"
+    if [[ "${role}" == clients ]]; then
+        printf '%s\t%s\n' "${pid}" "${st}" >> "${SCENARIO_ROOT}/harness-${role}"
+    else
+        printf '%s\t%s\n' "${pid}" "${st}" > "${SCENARIO_ROOT}/harness-${role}"
+    fi
 }
 
 run_start() {

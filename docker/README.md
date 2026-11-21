@@ -1218,9 +1218,26 @@ a write-only open; it writes nothing. The recorded live tmux PID/start/socket
 must remain valid, with runner/script PIDs and all tmux descendants in
 `shard/harness`.
 
+Test 44 records its script-owned `stub-mcp-session.ts` fixtures as
+`pid<TAB>start` rows in `${SCENARIO_ROOT}/harness-clients`, appending through
+`_scenario_placement_identity clients`. Listed clients must stay live with
+that start, but listing alone grants no out-of-tree exception.
+
+Both the main validation and final recheck require fresh metadata proving a
+live, non-zombie process with the recorded start, classified as
+`stub-mcp-session.ts`, in `/shard/harness`, with current ancestry to a
+still-valid recorded runner/script caller and outside the current measured
+server tree. Any failed condition is `missing`, including exit, reuse or a
+changed program with the same start identity.
+
+Accepted clients add to `harness_members`, never persona stub/MCP evidence.
+`stop_clients` clears the list, and an absent file leaves other burst scripts
+unchanged.
+
 Each configured persona needs a complete stub/MCP pair, revalidated in that
-tmux tree; recognized live duplicates outside it or the harness also fail
-the check. Recorded server/Slack/tmux and runner/script identities must remain
+tmux tree; recognized live duplicates outside it or the harness fail unless
+they are listed fixture clients satisfying the full invariant above.
+Recorded server/Slack/tmux and runner/script identities must remain
 live and unchanged through the final check.
 
 A non-required server child or harness/tmux helper is skipped only when it

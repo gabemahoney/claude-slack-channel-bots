@@ -2407,7 +2407,8 @@ export function guardedCgroups(server: string | undefined, drivers: (string | un
 
 /** Content-free placement evidence. The tmux PID/start identity is captured
  * before CSCB starts; inspect its live descendants, never any TUI or environ.
- * Every configured persona needs both its stub and its MCP client. */
+ * Every configured persona needs both its stub and its MCP client. Explicit
+ * script-owned fixture clients are required harness members, never persona proof. */
 export function harnessCpuEvidence(root: string | undefined, state: string | undefined, record: string, expected: number,
   read: CgroupRead, proc = HARNESS_PROC_ROOT, serverPid?: number): Result {
   const stats: Result['stats'] = { harness_cgroup: '/shard/harness', harness_cpus: 'unknown', runner_cgroup: 'unknown', script_cgroup: 'unknown',
@@ -2440,7 +2441,7 @@ export function harnessCpuEvidence(root: string | undefined, state: string | und
       && (!existsSync(join(proc, String(member))) || (current?.zombie === true && current.start === start))
     stats.slack_cgroup = group(slack.pid) ?? 'unknown'
     if (group(server.pid) !== '/shard/server' || stats.slack_cgroup !== '/shard/harness') return answer(false)
-    const callers = textFile(`${record}.harness`)
+    const callers = textFile(`${record}.harness`), callerPids = new Set<number>()
     if (!callers?.endsWith('\n')) return answer(false)
     for (const line of callers.trimEnd().split('\n')) {
       if (!/^[1-9][0-9]* [1-9][0-9]*$/.test(line)) return answer(false)
@@ -2451,6 +2452,20 @@ export function harnessCpuEvidence(root: string | undefined, state: string | und
         const current = info(member)
         if (!current || current.zombie) return answer(false)
         required.set(member, current.start)
+        callerPids.add(member)
+      }
+    }
+    const clients = new Map<number, string>(), clientFile = join(root, 'harness-clients')
+    if (existsSync(clientFile)) {
+      const rows = textFile(clientFile)
+      if (rows === undefined || (rows !== '' && !rows.endsWith('\n'))) return answer(false)
+      for (const line of rows === '' ? [] : rows.slice(0, -1).split('\n')) {
+        const row = line.match(/^([1-9][0-9]*)\t([0-9]+)$/)
+        if (!row) return answer(false)
+        const member = Number(row[1]), current = info(member)
+        if (!Number.isSafeInteger(member) || clients.has(member) || required.has(member)
+          || !current || current.zombie || current.start !== row[2]) return answer(false)
+        clients.set(member, row[2]); required.set(member, row[2])
       }
     }
     const identity = textFile(join(root, 'harness-tmux'))?.trim().split('\t')
@@ -2482,6 +2497,35 @@ export function harnessCpuEvidence(root: string | undefined, state: string | und
       return members
     }
     const descendants = tree(pid), serverTree = tree(server.pid)
+    const callerTree = new Set([...callerPids].flatMap(caller => [...tree(caller)].filter(member => member !== caller)))
+    for (const [member, start] of clients) {
+      if (processes.get(member)?.start !== start || !callerTree.has(member) || serverTree.has(member)
+        || group(member) !== '/shard/harness') return answer(false)
+    }
+    // The exception must remain true at each later validation boundary.
+    // Walk fresh ancestry all the way to PID 1/0, so a caller below the
+    // measured server cannot authorize its descendants. No snapshot tree
+    // grants authority after reparenting, exec or a cgroup move.
+    const validClient = (member: number, current: ReturnType<typeof info>) => {
+      const start = clients.get(member)
+      if (start === undefined || !current || current.zombie || current.start !== start
+        || group(member) !== '/shard/harness'
+        || basename(textFile(join(proc, String(member), 'cmdline'))?.split('\0')[1] ?? '') !== 'stub-mcp-session.ts') return false
+      const seen = new Set<number>()
+      let ancestor = member, node: ReturnType<typeof info> = current, caller = false
+      while (!seen.has(ancestor)) {
+        if (ancestor === server.pid || !node || node.zombie) return false
+        const before = processes.get(ancestor)
+        if (before && node.start !== before.start) return false
+        if (callerPids.has(ancestor)) {
+          if (node.start !== required.get(ancestor) || group(ancestor) !== '/shard/harness') return false
+          caller = true
+        }
+        if (node.parent === 0 || (node.parent === 1 && !callerPids.has(1))) return caller && node.parent !== server.pid
+        seen.add(ancestor); ancestor = node.parent; node = info(ancestor)
+      }
+      return false
+    }
     const stubs = new Set<string>(), mcps = new Set<string>()
     const candidates = new Map<number, { cwd: string; entry: string; start: string }>()
     for (const member of descendants) {
@@ -2502,7 +2546,10 @@ export function harnessCpuEvidence(root: string | undefined, state: string | und
       try { cwd = readlinkSync(join(proc, String(member), 'cwd')) } catch { /* classify using group/tree */ }
       if (vanished(member)) continue
       const raw = textFile(join(proc, String(member), 'cmdline')), entry = basename(raw?.split('\0')[1] ?? '')
+      const fixtureClient = clients.has(member)
+      if (fixtureClient && (entry !== 'stub-mcp-session.ts' || g !== '/shard/harness')) return answer(false)
       if (['claude', 'stub-mcp-session.ts'].includes(entry)
+        && !fixtureClient
         && ((cwd !== undefined && !dirs.includes(cwd)) || !descendants.has(member) || (g !== undefined && g !== '/shard/harness'))) return answer(false)
       if (vanished(member)) continue
       const relevant = owned || g === undefined || dirs.includes(cwd ?? '') || ['claude', 'stub-mcp-session.ts'].includes(entry)
@@ -2511,7 +2558,8 @@ export function harnessCpuEvidence(root: string | undefined, state: string | und
       if (after && after.start !== before.start) return answer(false)
       if (vanished(member, after, before.start)) continue
       if (cwd === undefined || !raw || !g || !after || after.zombie) return answer(false)
-      if (descendants.has(member)) {
+      if (fixtureClient && !validClient(member, after)) return answer(false)
+      if (descendants.has(member) || fixtureClient) {
         if (g !== '/shard/harness') return answer(false)
         stats.harness_members = Number(stats.harness_members) + 1
       }
@@ -2519,6 +2567,7 @@ export function harnessCpuEvidence(root: string | undefined, state: string | und
         if (g !== '/shard/server') return answer(false)
         stats.server_members = Number(stats.server_members) + 1
       }
+      if (fixtureClient) continue
       if (!['claude', 'stub-mcp-session.ts'].includes(entry)) continue
       if (!dirs.includes(cwd)) return answer(false)
       if (!descendants.has(member) || g !== '/shard/harness') return answer(false)
@@ -2537,7 +2586,10 @@ export function harnessCpuEvidence(root: string | undefined, state: string | und
     stats.persona_stubs = stubs.size; stats.persona_mcps = mcps.size
     // Recheck after scanning: a lost/reused server cannot pass on stale metadata.
     return answer(stubs.size === expected && mcps.size === expected
-      && [...required].every(([member, start]) => { const current = info(member); return current?.start === start && !current.zombie }))
+      && [...required].every(([member, start]) => {
+        const current = info(member)
+        return current?.start === start && !current.zombie && (!clients.has(member) || validClient(member, current))
+      }))
   } catch { return answer(false) }
 }
 

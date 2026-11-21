@@ -176,6 +176,7 @@ stop_clients() {
             unset "CLIENT[${key}]"
         fi
     done
+    : > "${SCENARIO_ROOT}/harness-clients"
 }
 clean_stop() {
     stop_clients
@@ -262,6 +263,7 @@ start_pending_post() {
         > "${EVIDENCE}/${key}.mcp.log" 2>&1 &
     CLIENT[${key}]=$!
     track_pid "${CLIENT[${key}]}"
+    _scenario_placement_identity clients "${CLIENT[${key}]}"
     slack_stub_post_lost "${key}" "${HOLD_CHANNEL}" false times=100000
     slack_stub_history_fault "${key}" history hang "channel=${HOLD_CHANNEL}" times=100000
     request="$(stub_session_submit "${WORK[${key}]}" reply \

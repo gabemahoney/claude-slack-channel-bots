@@ -418,8 +418,7 @@ function advance(ms) {
     writeFileSync(file, clock + source.replace(ready, `${ready}; queueMicrotask(async () => {
       advance(610000);
       for (let turn = 0; turn < 5; turn++) await Promise.resolve();
-      advance(625000);
-      process.emit('SIGTERM');
+      process.prependOnceListener('SIGTERM', () => advance(625000));
     })`))
     const child = memberHarness()
     expect(child.error).toBeUndefined()
