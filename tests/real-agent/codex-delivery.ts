@@ -401,7 +401,7 @@ async function gate() {
   fault('no_enter')
   for (const seq of burst) await delivered(seq)
   if (!consumedFault('no_enter')) throw new Error('whole-text fault never occurred')
-  const { auditCodexDelivery, assertCodexRecovery, codexShimCalls } = await import('./codex-gate.ts')
+  const { auditCodexDelivery, assertCodexRecovery, codexShimCalls, withCompactedRefusals } = await import('./codex-gate.ts')
   assertCodexRecovery(journal(), burst[0]!, 'enter', receipts.readShimLog(shimLog), instance)
   assertCodexRecovery(journal(), burst[1]!, 'retype', receipts.readShimLog(shimLog), instance)
   const completedPrefix = journal().filter(r => r.seq >= basicSeqs[0]!)
@@ -433,7 +433,9 @@ async function gate() {
     record('harness-crash', { pid: child.pid, signal: child.signalCode, seq: crashItem.seq, afterText: true, beforeEnter: true })
     await buildEngine()
     for (const item of queue.items(key)) if (!item.delivered) await delivered(item.accepted.seq)
-    assertCodexRecovery(journal(), crashItem.seq, 'enter', receipts.readShimLog(shimLog), instance)
+    // buildEngine's queue start compacted the open crash item, dropping any
+    // refused text attempt's pair; audit with the pairs observed before the kill.
+    assertCodexRecovery(withCompactedRefusals(beforeKill, journal(), crashItem.seq), crashItem.seq, 'enter', receipts.readShimLog(shimLog), instance)
   } finally { if (child.exitCode === null) { child.kill('SIGKILL'); await child.exited } }
 
   stage = 'gate-trailing-popup-fidelity'

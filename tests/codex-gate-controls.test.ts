@@ -1,7 +1,11 @@
 /** Synthetic gate controls. These records are never written into a real queue
  * or a native session and never constitute native acceptance evidence. */
 import { describe, expect, test } from 'bun:test'
-import { auditCodexDelivery, assertCodexRecovery } from './real-agent/codex-gate.ts'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { auditCodexDelivery, assertCodexRecovery, withCompactedRefusals } from './real-agent/codex-gate.ts'
+import { makeQueue, readQueue, seedQueue } from './test-helpers/delivery-queue.ts'
 import { projectCodexRollout } from './real-agent/codex-evidence.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 
@@ -193,5 +197,62 @@ describe('Codex fault recovery evidence', () => {
     // Only the refused call precedes the retype intent: nothing was lost and retyped.
     expect(() => assertCodexRecovery(journal, 1, 'retype', f.shim, instance)).toThrow('lost text was not retyped')
     expect(() => assertCodexRecovery(journal.filter(r => r.kind !== 'refused'), 1, 'retype', f.shim, instance)).not.toThrow()
+  })
+
+  /** The D1 crash flow: the child's first text send is refused, its retry is
+   * typed, then the harness dies before Enter. The real queue's start compacts
+   * the open item, dropping the refused pair, before Enter recovery runs. */
+  async function crashRestart(seeded: any[]) {
+    const dir = mkdtempSync(join(tmpdir(), 'codex-gate-compact-'))
+    try {
+      seedQueue(dir, seeded)
+      const queue = await makeQueue(dir)
+      await queue.stop()
+      const after = readQueue(dir) as any[]
+      const retry = after.find(r => r.kind === 'sent' && r.attempt === 2)
+      // Recovery evidence the restarted engine appends: a durable Enter intent and the delivery.
+      const journal = [...after, { ...retry, send_kind: 'enter', attempt: 3, at: 1100 }, { v: 1, kind: 'delivered', seq: 1, part: 1, at: 1200, receipt: { path, offset: 0 } }]
+      return { after, journal }
+    } finally { rmSync(dir, { recursive: true, force: true }) }
+  }
+  const recover = (journal: any[], shim: string) => () => assertCodexRecovery(journal, 1, 'enter', shim, instance)
+  test('crash Enter recovery keeps refusals observed before the real queue restart', async () => {
+    const f = refused(), before = f.journal.filter(r => r.seq === 1 && r.kind !== 'delivered')
+    const { after, journal } = await crashRestart(before)
+    // Premise: startup compaction removed attempt 1's sent/refused pair and recorded its watermark.
+    expect(after.filter(r => r.kind === 'sent' || r.kind === 'refused').map(r => [r.kind, r.attempt])).toEqual([['sent', 2]])
+    expect(after.find(r => r.kind === 'accepted' && r.seq === 1 && !r.compact)?.attempt_high_watermark).toBe(2)
+    const shim = f.shim + call(1101, undefined, 'Enter')
+    // The post-restart journal alone repeats the original false failure.
+    expect(recover(journal, shim)).toThrow('durable recovery Enter missing')
+    const audited = withCompactedRefusals(before, journal, 1)
+    expect(recover(audited, shim)).not.toThrow()
+    expect(audited.filter(r => r.kind === 'refused')).toEqual([before.find(r => r.kind === 'refused')])
+    // An unrefused extra text call still fails, as does a missing actual Enter.
+    expect(recover(audited, shim + call(1150, texts[0]))).toThrow('durable recovery Enter missing')
+    expect(recover(audited, f.shim)).toThrow('durable recovery Enter missing')
+  })
+  test('crash Enter recovery restores nothing that compaction kept, duplicated or never observed', async () => {
+    const f = refused(), before = f.journal.filter(r => r.seq === 1 && r.kind !== 'delivered')
+    const shim = f.shim + call(1101, undefined, 'Enter')
+    // An unrefused first send survives compaction; nothing is restored and the extra call fails.
+    const unrefused = await crashRestart(before.filter(r => r.kind !== 'refused'))
+    expect(unrefused.after.filter(r => r.kind === 'sent').map(r => r.attempt)).toEqual([1, 2])
+    expect(withCompactedRefusals(before, unrefused.journal, 1)).toEqual(unrefused.journal)
+    expect(recover(withCompactedRefusals(before, unrefused.journal, 1), shim)).toThrow('durable recovery Enter missing')
+    const { journal } = await crashRestart(before)
+    // A pair still in the journal is not added again (no duplicate attempt).
+    const uncompacted = [...before, ...journal.slice(-2)]
+    expect(withCompactedRefusals(before, uncompacted, 1)).toEqual(uncompacted)
+    expect(recover(withCompactedRefusals(before, uncompacted, 1), shim)).not.toThrow()
+    // Another item's refusal, or one above the compacted watermark, is not restored.
+    expect(withCompactedRefusals(before.map(r => r.kind === 'refused' ? { ...r, seq: 2 } : r), journal, 1)).toEqual(journal)
+    const high = before.map(r => (r.kind === 'refused' || (r.kind === 'sent' && r.attempt === 1)) ? { ...r, attempt: 5 } : r)
+    expect(withCompactedRefusals(high, journal, 1)).toEqual(journal)
+    // Without an observed refusal, nothing is inferred from the missing records.
+    expect(withCompactedRefusals(before.filter(r => r.kind !== 'refused'), journal, 1)).toEqual(journal)
+    // A repeated observed refusal stays ambiguous and excuses nothing.
+    const repeated = before.flatMap(r => r.kind === 'refused' ? [r, r] : [r])
+    expect(recover(withCompactedRefusals(repeated, journal, 1), shim)).toThrow('durable recovery Enter missing')
   })
 })

@@ -89,6 +89,25 @@ export function auditCodexDelivery(options: {
   return { duplicates, firstReceipts, items: accepted.length }
 }
 
+/** b.88t: queue startup compaction drops an open item's refused sent/refused
+ * pairs. For one recovery audit, add back the pairs observed before the
+ * restart only for attempts the restarted journal no longer holds at all and
+ * that its compacted watermark covers. Nothing is inferred from a missing
+ * record, repeated records stay repeated (refusedTextSends then excuses
+ * nothing), and the result is never written to the production queue. */
+export function withCompactedRefusals(before: any[], after: any[], seq: number): any[] {
+  const item = after.filter(r => r.kind === 'accepted' && r.seq === seq && !r.compact)
+  const watermark = item.length === 1 ? item[0].attempt_high_watermark : undefined
+  if (!Number.isSafeInteger(watermark)) return after
+  const own = (rows: any[], attempt: number) => rows.filter(r => (r.kind === 'sent' || r.kind === 'refused') && r.seq === seq && r.attempt === attempt)
+  const restored: any[] = []
+  for (const attempt of new Set(before.filter(r => r.kind === 'refused' && r.seq === seq).map(r => r.attempt))) {
+    if (!Number.isSafeInteger(attempt) || attempt < 1 || attempt > watermark || own(after, attempt).length) continue
+    restored.push(...own(before, attempt))
+  }
+  return restored.length ? [...after, ...restored] : after
+}
+
 export function assertCodexRecovery(journal: any[], seq: number, kind: 'retype' | 'no-retype' | 'enter', shim: string, instance: string) {
   const sends = journal.filter(r => r.seq === seq && r.kind === 'sent' && !r.unknown_outcome)
   const fixed = journal.find(r => r.seq === seq && r.kind === 'fixed')
