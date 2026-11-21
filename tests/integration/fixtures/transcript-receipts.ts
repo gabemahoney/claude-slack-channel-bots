@@ -344,21 +344,31 @@ export function receiptProgress(options: AuditOptions, entries: readonly Transcr
   }
   return completed
 }
-/** How many of a part's shim text sends AD refused, so nothing was typed
+/** The indices of a part's shim text sends AD refused, so nothing was typed
  * (b.88t). A send counts only when it lies inside one refused attempt's
  * window: that attempt's durable `sent` text record (written before the keys)
- * at or before the send, and its `refused` record at or after it. Each refused
- * attempt accounts for at most one send; any other send stays typed. */
-function refusedTextSends(journal: readonly any[], seq: number, part: number, typed: readonly ShimSend[]): number {
+ * at or before the send, and its `refused` record at or after it. The journal
+ * stamps both with whole Date.now milliseconds, the shim with microseconds, so
+ * the send is compared at microsecond precision against the intent and at
+ * millisecond precision against the refusal. An attempt with more than one
+ * `sent` or `refused` record is ambiguous and excuses nothing; each refused
+ * attempt excuses at most one send; any other send stays typed. */
+function refusedTextSends(journal: readonly any[], seq: number, part: number, typed: readonly ShimSend[]): Set<number> {
   const used = new Set<number>()
-  for (const sent of journal) {
-    if (sent.kind !== 'sent' || sent.seq !== seq || sent.part !== part || sent.send_kind !== 'text' || !Number.isFinite(sent.at)) continue
-    const refused = journal.find(r => r.kind === 'refused' && r.seq === seq && r.attempt === sent.attempt)
-    if (!refused || !Number.isFinite(refused.at)) continue
-    const send = typed.findIndex((s, i) => !used.has(i) && s.at >= sent.at && s.at <= refused.at)
+  const attempts = journal.filter(r => r.kind === 'refused' && r.seq === seq).map(r => r.attempt)
+  for (const attempt of new Set(attempts)) {
+    const intents = journal.filter(r => r.kind === 'sent' && r.seq === seq && r.attempt === attempt)
+    const refusals = journal.filter(r => r.kind === 'refused' && r.seq === seq && r.attempt === attempt)
+    if (intents.length !== 1 || refusals.length !== 1) continue
+    const sent = intents[0]!, refused = refusals[0]!
+    if (sent.part !== part || sent.send_kind !== 'text' || !Number.isFinite(sent.at) || !Number.isFinite(refused.at)) continue
+    const send = typed.findIndex((s, i) => {
+      const micros = Math.round(s.at * 1000)
+      return !used.has(i) && micros >= sent.at * 1000 && Math.floor(micros / 1000) <= refused.at
+    })
     if (send >= 0) used.add(send)
   }
-  return used.size
+  return used
 }
 export function auditReceipts(options: AuditOptions, entries: readonly TranscriptEntry[], adapters: ReceiptAdapters) {
   const journal = receiptJournal(options.stateDir, options.key)
@@ -408,12 +418,16 @@ export function auditReceipts(options: AuditOptions, entries: readonly Transcrip
       if (!typed.length) throw new Error(`Item ${item.seq} part ${part} has no shim send`)
       if (typed.some(s => !Number.isFinite(s.at) || s.at < receivedAt)) throw new Error('Missing, invalid or negative typing measurement')
       if (typed.some(s => s.at < partDelivered)) throw new Error('Successor send preceded prior receipt/delivery log')
-      if (options.noRetype && typed.length - refusedTextSends(journal, item.seq, part, typed) !== 1) throw new Error('Text fidelity case retyped')
+      // Validity and order checks above cover every send; timing uses only sends AD did not refuse.
+      const refused = refusedTextSends(journal, item.seq, part, typed)
+      const keyed = typed.filter((_, i) => !refused.has(i))
+      if (!keyed.length) throw new Error(`Item ${item.seq} part ${part} has no unrefused shim send`)
+      if (options.noRetype && keyed.length !== 1) throw new Error('Text fidelity case retyped')
       if (options.noRetype && matches.length !== 1) throw new Error('Text fidelity case taken in more than once')
       if (options.noRetype && journal.some(r => r.kind === 'sent' && r.seq === item.seq && r.part === part && r.send_kind === 'enter')) {
         throw new Error('Text fidelity case needed Enter-only recovery')
       }
-      firstTyped = Math.min(firstTyped, typed[0]!.at)
+      firstTyped = Math.min(firstTyped, keyed[0]!.at)
       if (!Number.isFinite(delivered.at)) throw new Error('Invalid durable delivery timestamp')
       partDelivered = delivered.at
     }

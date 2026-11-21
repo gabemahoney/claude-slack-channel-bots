@@ -93,7 +93,16 @@ test('b.88t fidelity counts a send AD refused as untyped only inside its own att
   expect(sent.map(r => [r.attempt, r.send_kind])).toEqual([[1, 'text'], [2, 'text']])
   expect(refused).toMatchObject({ seq: 1, attempt: 1, at: sent[0].at + 40 })
   expect(calls.filter(line => line.includes('--text'))).toHaveLength(2)
-  expect(audit()).toMatchObject({ items: 1, duplicates: 0 })
+  // Typing time is the retry's send, not the refused one (received at sent[0].at - 10).
+  const receivedAt = sent[0].at - 10
+  expect(audit()).toMatchObject({ items: 1, duplicates: 0, timings: [{ seq: 1, typing_ms: sent[1].at - receivedAt, delivery_ms: sent[1].at + 10 - receivedAt }] })
+  expect(h.audit()).toMatchObject({ timings: [{ seq: 1, typing_ms: sent[1].at - receivedAt }] })
+  // A delivery log between the refused and the typed send is inconsistent, in and outside a fidelity run.
+  const serverLog = join(h.options.stateDir, 'server.log'), logLines = readFileSync(serverLog, 'utf8')
+  writeFileSync(serverLog, logLines.replace(/^\[[^\]]+\](?= \[slack\] message-delivered:)/m, `[${new Date(sent[0].at + 1000).toISOString()}]`))
+  expect(audit).toThrow('Negative or inconsistent delivery measurement')
+  expect(h.audit).toThrow('Negative or inconsistent delivery measurement')
+  writeFileSync(serverLog, logLines)
   const write = (journal: any[], shim = calls) => {
     writeFileSync(h.journal, journal.map(r => JSON.stringify(r)).join('\n') + '\n')
     writeFileSync(h.shimLog, shim.join('\n') + '\n')
@@ -118,6 +127,23 @@ test('b.88t fidelity counts a send AD refused as untyped only inside its own att
   rejects(rows, [calls[0]!, callAt(calls[0]!, sent[0].at + 20), ...calls.slice(1)])
   // An extra unpaired send after the typed one stays typed.
   rejects(rows, [...calls, callAt(calls[1]!, sent[1].at + 5)])
+  // A repeated intent or refusal for the refused attempt is ambiguous and excuses nothing, so it cannot excuse two sends.
+  const twoInWindow = [calls[0]!, callAt(calls[0]!, sent[0].at + 20), ...calls.slice(1)]
+  rejects(rows.flatMap(r => r.kind === 'sent' && r.attempt === 1 ? [r, r] : [r]), twoInWindow)
+  rejects(rows.flatMap(r => r.kind === 'sent' && r.attempt === 1 ? [r, r] : [r]))
+  rejects(rows.flatMap(r => r.kind === 'refused' ? [r, r] : [r]))
+  // Endpoints at recorded precision: the journal's whole milliseconds, the shim's microseconds.
+  const at = (send: number) => calls.map((line, i) => i === 0 ? callAt(line, send) : line)
+  write(rows, at(refused.at + 0.8))
+  expect(audit()).toMatchObject({ items: 1, timings: [{ typing_ms: sent[1].at - receivedAt }] })
+  write(rows, at(sent[0].at))
+  expect(audit()).toMatchObject({ items: 1 })
+  rejects(rows, at(refused.at + 1))
+  rejects(rows, at(sent[0].at - 0.001))
+  // Every send AD refused and none typed: no typing measurement, in and outside a fidelity run.
+  write(rows, [calls[0]!])
+  expect(audit).toThrow('Item 1 part 1 has no unrefused shim send')
+  expect(h.audit).toThrow('Item 1 part 1 has no unrefused shim send')
   // Back to production evidence: passes again; outside a fidelity run both sends were always accepted.
   write(rows)
   expect(audit()).toMatchObject({ items: 1 })
