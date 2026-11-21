@@ -1655,7 +1655,11 @@ describe('cpu-profile opt-in', () => {
     // test-48 shares membership-load.sh but never passes its --cpu-profile option.
     // burst-driver.sh only forwards the caller's SR8_PROFILE_DIR to the driver it launches; it sets none.
     expect(shells.filter(f => opted.test(readFileSync(join(integration, f), 'utf8'))).sort())
-      .toEqual(['fixtures/burst-driver.sh', 'lib/membership-load.sh', 'test-32-fmk-real-order.sh', 'test-44-fmk-thread-burst.sh', 'test-45-fmk-membership-load.sh'])
+      .toEqual(['fixtures/burst-driver.sh', 'fixtures/server-start.sh', 'lib/membership-load.sh', 'test-32-fmk-real-order.sh', 'test-44-fmk-thread-burst.sh', 'test-45-fmk-membership-load.sh'])
+    const starter = readFileSync(join(integration, 'fixtures/server-start.sh'), 'utf8')
+    expect(starter).toContain("[[ ${BUN_OPTIONS} == '--preload /tests/integration/fixtures/cpu-profile-preload.ts' ]] || exit 64")
+    expect(starter).toContain('trusted /tests/integration/fixtures/cpu-profile-preload.ts || exit 70')
+    expect(starter).toContain("fixed+=(BUN_OPTIONS='--preload /tests/integration/fixtures/cpu-profile-preload.ts' CSCB_TEST_CPU_PROFILE_DIR=\"${profile}\")")
     const forwarder = readFileSync(join(integration, 'fixtures/burst-driver.sh'), 'utf8')
     expect(forwarder.split('\n').filter(line => opted.test(line))).toEqual(['DRIVER_ENV=(SCENARIO_ROOT SR8_PHASE_CPU_FILE SR8_PHASE_CPU_PIDS SR8_PROFILE_DIR CSCB_TEST_DIAGNOSTICS SR8_MEMBER_CPU)'])
     expect(shells.filter(f => readFileSync(join(integration, f), 'utf8').includes('--cpu-profile')).sort())

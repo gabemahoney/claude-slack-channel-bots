@@ -1811,8 +1811,16 @@ _scenario_closing_recheck() {
 # Print the PID of every live process of the real tmux binary that is still
 # the scenario's own (fmk mode): its tmux server and any client left running.
 _scenario_tmux_pids() {
-    local proc
-    for proc in /proc/[0-9]*; do
+    local proc proc_root="${1:-/proc}"
+    local owned_pid owned_start owned_socket
+    if [[ -r "${SCENARIO_ROOT}/harness-tmux" ]]; then
+        IFS=$'\t' read -r owned_pid owned_start owned_socket < "${SCENARIO_ROOT}/harness-tmux"
+        if [[ "${owned_pid}" =~ ^[1-9][0-9]*$ && "$(_scenario_proc_starttime "${owned_pid}" "${proc_root}")" == "${owned_start}" \
+            && "${proc_root}/${owned_pid}/exe" -ef "${SCENARIO_REAL_TMUX}" ]]; then
+            printf '%s\n' "${owned_pid}"
+        fi
+    fi
+    for proc in "${proc_root}"/[0-9]*; do
         [[ "${proc}/exe" -ef "${SCENARIO_REAL_TMUX}" ]] || continue
         _scenario_pid_ours "${proc#/proc/}" && printf '%s\n' "${proc#/proc/}"
     done
@@ -2313,6 +2321,34 @@ _scenario_register_state_dir() {
     _SCENARIO_STATE_DIRS+=("$1")
 }
 
+_scenario_harness_tmux() {
+    require_ci_image _scenario_harness_tmux
+    require_scenario_home _scenario_harness_tmux
+    _scenario_tmux_check _scenario_harness_tmux
+    local out pid socket group st
+    out="$("${SCENARIO_REAL_TMUX}" start-server \; set-option -s exit-empty off \; display-message -p '#{pid} #{socket_path}')" \
+        || fail 'cannot bootstrap the harness tmux server'
+    read -r pid socket <<< "${out}"
+    [[ "${pid}" =~ ^[1-9][0-9]*$ && "${socket}" == "${TMUX_TMPDIR}"/* && -S "${socket}" ]] \
+        || fail 'invalid harness tmux server identity'
+    read -r group < "/proc/${pid}/cgroup" || fail 'cannot read harness tmux placement'
+    [[ "${group}" == 0::/shard/harness ]] || fail 'tmux server is not harness-born'
+    st="$(_scenario_proc_starttime "${pid}")"
+    [[ "${st}" =~ ^[0-9]+$ ]] || fail 'cannot read harness tmux start identity'
+    printf '%s\t%s\t%s\n' "${pid}" "${st}" "${socket}" > "${SCENARIO_ROOT}/harness-tmux"
+}
+
+# Birth identities for mandatory placement evidence in burst-driver shards.
+_scenario_placement_identity() {
+    [[ -p /run/cscb-burst-driver-server/requests ]] || return 0
+    local role="$1" pid="$2" st
+    [[ "${role}" == server || "${role}" == slack ]] || fail 'invalid placement role'
+    [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || fail 'invalid placement PID'
+    st="$(_scenario_proc_starttime "${pid}")"
+    [[ "${st}" =~ ^[0-9]+$ ]] || fail 'unavailable placement identity'
+    printf '%s\t%s\n' "${pid}" "${st}" > "${SCENARIO_ROOT}/harness-${role}"
+}
+
 run_start() {
     local live=0
     case "${1:-}" in
@@ -2340,14 +2376,22 @@ run_start() {
     else
         env_args+=(SLACK_DRY_RUN=1)
     fi
+    if [[ -p /run/cscb-burst-driver-server/requests ]]; then
+        _scenario_harness_tmux
+    fi
     set +e
-    (cd "${SCENARIO_REPO}" && _scenario_cscb_exec start env "${env_args[@]}" "${SCENARIO_CLI}" start) > "${START_OUT}" 2>&1
+    if [[ -p /run/cscb-burst-driver-server/requests ]]; then
+        env "${env_args[@]}" bash "${SCENARIO_FIXTURES}/server-start.sh" start > "${START_OUT}" 2>&1
+    else
+        (cd "${SCENARIO_REPO}" && _scenario_cscb_exec start env "${env_args[@]}" "${SCENARIO_CLI}" start) > "${START_OUT}" 2>&1
+    fi
     START_RC=$?
     set -e
     local pid
     pid="$(server_pid)"
     if [[ -n "${pid}" ]]; then
         _scenario_add _SCENARIO_SERVER_PIDS "${pid}"
+        _scenario_placement_identity server "${pid}"
     fi
     _scenario_cscb_after || fail "run_start: could not update the CSCB process record"
     return 0
@@ -2414,7 +2458,7 @@ stop_server() {
 # same PID); nothing when there is no such process.
 _scenario_proc_starttime() {
     local stat rest fields=()
-    { read -r stat < "/proc/$1/stat"; } 2> /dev/null || return 0
+    { read -r stat < "${2:-/proc}/$1/stat"; } 2> /dev/null || return 0
     # The fields after the parenthesised command name start at field 3.
     rest="${stat##*) }"
     read -r -a fields <<< "${rest}"

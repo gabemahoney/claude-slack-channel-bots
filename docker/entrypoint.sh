@@ -71,11 +71,13 @@ chown -R testuser:testuser "${TESTUSER_HOME}/.claude" "${TESTUSER_HOME}/.claude.
 # cgroup namespace and a writable cgroup) keeps the SR-8 burst driver off the
 # server's CPU quota. It refuses unless the cgroup it sees is this container's
 # own: this process at its namespace root, the mount's root listing it.
-# Everything started here runs in shard/server, at exactly 2 CPUs: the same
-# quota as an ordinary shard. The driver's launcher
+# The server's 2-CPU quota is the server's alone: a start launcher is born
+# in shard/server. Everything else starts in shard/harness, capped at 1 CPU,
+# including the runner, scripts, Slack stub and harness-born tmux/personas.
+# The driver's launcher
 # (tests/integration/fixtures/burst-driver.sh --serve) is born in
 # shard/driver, at 0.9 CPU, and starts every driver there. The runner gives the
-# container 4 CPUs (scripts/ci-run.ts DRIVER_CPUS), so 1.1 CPU is left as
+# container 5 CPUs (scripts/ci-run.ts DRIVER_CPUS), so 1.1 CPU is left as
 # headroom. With only 0.1 CPU left, the container's quota could throttle the
 # server's group while the server's own quota was not exhausted, unseen in
 # the server's cpu.stat (b.9p6: late Post Hold releases with the server
@@ -93,27 +95,37 @@ split_driver_cpu() {
         return 1
     fi
     read -r quota period < "${root}/cpu.max"
-    if ! [[ ${quota} =~ ^[0-9]+$ && ${period} =~ ^[0-9]+$ ]] || (( quota < period * 3 + period * 9 / 10 )); then
-        echo "entrypoint.sh: the container's cpu.max leaves less than 1 CPU of headroom beside the server's 2 CPUs and the burst driver's 0.9" >&2
+    if ! [[ ${quota} =~ ^[0-9]+$ && ${period} =~ ^[0-9]+$ ]] || (( quota < period * 4 + period * 9 / 10 )); then
+        echo "entrypoint.sh: the container's cpu.max leaves less than 1 CPU of headroom beside the server's 2 CPUs, the burst driver's 0.9 and the harness's 1" >&2
         return 1
     fi
     mkdir "${root}/shard"
     echo threaded > "${root}/shard/cgroup.type"
     echo +cpu > "${root}/cgroup.subtree_control"
     echo +cpu > "${root}/shard/cgroup.subtree_control"
-    mkdir "${root}/shard/server" "${root}/shard/driver"
+    mkdir "${root}/shard/server" "${root}/shard/driver" "${root}/shard/harness"
     echo threaded > "${root}/shard/server/cgroup.type"
     echo threaded > "${root}/shard/driver/cgroup.type"
+    echo threaded > "${root}/shard/harness/cgroup.type"
     echo "$(( period * 2 )) ${period}" > "${root}/shard/server/cpu.max"
     echo "$(( period * 9 / 10 )) ${period}" > "${root}/shard/driver/cpu.max"
+    echo "${period} ${period}" > "${root}/shard/harness/cpu.max"
     mkdir -m 0700 "${spool}"
     mkfifo -m 0600 "${spool}/requests"
     chown testuser:testuser "${spool}" "${spool}/requests"
-    # The launcher forks while this process is in shard/driver, then this
-    # process, and everything it later starts, goes to shard/server.
+    # Each launcher is born in its group; no child migrates after launch.
     echo "$$" > "${root}/shard/driver/cgroup.procs"
     gosu testuser bash /tests/integration/fixtures/burst-driver.sh --serve "${spool}" &
     echo "$$" > "${root}/shard/server/cgroup.procs"
+    local server_spool="${spool}-server"
+    mkdir -m 0755 "${server_spool}"
+    mkdir -m 0700 "${server_spool}/jobs"
+    mkfifo -m 0660 "${server_spool}/requests"
+    chown root:testuser "${server_spool}/requests"
+    chown testuser:testuser "${server_spool}/jobs"
+    gosu testuser bash /tests/integration/fixtures/server-start.sh --serve "${server_spool}" &
+    echo "$$" > "${root}/shard/harness/cgroup.procs"
+    export CSCB_TEST_RUNNER_PID=$$
 }
 if [[ -w /sys/fs/cgroup/cgroup.subtree_control ]] && (( $$ != 1 )); then
     split_driver_cpu /sys/fs/cgroup /proc/self/cgroup /run/cscb-burst-driver

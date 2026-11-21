@@ -551,7 +551,7 @@ run_membership_load() {
         PLAN="${ROOT}/plan.tsv"
         mkdir -p "${BATCH}" "${WRITES}"
         membership_profile_open
-        bun "${E}" cpu-mark "${ROOT}/cpu.before" || :
+        bun "${E}" cpu-mark "${ROOT}/cpu.before" /shard/server || :
         new_state_dir "${MODE}-${CASE_KIND}"
         CONFIG="${SLACK_STATE_DIR}/config.json"
         # Diagnostic observers add buffered ACK/append/save rows, never verdicts.
@@ -586,6 +586,7 @@ run_membership_load() {
         track_pid "${STUB_PID}"
         wait_for_file "${ROOT}/slack-ready.json" 20 'Slack stub readiness'
         [[ "$(jq -er .pid "${ROOT}/slack-ready.json")" == "${STUB_PID}" ]] || fail 'wrong Slack stub PID'
+        _scenario_placement_identity slack "${STUB_PID}"
         CSCB_SLACK_API_URL="$(jq -er .api_url "${ROOT}/slack-ready.json")"
         export CSCB_SLACK_API_URL
         [[ "${CSCB_SLACK_API_URL}" =~ ^http://127\.0\.0\.1:[0-9]+/api/$ ]] || fail 'non-loopback Slack stub'

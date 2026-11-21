@@ -148,6 +148,8 @@ record="$1"
 shift
 [[ ${record} == /* ]] && driver_command "$@" || usage
 if [[ -p ${SPOOL}/requests ]]; then
+    # Caller identities are separate from the unchanged driver-group record.
+    printf '%s %s\n' "${CSCB_TEST_RUNNER_PID:-unknown}" "${PPID}" >> "${record}.harness"
     run_through_launcher "${record}" "$@"
 fi
 record_cgroup "${record}" || exit 70

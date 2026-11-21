@@ -1025,10 +1025,10 @@ function burstS2Argv(cpus: string, writable: boolean): string[] {
 }
 
 describe('submitCommands: burst-driver shards (b.ya4)', () => {
-  test("the fixtures are burst-driver scripts by the kit's rule, and v0.19.1's figures are this checkout's", () => {
+  test("the fixtures are burst-driver scripts by the kit's rule; historical tag resources remain independent", () => {
     expect([THREAD_BURST, MEMBERSHIP_LOAD].every((file) => BURST_DRIVER_SCRIPTS.test(file))).toBe(true)
     expect([f(1), f(5)].some((file) => BURST_DRIVER_SCRIPTS.test(file))).toBe(false)
-    expect(CPUS_PER_SHARD + DRIVER_CPUS).toBe(BURST_V0191.cpus)
+    expect(submitCommands({ ...SETTINGS, burstDriver: BURST_V0191 }, BURST_PLAN)).toEqual([burstS2Argv('4', true), ORDINARY_S1_ARGV])
   })
 
   test("a burst-driver shard gets --cgroups writable and the tag's burst CPUs; the ordinary shard keeps today's exact argv", () => {
@@ -1306,6 +1306,7 @@ describe("prepare.sh's downgrade fixture", () => {
     cscbTag('1.1.6', pinned, { ...split, ciRun: CI_RUN.replace(PER_SHARD_LINE, '') })
     cscbTag('1.1.7', pinned, { ...split, ciRun: CI_RUN.replace(PATTERN_LINE, '') })
     cscbTag('1.1.8', pinned, { ...split, ciRun: CI_RUN.replace(PATTERN_LINE, (line) => `${line}i`) })
+    cscbTag('1.1.9', pinned, { ciRun: CI_RUN.replace(DRIVER_LINE, 'export const DRIVER_CPUS = 2'), entrypoint: 'split_driver_cpu() {\n    :\n}\n' })
   }, 30_000)
 
   afterAll(() => {
@@ -1362,6 +1363,10 @@ describe("prepare.sh's downgrade fixture", () => {
 
   test("v0.19.0's DRIVER_CPUS 1 gives 3 CPUs, as its CI did", () => {
     expect(burstDriverOf('1.1.1')).toEqual({ cpus: CPUS_PER_SHARD + 1, pattern: BURST_DRIVER_SCRIPTS.source })
+  }, 30_000)
+
+  test("an older tag's DRIVER_CPUS 2 still gives four CPUs despite this checkout's harness split", () => {
+    expect(burstDriverOf('1.1.9')).toEqual({ cpus: 4, pattern: BURST_DRIVER_SCRIPTS.source })
   }, 30_000)
 
   test('a tag before the split (no DRIVER_CPUS, no split_driver_cpu) records burst_driver null', () => {

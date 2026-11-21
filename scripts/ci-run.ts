@@ -665,10 +665,10 @@ export const CI_CPUS = 12
 export const CPUS_PER_SHARD = 2
 /**
  * The extra CPUs a burst-driver shard takes beside the server's `CPUS_PER_SHARD`:
- * 0.9 for the driver's group and the rest as headroom, so the container's quota
+ * 0.9 for the driver's group, 1 for the harness and 1.1 headroom, so the container's quota
  * does not throttle the server's group (b.9p6, docker/entrypoint.sh).
  */
-export const DRIVER_CPUS = 2
+export const DRIVER_CPUS = 3
 /** Thread-burst and every membership-load group: their `sr8-evidence.ts` driver runs outside the server's CPU quota. */
 export const BURST_DRIVER_SCRIPTS = /-fmk-(?:thread-burst|membership-load(?:-[a-z0-9]+)*)\.sh$/
 /** A burst-driver shard's `--security-opt`: its entrypoint splits the container's CPU quota (docker/entrypoint.sh). */

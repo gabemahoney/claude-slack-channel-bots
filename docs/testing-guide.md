@@ -267,6 +267,8 @@ New features that add significant logic should get their own test file (e.g., `s
 | tests/integration/fixtures/cpu-profile.ts, cpu-profile-preload.ts | cpu-profile.test.ts | Synthetic CPU profile ranks, sample windows and CLI outcomes; profiler start/stop faults, timeout, capped sampling and inert behavior without opt-in. Executable extracted shell controls cover unset/empty/0/other/1 for tests 32/44/45: no profile directories, hooks, preload or optional waits off; only strict first-hang profiles in membership, with later/open/new groups inert. Test-44 optional timing config/observers share the switch. Enabled controls retain bounded cleanup, status preservation and test-32 sampling/memory caps. |
 | tests/integration/fixtures/sr8-evidence.ts (`member-cpu`), lib/membership-load.sh, fixtures/burst-driver.sh | cpu-profile.test.ts, ci-timing-regressions.test.ts | Synthetic member-CPU samples and injectable proc/cgroup trees cover bracketed counters, endpoint totals through gaps, matching thread identities, coverage, signed over-accounting, qualified/unavailable shares, ambiguous throttling and nearest-rank scan p99; top-ten-plus-rest output stays within the cap. CLI/shell controls cover exact two-part opt-in, no off-state process/file/output/wait, safe labels, placement, mode-0600 output, initial/readiness/final SIGTERM ordering, timer cancellation, nonfatal failure and elapsed start/stop deadlines with kill/reap. Ten in-memory deletion controls pin wiring presence/order; the real launcher declaration admits the fourth command and exact six environment names while retaining fixed paths, trust and crafted-request refusals; synthetic results establish no native sampling cost or performance verdict. |
 | delivery-engine.ts (createDeliveryCallBudget) | delivery-engine-budget.test.ts | Call-budget waits preserve whole-step age order and typed-text leases; back-to-back receipts deliver each item with only the required Enter revalidation read. |
+| scripts/ci-run.ts (burst resources/admission), scripts/ad-gate/prepare.sh | ci-run-interface.test.ts, ci-run-admission.test.ts, ad-gate.test.ts | Current burst shards take 5 CPUs and ordinary shards 2; admission pins `2 × N + 3 × min(N, burst-driver scripts)` and its fit boundaries. Historical v0.19.1 four-CPU and v0.19.0 three-CPU manifests remain independent of current constants, with prepare controls reading the old tag's own values. |
+| docker/entrypoint.sh, tests/integration/fixtures/server-start.sh, burst-driver.sh, sr8-evidence.ts, lib/scenario.sh, lib/membership-load.sh | cgroup-harness.test.ts | Fake proc/cgroup trees cover three-group allocation/headroom, misplaced members/duplicates, harness quota and the combined `driver-cpu` CLI; deterministic later-read controls cover optional-helper exits and zombies with unchanged identities, persistent unreadability/reuse, strict required identities/persona pairs and observed contradictions (wrong group then exit; changed start plus zombie or exit). Real scratch broker/tmux controls cover fixed inputs/environment/profile, output/status/actual CLI identity, exact TERM/INT/HUP relay before/after PID discovery with bounded interruption (the after-discovery case waits for the client's PID-consumption acknowledgement), ordinary starts, two personas/empty restart and real PID-classifier cleanup; real-CLI baseline controls execute membership's pre-case mark and reject cross-group/identity/unavailable counters. Changed shell files are parsed in the test job; these unit controls supply no native cgroup or burst-performance evidence. |
 | tests/integration/test-19-fmk-reuse.sh, test-23-fmk-latch-recheck.sh | fmk-kit-followups.test.ts | The real mark-window shell block preserves epoch milliseconds under mawk. Extracted sweep-latch checks require one correctly parented Full Row get between list and latch, reject missing/duplicate/early/wrong-ID calls, permit later gets, and retain the list timer for both sweep-latched cases. |
 | tests/integration/lib/scenario.sh | fmk-mark-caller.test.ts | Row attribution requires matching state and every label; permission-list traffic cannot claim a waiting-row mark, and competing eligible callers remain ambiguous. |
 | src/, tests/integration/fixtures/ and tests/test-helpers/ source audits | fmk-source-audit.test.ts | Population-builder image boundaries, sanctioned process starts, lexer coverage and agent-director error-class imports/classification; planted violations and clean controls reject name-based classification and stale exemptions. Split recovery compositions bind guards to helper plus actual test-66/67 callers, retaining removal mutants and the final stopped-worker/snapshot chunk callback. The real test-67 arguments-file command retains the exact 6,001-character payload and binding controls, production config parsing and independent chunk expectation. All four recovery entrypoints retain short/full selection and duplicate-number refusal. |
@@ -981,46 +983,57 @@ the same scratch storage meanwhile. Resolve
 prerequisite closure and retain SELECTIVE verdicts and reader exit 3;
 the caller judges combined coverage separately.
 
-The bounds measure CSCB, so the tests' own burst driver (`sr8-evidence.ts`
-`burst`, `fault-burst` and `fault-recover`) runs off the measured server's
-CPU quota. Test 44 and every strict/open membership group run in
-[burst-driver shards](../docker/README.md#burst-driver-shards): the server
-keeps 2 CPUs of `cpu.max` quota, as in every shard, shared as before with the
-Slack stub, the scripts and the runner. `tests/integration/fixtures/burst-driver.sh`
-hands each driver run to a launcher born in its own group beside the server's,
-at 0.9 CPU, and the cgroup each run ran in is recorded. The container has
-4 CPUs (`CPUS_PER_SHARD` + `DRIVER_CPUS`), so 1.1 CPU is headroom above both groups.
-The runner's naming-family classifier includes every suffixed membership
-entrypoint. Admission reserves the two extra CPUs per driver-bearing shard;
-multiple driver scripts in a shard add them only once. These shards retain
-`--init`, private cgroup namespaces and writable cgroups. Recovery groups
-remain ordinary no-model, non-burst workloads.
+The bounds measure CSCB, so Test 44 and every strict/open membership group
+give `shard/server`'s 2 CPUs to the CSCB tree alone. The split keeps all
+harness load off that quota: the runner, scripts/helpers, Slack stub and
+harness-born tmux/persona/MCP trees use `shard/harness` at 1 CPU, while the
+burst launcher, drivers and member sampler use `shard/driver` at 0.9 CPU.
 
-See [Burst-driver shards](../docker/README.md#burst-driver-shards) for the
-launcher allowlist, trust and resource contract. The [Member CPU sampler](../tests/README.md#member-cpu-sampler)
-reference covers its separate `member-cpu-cgroup` record, output and lifecycle.
+Burst-driver containers have 5 CPUs (`CPUS_PER_SHARD` + `DRIVER_CPUS`),
+leaving 1.1 CPU of headroom above the groups' combined 3.9. Admission reserves
+three extra CPUs per possible driver-bearing shard, once per shard even with
+several driver scripts; ordinary shards and recovery groups retain their path.
 
-While the measured server still runs, `driver-cpu` reads `<OUT>/driver-cgroup` and the
-server's cgroup. As the server's UID, from the server's group, it opens every
-guarded cgroup file on both paths write-only, and writes nothing. It passes
-only when:
+See [Burst-driver shards](../docker/README.md#burst-driver-shards) for resource
+admission, the fixed server-start broker, harness tmux lifecycle and both
+launchers' trust contracts. The [Member CPU sampler](../tests/README.md#member-cpu-sampler)
+reference covers its separate `member-cpu-cgroup` record, output and lifecycle;
+its target is now the server-only tree.
 
-- the server's quota is 2 CPUs and the driver's is finite;
-- every cgroup holding both allows both;
-- every present guarded file refused the open.
+While the measured server runs, `driver-cpu` combines
+`<OUT>/driver-cgroup`, its `.harness` sidecar and live placement evidence.
+It requires exact server/driver paths, the server's 2 CPUs, a finite driver
+quota, an exact 1-CPU harness, sufficient common-ancestor headroom and
+runner/script/tmux/persona/MCP placement in the harness. Lost/reused tmux,
+misplaced members or unavailable evidence make it `missing`.
 
-A driver in the server's group or quota, a guarded file that opened (even a
-write-only one), a probe error other than a refusal, or an unreadable
-placement is missing. It checks placement, configured quotas and permissions,
-not throttling. A throttled ancestor (the container's quota) never shows in
-the server group's own `cpu.stat`: its tasks wait runnable, which only its
-`cpu.pressure` shows. With 0.1 CPU of headroom (a 3-CPU container), b.9p6's
-SR-8 runs saw such gaps of up to 313 ms, and a Post Hold released 110 ms late
-fits that class. The 1.1 CPU of headroom keeps the container's quota clear of
-the 2.9 CPUs the groups can use. The entrypoint refuses, and `driver-cpu`
-reports `missing` for, a container with less than 1 CPU of headroom
-(`SR8_CONTAINER_HEADROOM_CPUS`). A passing control still does not rule out
-contention outside the container (the host's own quota or other load).
+The control also checks recorded live server/Slack identities, complete persona
+stub/MCP pairs, Slack in the harness and every live non-tmux server descendant
+in `shard/server`. It skips optional server/harness/tmux helpers proved exited
+during collection only without an observed contradiction; a readable zombie
+must retain the recorded start identity.
+
+An observed wrong group or changed start identity remains `missing` after
+exit; required identity/pair loss and still-present unreadable candidates
+also fail closed. Ten placement fields follow the unchanged `limit=2 verdict=…`
+text, as listed in Docker's reference.
+
+After the burst, the script probes as the server's UID from the harness:
+guarded files on the server/driver/ancestor and harness paths must refuse
+write-only opens, with no writes performed. A successful open or another
+probe error is `missing`; the control checks placement, configured quotas
+and permissions, not throttling.
+
+A throttled ancestor never shows in the server group's own `cpu.stat`:
+its tasks wait runnable, which its `cpu.pressure` shows. Historically, with
+0.1 CPU of headroom in a 3-CPU container, b.9p6's SR-8 runs saw such gaps of
+up to 313 ms, and a Post Hold released 110 ms late fits that class.
+
+The current 5-CPU container leaves 1.1 CPUs above the three groups' 3.9;
+the entrypoint refuses below 4.9, and `driver-cpu` requires at least 1 CPU
+of headroom (`SR8_CONTAINER_HEADROOM_CPUS`). A passing control still does
+not rule out contention outside the container, such as the host's quota or
+other load.
 
 Take populations and burst counts from `tests/test-helpers/thread-populations.ts`:
 0, 10,000 and 100,000 Joined Threads per persona across 100 eligible
@@ -1300,17 +1313,29 @@ Read results against the `recorded: sr8 conditions` line: Bun version, CPUs,
 cgroup memory limit, filesystem type, the state directory's mount and server
 peak RSS. Test 44 captures its largest two-recipient open-mode burst, every
 membership group captures each case, and Test 32 captures each mode's thread
-phase while its measured server still exists. Membership groups also add the server's
-cgroup's `cpu.max`, its 2 CPUs, and that cgroup's throttling deltas since the
-case's start (`unknown` when unreadable). Test 44 and every membership group follow each
+phase while its measured server still exists.
+
+Membership groups also add the server cgroup's `cpu.max`, its 2 CPUs and
+that cgroup's throttling deltas since the case's start. The pre-case
+`cpu-mark` stays before state creation, seeding and either start, explicitly
+marking `/shard/server`, whose cgroup already exists before the daemon.
+
+Its JSON mark records the group path, device/inode identity and readable
+counters; `conditions` subtracts only when the live measured PID has a stable
+start identity in that same cgroup object. Foreign, replaced, old/unidentifiable
+or unreadable marks/counters leave deltas `unknown`; ordinary shared-group
+marks still work without an explicit group.
+
+Test 44 and every membership group follow each
 driver run with `driver-cpu`, which records where the driver and the server
 ran, how many guarded cgroup files a write-only open by the server's UID
-reached and how many it could not probe. The
-fixture's output forms are:
+reached and how many it could not probe. The fixture's output forms follow;
+the ten-field placement tail is listed in
+[Burst-driver shards](../docker/README.md#burst-driver-shards).
 
 ```text
 recorded: sr8 conditions bun=<version> cpus=<count> memory_limit=<limit> fs_type=<type> state_dir_mount=<mount> peak_rss_kib=<KiB>[ cpu_max=<quota|max>/<period> nr_periods_delta=<n> nr_throttled_delta=<n> throttled_usec_delta=<usec>]
-recorded: sr8 driver-cpu scenario=<scenario> mode=<strict|open> population=<joins-per-persona> recipients=<1|2> samples=<driver runs> server_cgroup=<path> server_cpu_max=<quota|max>/<period> server_cpus=<n> server_usage_ms=<ms> driver_cgroup=<path> driver_cpu_max=<quota|max>/<period> driver_cpus=<n> driver_usage_ms=<ms> shared_cpus=<n|none> guarded_files=<n> writable_files=<n> unprobed_files=<n> limit=2 verdict=<pass|missing>
+recorded: sr8 driver-cpu scenario=<scenario> mode=<strict|open> population=<joins-per-persona> recipients=<1|2> samples=<driver runs> server_cgroup=<path> server_cpu_max=<quota|max>/<period> server_cpus=<n> server_usage_ms=<ms> driver_cgroup=<path> driver_cpu_max=<quota|max>/<period> driver_cpus=<n> driver_usage_ms=<ms> shared_cpus=<n|none> guarded_files=<n> writable_files=<n> unprobed_files=<n> limit=2 verdict=<pass|missing> <placement fields>
 recorded: sr8 <measure> scenario=<scenario> mode=<strict|open> population=<joins-per-persona> recipients=<1|2> samples=<count> <statistics> limit=<limit> verdict=<pass|fail|missing|recorded>
 recorded: sr8 summary scenario=<scenario> measures=<count> pass=<count> fail=<count> missing=<count>
 recorded: sr8 membership-fault-row case=<case> source=<fault|fault-settled|api|scan|stub> <fields>

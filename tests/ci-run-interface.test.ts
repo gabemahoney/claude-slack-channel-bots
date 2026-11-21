@@ -1063,7 +1063,7 @@ const CONSTANT_PINS: readonly (readonly [string, unknown, unknown])[] = [
   // CPUs and ranges.
   ['CI_CPUS', CI_CPUS, 12],
   ['CPUS_PER_SHARD', CPUS_PER_SHARD, 2],
-  ['DRIVER_CPUS', DRIVER_CPUS, 2],
+  ['DRIVER_CPUS', DRIVER_CPUS, 3],
   ['BURST_DRIVER_SCRIPTS', BURST_DRIVER_SCRIPTS, /-fmk-(?:thread-burst|membership-load(?:-[a-z0-9]+)*)\.sh$/],
   ['DRIVER_SHARD_SECURITY_OPT', DRIVER_SHARD_SECURITY_OPT, 'writable-cgroups=true'],
   ['DRIVER_SHARD_CGROUPNS', DRIVER_SHARD_CGROUPNS, 'private'],

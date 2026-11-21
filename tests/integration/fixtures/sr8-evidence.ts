@@ -172,9 +172,12 @@
  *     Bun, CPUs, cgroup memory limit, filesystem/mount, server VmHWM (KiB). With a
  *     cpu-mark file, also the server's cgroup cpu_max and the nr_periods/nr_throttled/
  *     throttled_usec deltas since that mark (cpuConditionFields; unknown if unread).
- *   cpu-mark <new-file>
- *     Saves its own cgroup's cpu.stat counters (empty when unreadable) at a case's
- *     start: the server's cgroup, since only the burst driver runs elsewhere.
+ *   cpu-mark <new-file> [<server-cgroup>]
+ *     Saves JSON with the selected group's path, dev/inode identity and readable
+ *     cpu.stat counters at the pre-case mark. Burst cases explicitly select
+ *     /shard/server; conditions matches the measured PID to that same group.
+ *     Ordinary shared-group shards may omit the group; unreadable counters
+ *     remain unavailable. The observer itself can run in /shard/harness.
  *   driver-cpu C <server-pid> <driver-record>
  *     The control that the burst driver ran off the server's CPU quota: placement,
  *     configured quotas and permissions, not throttling. The record is
@@ -546,7 +549,7 @@
  * Post Hold and N4 STRICT limits and the membership hang request duration D-A;
  * each prints signed excess and allowance always.
  */
-import { existsSync, readFileSync, readlinkSync, writeFileSync, appendFileSync, mkdirSync, statSync, statfsSync, openSync, readSync, writeSync, closeSync, constants as fsConstants } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, readlinkSync, writeFileSync, appendFileSync, mkdirSync, statSync, statfsSync, openSync, readSync, writeSync, closeSync, constants as fsConstants } from 'node:fs'
 import { basename, join, resolve } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { cpus } from 'node:os'
@@ -563,7 +566,7 @@ export const SR8_ATTRIBUTION_KINDS: readonly string[] = ['post-hold-timing', 'ev
 export const SR8_USER_HZ = 100
 export type Verdict = 'pass' | 'fail' | 'missing' | 'recorded'
 export interface Context { scenario: string; mode: 'strict' | 'open'; population: number; recipients: number }
-export interface Result { measure: string; samples: number; stats: Record<string, string | number>; limit: string | number; verdict: Verdict }
+export interface Result { measure: string; samples: number; stats: Record<string, string | number>; limit: string | number; verdict: Verdict; placement?: Record<string, string | number> }
 export interface Measurement { v: number; kind: string; key: string; seq?: number; seqs?: number[]; store?: string; at_mono_ms: number; store_ms?: number; held_ms?: number; outcome?: string; cause?: string; start_mono_ms?: number; end_mono_ms?: number }
 export interface Accepted { key: string; seq: number }
 export interface Times { envelope_id: string; push: { sent_mono_ms: number; connection_id: unknown }; acks: { ack_mono_ms: number; connection_id: unknown }[] }
@@ -578,6 +581,7 @@ const result = (measure: string, samples: number, stats: Result['stats'], limit:
 export function resultLine(c: Context, r: Result): string {
   if (!/^[a-zA-Z0-9_-]+$/.test(c.scenario) || !['strict', 'open'].includes(c.mode)) throw new Error('invalid context')
   return `recorded: sr8 ${r.measure} scenario=${c.scenario} mode=${c.mode} population=${c.population} recipients=${c.recipients} samples=${r.samples} ${Object.entries(r.stats).map(([k, v]) => `${k}=${v}`).join(' ')} limit=${r.limit} verdict=${r.verdict}`
+    + Object.entries(r.placement ?? {}).map(([k, v]) => ` ${k}=${v}`).join('')
 }
 export function summary(c: Context, rows: Result[]): string {
   return `recorded: sr8 summary scenario=${c.scenario} measures=${rows.length} pass=${rows.filter(r => r.verdict === 'pass').length} fail=${rows.filter(r => r.verdict === 'fail').length} missing=${rows.filter(r => r.verdict === 'missing').length}`
@@ -1699,7 +1703,10 @@ async function additional(command: string, c: Context, args: string[]): Promise<
     if (!/^\d+$/.test(pid)) throw new Error('usage')
     const runs = text === undefined || !text.endsWith('\n') ? undefined : text.slice(0, -1).split('\n').map(line => cgroupPathOf(`0::${line}`))
     const server = procCgroup(Number(pid))
-    return [driverCpuVerdict(server, runs, cgroupFile, cgroupWriteAccess(guardedCgroups(server, runs), probeCgroupFile))]
+    const paths = [...guardedCgroups(server, runs), '/shard/harness']
+    const base = driverCpuVerdict(server, runs, cgroupFile, cgroupWriteAccess([...new Set(paths)], probeCgroupFile))
+    const harness = harnessCpuEvidence(process.env.SCENARIO_ROOT, process.env.SLACK_STATE_DIR, record, c.recipients, cgroupFile, HARNESS_PROC_ROOT, Number(pid))
+    return [{ ...base, placement: harness.stats, verdict: base.verdict === 'pass' && harness.verdict === 'pass' ? 'pass' : 'missing' }]
   }
   if (command === 'lookup-faults') {
     countArgs(args, 3)
@@ -2354,9 +2361,10 @@ export function cgroupWriteAccess(paths: string[], probe: (path: string, file: s
  * the smallest cpu.max on its path. The server's must be `SR8_SERVER_CPUS`;
  * each recorded driver run's must be finite; and every cgroup holding both
  * (their common ancestors, the server's own when they share it) must allow
- * the server's CPUs plus the driver's plus `SR8_CONTAINER_HEADROOM_CPUS`.
- * The server's UID, checking from the
- * server's group, must be able to open none of the guarded files on either
+ * the server's CPUs plus the driver's, the harness's 1 CPU and
+ * `SR8_CONTAINER_HEADROOM_CPUS`.
+ * The server's UID, checking from the harness after the burst,
+ * must be able to open none of the guarded files on these
  * path for writing, so it can neither move a process nor change a limit.
  * Any other placement, an unreadable path or cpu.max, a writable guarded
  * file, one it could not probe, none checked, or no recorded run is missing.
@@ -2372,8 +2380,8 @@ export function driverCpuVerdict(server: string | undefined, drivers: (string | 
     : cgroupChain(server).filter(path => cgroupChain(driver).includes(path)).map(limit)
   const fits = (driver: string | undefined) => {
     const serverCpus = cpusOf(server), driverCpus = cpusOf(driver), common = shared(driver)
-    return serverCpus === SR8_SERVER_CPUS && driverCpus !== undefined && Number.isFinite(driverCpus)
-      && !!common?.every(c => c !== undefined && c >= serverCpus + driverCpus + SR8_CONTAINER_HEADROOM_CPUS)
+    return server === '/shard/server' && driver === '/shard/driver' && serverCpus === SR8_SERVER_CPUS && driverCpus !== undefined && Number.isFinite(driverCpus)
+      && !!common?.every(c => c !== undefined && c >= serverCpus + driverCpus + 1 + SR8_CONTAINER_HEADROOM_CPUS)
   }
   const shown = (path: string | undefined) => path ?? 'unknown'
   const cpus = (n: number | undefined) => n === undefined ? 'unknown' : Number.isFinite(n) ? round3(n) : 'max'
@@ -2395,6 +2403,142 @@ export function driverCpuVerdict(server: string | undefined, drivers: (string | 
 /** The cgroups driver-cpu checks permissions on: every cgroup on the server's and the drivers' paths, once each, root first. Pure. */
 export function guardedCgroups(server: string | undefined, drivers: (string | undefined)[] | undefined): string[] {
   return [...new Set([server, ...drivers ?? []].flatMap(path => path === undefined ? [] : cgroupChain(path)))]
+}
+
+/** Content-free placement evidence. The tmux PID/start identity is captured
+ * before CSCB starts; inspect its live descendants, never any TUI or environ.
+ * Every configured persona needs both its stub and its MCP client. */
+export function harnessCpuEvidence(root: string | undefined, state: string | undefined, record: string, expected: number,
+  read: CgroupRead, proc = HARNESS_PROC_ROOT, serverPid?: number): Result {
+  const stats: Result['stats'] = { harness_cgroup: '/shard/harness', harness_cpus: 'unknown', runner_cgroup: 'unknown', script_cgroup: 'unknown',
+    tmux_cgroup: 'unknown', persona_stubs: 0, persona_mcps: 0, harness_members: 0, slack_cgroup: 'unknown', server_members: 0 }
+  const answer = (good: boolean) => result('harness-cpu', Number(stats.harness_members), stats, SR8_SERVER_CPUS, good ? 'pass' : 'missing')
+  try {
+    const cpus = cgroupChain('/shard/harness').map(path => cpuMaxCpus(read(path, 'cpu.max')))
+    if (cpus.some(n => n === undefined)) return answer(false)
+    const quota = Math.min(...cpus as number[]); stats.harness_cpus = Number.isFinite(quota) ? quota : 'max'
+    if (quota !== 1 || !root || !state || !Number.isSafeInteger(serverPid)) return answer(false)
+    const group = (pid: number) => cgroupPathOf(textFile(join(proc, String(pid), 'cgroup')))
+    const info = (pid: number) => {
+      const raw = textFile(join(proc, String(pid), 'stat')), fields = raw?.slice(raw.lastIndexOf(') ') + 2).trim().split(/\s+/)
+      return fields && /^[A-Za-z]$/.test(fields[0]) && /^[0-9]+$/.test(fields[1]) && /^[0-9]+$/.test(fields[19])
+        ? { parent: Number(fields[1]), start: fields[19], zombie: fields[0] === 'Z' } : undefined
+    }
+    const recorded = (role: string, wanted?: number) => {
+      const row = textFile(join(root, `harness-${role}`))?.trim().split('\t')
+      if (!row || row.length !== 2 || !/^[1-9][0-9]*$/.test(row[0]) || !/^[0-9]+$/.test(row[1])) throw new Error('identity')
+      const pid = Number(row[0]), current = info(pid)
+      if ((wanted !== undefined && pid !== wanted) || !current || current.zombie || current.start !== row[1]) throw new Error('identity')
+      return { pid, start: row[1] }
+    }
+    const server = recorded('server', serverPid), slack = recorded('slack')
+    const required = new Map([[server.pid, server.start], [slack.pid, slack.start]])
+    // An exit cannot erase an observed placement/identity contradiction.
+    // A zombie proves this helper exited only with the same start identity.
+    const vanished = (member: number, current?: ReturnType<typeof info>, start?: string) => !required.has(member)
+      && !(current && start !== undefined && current.start !== start)
+      && (!existsSync(join(proc, String(member))) || (current?.zombie === true && current.start === start))
+    stats.slack_cgroup = group(slack.pid) ?? 'unknown'
+    if (group(server.pid) !== '/shard/server' || stats.slack_cgroup !== '/shard/harness') return answer(false)
+    const callers = textFile(`${record}.harness`)
+    if (!callers?.endsWith('\n')) return answer(false)
+    for (const line of callers.trimEnd().split('\n')) {
+      if (!/^[1-9][0-9]* [1-9][0-9]*$/.test(line)) return answer(false)
+      const [runner, script] = line.split(' ').map(Number)
+      stats.runner_cgroup = group(runner) ?? 'unknown'; stats.script_cgroup = group(script) ?? 'unknown'
+      if (stats.runner_cgroup !== '/shard/harness' || stats.script_cgroup !== '/shard/harness') return answer(false)
+      for (const member of [runner, script]) {
+        const current = info(member)
+        if (!current || current.zombie) return answer(false)
+        required.set(member, current.start)
+      }
+    }
+    const identity = textFile(join(root, 'harness-tmux'))?.trim().split('\t')
+    if (!identity || identity.length !== 3 || !/^[1-9][0-9]*$/.test(identity[0]) || !/^[0-9]+$/.test(identity[1])
+      || !identity[2].startsWith(join(root, 'tmux') + '/') || !statSync(identity[2]).isSocket()) return answer(false)
+    const config = JSON.parse(readFileSync(join(state, 'config.json'), 'utf8'))
+    const dirs: string[] = config.personas.map((persona: { working_directory: string }) => persona.working_directory)
+    if (dirs.length !== expected || new Set(dirs).size !== expected) return answer(false)
+    const pid = Number(identity[0]), processes = new Map<number, NonNullable<ReturnType<typeof info>>>()
+    required.set(pid, identity[1])
+    for (const name of readdirSync(proc).filter(name => /^[1-9][0-9]*$/.test(name))) {
+      const member = Number(name), current = info(member)
+      if (current?.zombie) continue
+      if (current) processes.set(member, current)
+      else {
+        // Without stat we cannot prove this live PID is outside the trees.
+        // A stale entry whose process has actually vanished is harmless.
+        if (!vanished(member)) return answer(false)
+      }
+    }
+    stats.tmux_cgroup = group(pid) ?? 'unknown'
+    if (processes.get(pid)?.start !== identity[1] || stats.tmux_cgroup !== '/shard/harness') return answer(false)
+    const tree = (parent: number) => {
+      const members = new Set([parent])
+      for (let size = -1; size !== members.size;) {
+        size = members.size
+        for (const [child, entry] of processes) if (members.has(entry.parent)) members.add(child)
+      }
+      return members
+    }
+    const descendants = tree(pid), serverTree = tree(server.pid)
+    const stubs = new Set<string>(), mcps = new Set<string>()
+    const candidates = new Map<number, { cwd: string; entry: string; start: string }>()
+    for (const member of descendants) {
+      const g = group(member), current = info(member)
+      const start = processes.get(member)?.start
+      if ((g !== undefined && g !== '/shard/harness') || (current && current.start !== start)) return answer(false)
+      if (vanished(member, current, start)) continue
+      if (g === undefined || !current || current.zombie) return answer(false)
+    }
+    // Also reject a server-born duplicate outside the recorded tmux tree;
+    // an old correctly placed worker must not hide a misplaced new launch.
+    for (const [member, before] of processes) {
+      const g = group(member), owned = g === '/shard/server' || g === '/shard/harness' || serverTree.has(member) || descendants.has(member)
+      if (g !== undefined && ((descendants.has(member) && g !== '/shard/harness')
+        || (serverTree.has(member) && !descendants.has(member) && g !== '/shard/server'))) return answer(false)
+      if (vanished(member)) continue
+      let cwd: string | undefined
+      try { cwd = readlinkSync(join(proc, String(member), 'cwd')) } catch { /* classify using group/tree */ }
+      if (vanished(member)) continue
+      const raw = textFile(join(proc, String(member), 'cmdline')), entry = basename(raw?.split('\0')[1] ?? '')
+      if (['claude', 'stub-mcp-session.ts'].includes(entry)
+        && ((cwd !== undefined && !dirs.includes(cwd)) || !descendants.has(member) || (g !== undefined && g !== '/shard/harness'))) return answer(false)
+      if (vanished(member)) continue
+      const relevant = owned || g === undefined || dirs.includes(cwd ?? '') || ['claude', 'stub-mcp-session.ts'].includes(entry)
+      if (!relevant) continue
+      const after = info(member)
+      if (after && after.start !== before.start) return answer(false)
+      if (vanished(member, after, before.start)) continue
+      if (cwd === undefined || !raw || !g || !after || after.zombie) return answer(false)
+      if (descendants.has(member)) {
+        if (g !== '/shard/harness') return answer(false)
+        stats.harness_members = Number(stats.harness_members) + 1
+      }
+      if (serverTree.has(member) && !descendants.has(member)) {
+        if (g !== '/shard/server') return answer(false)
+        stats.server_members = Number(stats.server_members) + 1
+      }
+      if (!['claude', 'stub-mcp-session.ts'].includes(entry)) continue
+      if (!dirs.includes(cwd)) return answer(false)
+      if (!descendants.has(member) || g !== '/shard/harness') return answer(false)
+      candidates.set(member, { cwd, entry, start: after.start })
+    }
+    // A vanished optional helper is harmless, but losing the only stub/MCP
+    // for a persona still leaves incomplete evidence. Reuse/unreadability
+    // cannot be hidden by another valid pair either.
+    for (const [member, candidate] of candidates) {
+      const g = group(member), current = info(member)
+      if ((g !== undefined && g !== '/shard/harness') || (current && current.start !== candidate.start)) return answer(false)
+      if (vanished(member, current, candidate.start)) continue
+      if (!current || current.zombie || g === undefined) return answer(false)
+      ;(candidate.entry === 'claude' ? stubs : mcps).add(candidate.cwd)
+    }
+    stats.persona_stubs = stubs.size; stats.persona_mcps = mcps.size
+    // Recheck after scanning: a lost/reused server cannot pass on stale metadata.
+    return answer(stubs.size === expected && mcps.size === expected
+      && [...required].every(([member, start]) => { const current = info(member); return current?.start === start && !current.zombie }))
+  } catch { return answer(false) }
 }
 
 /** The cgroup's cpu.stat counters: v2 usage/user/system microseconds, and the
@@ -2764,6 +2908,7 @@ async function membershipAckObservation(c: Context, args: string[]): Promise<Res
 }
 /** The cgroup v2 namespace root's mount. */
 const CGROUP_ROOT = '/sys/fs/cgroup'
+const HARNESS_PROC_ROOT = '/proc'
 /** A cgroup v2 file of the cgroup at `path` below the namespace root. */
 const cgroupFile = (path: string, file: string) => textFile(join(CGROUP_ROOT, path, file))
 /**
@@ -2792,11 +2937,24 @@ function cgroupCpuMax(path: string) {
   return quota === undefined || period === undefined ? undefined : `${quota === '-1' ? 'max' : quota} ${period}`
 }
 const cgroupCpuStat = (path: string) => cgroupFile(path, 'cpu.stat') ?? (path === '/' ? textFile('/sys/fs/cgroup/cpu/cpu.stat') : undefined)
-/** The case's mark: this process's cgroup, the measured server's (the burst driver alone runs elsewhere). */
+/** Baseline before case setup/start, from the named measured group. Record
+ * its filesystem identity so conditions cannot subtract another group's
+ * counters. Ordinary shards may omit the group because script/server share
+ * it. The measured daemon need not exist yet; conditions checks its live PID. */
 function cpuMark(args: string[]) {
-  countArgs(args, 1)
-  const stat = cgroupCpuStat(cgroupOfPid('self'))
-  writeFileSync(args[0], cpuThrottle(stat) ? stat! : '', { flag: 'wx' })
+  countArgs(args, 1, 2)
+  const group = args[1] ?? procCgroup('self')
+  if (group !== undefined && cgroupPathOf(`0::${group}`) !== group) throw new Error('usage')
+  const identity = group === undefined ? undefined : cgroupIdentity(group)
+  const stat = group === undefined ? undefined : cgroupCpuStat(group)
+  writeFileSync(args[0], JSON.stringify({ group, identity, stat: cpuThrottle(stat) ? stat : undefined }), { flag: 'wx' })
+}
+function cgroupIdentity(group: string): string | undefined {
+  try { const s = statSync(join(CGROUP_ROOT, group), { bigint: true }); return `${s.dev}:${s.ino}` } catch { return undefined }
+}
+function processStart(pid: number): string | undefined {
+  const raw = textFile(join(HARNESS_PROC_ROOT, String(pid), 'stat')), fields = raw?.slice(raw.lastIndexOf(') ') + 2).trim().split(/\s+/)
+  return fields && fields[0] !== 'Z' && /^[0-9]+$/.test(fields[19]) ? fields[19] : undefined
 }
 function conditions(args: string[]) {
   countArgs(args, 2, 3)
@@ -2805,8 +2963,17 @@ function conditions(args: string[]) {
   const memory = textFile('/sys/fs/cgroup/memory.max')?.trim() ?? textFile('/sys/fs/cgroup/memory/memory.limit_in_bytes')?.trim() ?? 'unknown'
   const mount = (textFile('/proc/self/mountinfo') ?? '').split('\n').map(l => l.split(' ')).filter(s => s[4] && (resolve(state) === s[4] || resolve(state).startsWith(s[4].replace(/\/$/, '') + '/'))).sort((a, b) => b[4].length - a[4].length)[0]?.[4] ?? 'unknown'
   const peak = textFile(`/proc/${pid}/status`)?.match(/^VmHWM:\s+(\d+) kB$/m)?.[1] ?? 'unknown'
-  const server = cgroupOfPid(Number(pid))
-  const cpu = mark === undefined ? '' : ` ${cpuConditionFields(cgroupCpuMax(server), textFile(mark), cgroupCpuStat(server))}`
+  const start = processStart(Number(pid)), server = procCgroup(Number(pid))
+  let before: string | undefined, now: string | undefined
+  if (mark !== undefined && server !== undefined && start !== undefined) {
+    try {
+      const baseline = JSON.parse(textFile(mark) ?? '')
+      now = cgroupCpuStat(server)
+      if (baseline.group === server && baseline.identity !== undefined && baseline.identity === cgroupIdentity(server)
+        && processStart(Number(pid)) === start && procCgroup(Number(pid)) === server) before = baseline.stat
+    } catch { /* unavailable/old/foreign marks yield unknown deltas */ }
+  }
+  const cpu = mark === undefined ? '' : ` ${cpuConditionFields(server === undefined ? undefined : cgroupCpuMax(server), before, now)}`
   console.log(`recorded: sr8 conditions bun=${Bun.version} cpus=${cpus().length} memory_limit=${memory} fs_type=${statfsSync(state).type} state_dir_mount=${mount} peak_rss_kib=${peak}${cpu}`)
 }
 /** `member-cpu <case-kind> <out> <server-pid> <slack-pid> <case-root> <max-ms> <P> <Q>`:

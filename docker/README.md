@@ -674,11 +674,13 @@ names it. A `cscb-ci=1` container is picked by its label, whatever its name.
 The CPU fit counts the CPUs of every other live `/ci` reservation;
 `/ci-live` adds none.
 
-A shard holding test-44 or any strict/open membership-load group takes two
+A shard holding test-44 or any strict/open membership-load group takes three
 more CPUs than the 2 its server keeps (`DRIVER_CPUS`), once per shard even
-with several such scripts: 0.9 for the burst load driver and 1.1 of headroom
-(see [Burst-driver shards](#burst-driver-shards)). Admission comes before
-scheduling places those scripts, so for N shards it counts two more CPUs for
+with several such scripts: 0.9 for the burst load driver, 1 for the harness
+and 1.1 of headroom (see [Burst-driver shards](#burst-driver-shards)).
+
+Admission comes before scheduling places those scripts, so for N shards it
+counts three more CPUs for
 each of the run's burst-driver scripts, at most N; the reservation records
 the same CPUs.
 
@@ -688,7 +690,7 @@ the same CPUs.
 |---|---|
 | Memory | U + the commitments + N × the ordinary cap + 2 GiB per Codex shard + the 1 GiB admission margin ≤ C, and no container blocks every run |
 | Disk | (used + 1 GiB) ÷ (used + available) < 85% on the volume holding the run directory. The 1 GiB is an allowance for the run's own files; the 85% is `/ci`'s own disk line |
-| CPU | The other live reservations' CPUs + 2 × N + 2 × the smaller of N and the run's burst-driver scripts ≤ the 12 CI CPUs |
+| CPU | The other live reservations' CPUs + 2 × N + 3 × the smaller of N and the run's burst-driver scripts ≤ the 12 CI CPUs |
 
 The disk fit uses actual allocated filesystem blocks and available space;
 it does not discount temporary usage. The tarball is packed under the run
@@ -767,12 +769,14 @@ with a 64 GiB pod limit:
 - While a `/ci-live` run is active, C is 40 GiB and that run counts 13 GiB,
   so no `/ci` run fits once U is above 24 GiB.
 - The complete split burst workload population exceeds the maximum shard
-  count. A default full run can therefore fit at most 3 shards in an otherwise
-  unoccupied CPU budget: 6 + 6 = 12 CPUs; 4 shards would need 16. A second
-  default full run beside it is refused for CPU. At its isolation minimum of
-  two shards, the dedicated Codex shard and one ordinary shard, it needs
-  4 + 4 = 8 CPUs, with none free beside the 3-shard run.
-- Selective runs depend on their selected burst population; three is not a
+  count. A default full run can therefore fit at most 2 shards in an otherwise
+  unoccupied CPU budget: admission reserves 4 + 6 = 10 CPUs; 3 shards would
+  need 15 and 4 would need 20.
+
+  At its isolation minimum of two shards, the dedicated Codex shard and one
+  ordinary shard, it still reserves 10 CPUs, leaving 2 of the 12. A second
+  default full run cannot fit beside it.
+- Selective runs depend on their selected burst population; two is not a
   universal cap. A run without burst scripts takes 2 CPUs a shard, so a
   6-shard run holds all 12 CI CPUs and leaves none for another run.
 
@@ -856,7 +860,7 @@ rename), with these keys:
 | `runId`, `pid` | the run's RUN_ID and PID |
 | `shards` | N |
 | `memoryBytes` | N × the ordinary per-shard memory cap + 2 GiB per dedicated Codex shard |
-| `cpus` | 2 × N + 2 × the smaller of N and the run's burst-driver scripts |
+| `cpus` | 2 × N + 3 × the smaller of N and the run's burst-driver scripts |
 | `kind` | `full` or `selective` |
 
 - **Its lifetime.** A reservation lives until its run ends: the run removes
@@ -984,10 +988,10 @@ then its suffix:
   the full form shows `(page cache unknown)` in place of
   `(page cache <f> GiB)`.
 
-For example, a kill in shard-3 of a default full run at a 2.0 GiB cap:
+For example, a kill in shard-2 of a default full run at a 2.0 GiB cap:
 
 ```text
-cap from measured anon peak: 2.00 GiB in shard-3 (killed for out of memory at the cap) + 1 GiB margin → 3.0 GiB; current cap 2.0 GiB; source after out-of-memory kill in shard-3
+cap from measured anon peak: 2.00 GiB in shard-2 (killed for out of memory at the cap) + 1 GiB margin → 3.0 GiB; current cap 2.0 GiB; source after out-of-memory kill in shard-2
 ```
 
 **The suffix** says whether the run is a cap source:
@@ -1076,7 +1080,7 @@ image's build succeeded, and from the pinned ID when it did not (see
 | `--memory` | The per-shard memory cap, in bytes | Each shard is held to the cap admission counted it at (see [The per-shard memory cap and out-of-memory kills](#the-per-shard-memory-cap-and-out-of-memory-kills) for its value and rules) |
 | `--memory-swap` | The same as `--memory` | No swap above the cap: past it the kernel kills a process inside the container instead of swapping |
 | `--pids-limit` | `2048` | Stops a fork or spawn loop inside one shard long before it reaches the host |
-| `--cpus` | `2`, or `4` for a burst-driver shard | The CPUs admission reserves per shard (see [Admission: memory, disk and CPU](#admission-memory-disk-and-cpu) for the CPU budget) |
+| `--cpus` | `2`, or `5` for a burst-driver shard | The CPUs admission reserves per shard (see [Admission: memory, disk and CPU](#admission-memory-disk-and-cpu) for the CPU budget) |
 
 **Isolation.** A shard is on the default network only. No list sets
 `--network`, `--privileged`, or a PID, IPC or network namespace shared with
@@ -1095,7 +1099,7 @@ four things to an ordinary shard's:
 
 | Flag | Why |
 |---|---|
-| `--cpus 4` | The server keeps the 2 CPUs of quota every shard has; the driver takes 0.9 and 1.1 is headroom |
+| `--cpus 5` | The server alone keeps 2 CPUs; the driver takes 0.9, the harness 1 and 1.1 is headroom |
 | `--cgroupns private` | The cgroup the shard sees, and may write, is its own, whatever the daemon's default namespace mode |
 | `--security-opt writable-cgroups=true` | The entrypoint can make CPU groups inside the container's own cgroup, with no added capability |
 | `--init` | Docker's init is PID 1, so the container's main process stays in the container's cgroup, where the runner reads its memory and PIDs |
@@ -1109,9 +1113,17 @@ the container's own: the entrypoint at its namespace's root (`0::/`), listed in
 the mount root's `cgroup.procs`. It then splits the container's cgroup with
 the threaded `cpu` controller:
 
-- Everything it starts, the in-container runner, scripts, Slack stub and
-  server alike, runs in `shard/server` at `cpu.max` 200000/100000, the same
-  2 CPUs as before.
+- Only the CSCB tree runs in `shard/server` at `cpu.max` 200000/100000:
+  the start CLI, daemon and direct product children. The entrypoint starts
+  the fixed `server-start.sh` broker there, so the server's 2-CPU quota is
+  the server's alone.
+- `shard/harness`, at 1 CPU, holds the runner, scripts and helpers, Slack
+  stub, scenario tmux server, persona stubs and their MCP children. Before
+  each brokered CSCB start, the harness starts or verifies its real tmux
+  server on the scenario socket, with `exit-empty` off so it survives empty
+  sessions across stop/restart. It records PID/start identity/socket for
+  placement checks and cleanup, which also reaps an empty owned server;
+  agent-director still owns agent rows, launches and state.
 - The driver's launcher, `tests/integration/fixtures/burst-driver.sh --serve`,
   is born in `shard/driver`, at 0.9 CPU, and runs as testuser. A
   test's `burst-driver.sh` passes it each driver run, which starts there, so
@@ -1139,29 +1151,96 @@ the threaded `cpu` controller:
   `<OUT>/member-cpu-cgroup` record, leaving the burst's `driver-cpu` verdict
   input unchanged. With no launcher it runs in place; its summary reports
   both sampler and target cgroups (see [Optional test diagnostics](../tests/README.md#optional-test-diagnostics)).
+
+  Each launcher request also records runner/script PIDs in the separate
+  `<record>.harness` sidecar. The burst verdict uses
+  `<OUT>/driver-cgroup.harness` alongside `<OUT>/driver-cgroup`.
 - testuser, the server's UID, owns no cgroup file, so it cannot move any
   process into another group or change any limit. Only the entrypoint runs as
-  root, and it creates the groups and places the launcher before it drops to
+  root, and it creates the groups and places both launchers before it drops to
   testuser.
-- The 1.1 CPU left is headroom, so the container's 4-CPU quota stays clear
-  of the 2.9 CPUs the two groups can use. With 0.1 CPU of headroom (a 3-CPU
-  container), the control probes recorded 5 ms and 1.1 s of container-level
+- The 1.1 CPU left is headroom above the three groups' combined 3.9 CPUs
+  in the 5-CPU container. The entrypoint refuses a container quota below
+  4.9 CPUs (less than 1 CPU of headroom, `SR8_CONTAINER_HEADROOM_CPUS`), and
+  `driver-cpu` is `missing` for one; the server's quota stays exactly 2.
+
+  Historically, with 0.1 CPU of headroom in the former two-group, 3-CPU
+  container, the control probes recorded 5 ms and 1.1 s of container-level
   throttling under saturated loops. In b.9p6's SR-8 runs, the server's group
   sat runnable but not running for gaps of up to 313 ms: high `cpu.pressure`
   with no throttle in its own `cpu.stat`, the signature of a throttled
-  ancestor; a Post Hold released 110 ms late fits that class. Throttling at an
-  ancestor never shows in `shard/server/cpu.stat`. The entrypoint refuses a
-  container quota below 3.9 CPUs (less than 1 CPU of headroom above the
-  server's 2 and the driver's 0.9, `SR8_CONTAINER_HEADROOM_CPUS`), and
-  `driver-cpu` is `missing` for one. It always sets
-  the server's group to exactly 2 CPUs, whatever the container's quota.
+  ancestor; a Post Hold released 110 ms late fits that class. Throttling at
+  an ancestor never shows in `shard/server/cpu.stat`.
+
+**Server starts.** `tests/integration/fixtures/server-start.sh` is a
+CI-image-only fixed-command broker, born in `shard/server` as testuser.
+Its spool `/run/cscb-burst-driver-server` stays root-owned, with a
+group-accessible request FIFO and testuser-owned jobs directory for IPC.
+
+A request carries seven NUL-separated fields: `start`, scenario root, state
+directory, dry-run flag, loopback Slack API URL, diagnostics flag and optional
+profile directory. The broker validates canonical scenario paths, constructs
+the environment and runs fixed Bun/CLI paths from `/test-repo`. Bun, the
+broker, its directory and spool must pass the ownership/write-permission
+trust checks.
+
+The launcher keeps the start command, accepted inputs and environment fixed
+so harness work does not enter `shard/server` by accident; callers cannot
+choose the program, `PATH`, loader or environment. It grants no new privilege
+and does not protect the product from a tampering caller: the CLI lives in
+testuser-owned `/test-repo`, as on the direct `cscb start` path, and the
+fail-closed placement check catches accidental contamination.
+
+Existing profiling relays only the exact trusted `cpu-profile-preload.ts`
+and a scenario-contained output directory. The broker relays stdout/stderr,
+status and termination, and records the actual start CLI PID/start identity
+in `cscb-processes`. Without its spool, ordinary shards and host starts keep
+the original start path, environment and cwd, with no harness tmux pre-start.
+
+A separate per-request signal FIFO relays TERM, INT and HUP exactly, before
+and after the client learns the CLI PID. The first interruption sets a 5 s
+broker deadline before KILL and reaping of an unresponsive CLI, and a 6 s
+client deadline bounds interrupted submission and output-reader cleanup.
 
 Memory, PID and OOM figures stay the container's, as in any shard. While the
-measured server runs, the script's `driver-cpu` verdict checks the placement,
-the configured quotas and the server's UID's permissions (a write-only open of
-each guarded cgroup file must be refused; any other probe error is missing),
-not throttling (see
-[Thread Memory performance runs](../docs/testing-guide.md#thread-memory-performance-runs)).
+measured server runs, `driver-cpu` requires exact server/driver placement,
+the server's 2-CPU quota, a finite driver quota and the harness's exact finite
+1-CPU quota, plus sufficient common-ancestor headroom.
+
+Recorded PID/start identities must match the live measured server and Slack
+stub, with Slack in `shard/harness`. The collector rechecks recorded birth
+identities after scanning and requires every live measured-server descendant
+outside the recorded tmux/persona tree in `shard/server`.
+
+From the harness after the burst, the script checks as the server's UID that
+every guarded cgroup file on server, driver, ancestor and harness paths refuses
+a write-only open; it writes nothing. The recorded live tmux PID/start/socket
+must remain valid, with runner/script PIDs and all tmux descendants in
+`shard/harness`.
+
+Each configured persona needs a complete stub/MCP pair, revalidated in that
+tmux tree; recognized live duplicates outside it or the harness also fail
+the check. Recorded server/Slack/tmux and runner/script identities must remain
+live and unchanged through the final check.
+
+A non-required server child or harness/tmux helper is skipped only when it
+genuinely exits between enumeration and a later read with no contradiction
+already observed; a readable zombie counts as that helper's exit only with
+the same recorded start identity. A helper observed in the wrong group or
+with a changed start identity stays `missing` even if it then exits, in the
+main loop, tmux-descendant loop and final persona-candidate revalidation.
+
+Still-present unreadable candidates and loss of a required identity or a
+persona's only stub/MCP remain `missing`. Unrelated processes may have
+inaccessible cwd/command metadata when readable identity and group establish
+that they are outside the measured trees.
+
+Ten placement fields follow the unchanged `limit=2 verdict=…` text:
+`harness_cgroup`, `harness_cpus`, `runner_cgroup`, `script_cgroup`,
+`tmux_cgroup`, `persona_stubs`, `persona_mcps`, `harness_members`,
+`slack_cgroup` and `server_members`.
+This checks placement, quotas and permissions, not throttling or contention
+outside the container (see [Thread Memory performance runs](../docs/testing-guide.md#thread-memory-performance-runs)).
 
 **Mounts.** Each mount is a `--mount type=bind,...`, never `-v`, so Docker
 never creates a missing source: every source is a file or directory the
@@ -1580,9 +1659,14 @@ jobsched submit --context <ctx> --name adg-<cscb version>-<cand|ref>-s<k> --chan
   at v0.19.1) of a tag whose `docker/entrypoint.sh` splits the driver's CPU
   (`split_driver_cpu`, v0.19.0 on) gets `--cgroups writable` and that tag's
   own CI burst-shard CPUs, `CPUS_PER_SHARD + DRIVER_CPUS` from the tag's
-  `scripts/ci-run.ts`: 4 for v0.19.1, 3 for v0.19.0. The scheduler then runs
-  it in a private cgroup namespace with its own cgroup writable, which the
-  entrypoint needs to keep the server's quota apart from the driver's (see
+  `scripts/ci-run.ts`: 4 for v0.19.1, 3 for v0.19.0. The current tree uses
+  5 CPUs and the server-only/harness split described in
+  [Burst-driver shards](#burst-driver-shards); historical tags keep their own
+  constants and layout.
+
+  The scheduler then runs it in a private cgroup namespace with its own
+  cgroup writable, which the entrypoint needs to keep the server's quota
+  apart from the driver's (see
   [Burst-driver shards](#burst-driver-shards)); its `driver-cpu` verdict is
   otherwise `missing`. `prepare.sh` records the CPUs and the tag's
   `BURST_DRIVER_SCRIPTS` source as the manifest's `burst_driver`; it fails
@@ -1590,11 +1674,14 @@ jobsched submit --context <ctx> --name adg-<cscb version>-<cand|ref>-s<k> --chan
   is declared exactly once and the entrypoint splits, or, for a tag with no
   `DRIVER_CPUS`, unless the entrypoint does not split (`burst_driver`
   null: that tag's CI ran these scripts in ordinary shards, and so does the
-  gate). The driver refuses a tag whose pattern is not the kit's own, and a
+  gate).
+
+  The driver refuses a tag whose pattern is not the kit's own, and a
   `burst_driver` asking for more than the scheduler's maximum of 8 CPUs. A
   shard with no burst-driver script keeps `--cpus 2` and the scheduler's
-  read-only cgroup, and no such shard ever gets `--cgroups writable`. At
-  v0.19.x, though, the burst scripts take about a third of the tag's
+  read-only cgroup, and no such shard ever gets `--cgroups writable`.
+
+  At v0.19.x, though, the burst scripts take about a third of the tag's
   measured time, so in practice every planned shard holds one: a full
   gate's candidate shards all run as burst-driver shards (six planned
   shards at v0.19.1, each with 4 CPUs, submitted serially), as does each
@@ -1602,17 +1689,21 @@ jobsched submit --context <ctx> --name adg-<cscb version>-<cand|ref>-s<k> --chan
   only an `--only` subset or a reference rerun without one gets 2-CPU
   shards. Each shard's CPUs and cgroup setting, as `jobsched status`
   reports them, are in `report.md`'s shard table and `verdict.json`'s
-  `jobs`. The job has no `--init` (the scheduler offers none), so
+  `jobs`.
+
+  The job has no `--init` (the scheduler offers none), so
   `entry.sh` must stay PID 1 and start the tag's `entrypoint.sh` as a
-  child, never `exec` it: that entrypoint splits the cgroup only when its
-  own PID is not 1, and would otherwise skip the split silently. A
-  writable cgroup would let the job rewrite its own limits, so the
+  child, never `exec` it. That entrypoint splits the cgroup only when its
+  own PID is not 1, and would otherwise skip the split silently.
+
+  A writable cgroup would let the job rewrite its own limits, so the
   scheduler's supervisor watches the container cgroup's own `memory.max`,
   `memory.swap.max`, `cpu.max` and `pids.max` and stops a job that changes
   one: it ends `failed` with outcome `cgroup-limit-changed` and its run is
   cut short, so the gate FAILs that shard, and `verdict.json`'s
   `jobs[].reason` names the change. The tag's entrypoint sets CPU quotas
-  only on its child groups `shard/server` and `shard/driver`, never on the
+  only on its child groups (`shard/server`, `shard/driver` and, in the
+  current layout, `shard/harness`), never on the
   container's own cgroup, the only one the supervisor watches; so that
   outcome means a changed entrypoint or test wrote one of the container's
   own limit files.

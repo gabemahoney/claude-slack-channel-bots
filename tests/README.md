@@ -666,8 +666,23 @@ and undurable. Tests 45/48 select hang; strict 51–57 and open 58–64 select
 the remaining groups in that order. Every case freshly seeds and reopens
 100,000 joins per persona P and Q, with the full original bursts, ordered
 writes, fault/recovery accounting, seal/compaction checks and numerical bounds.
-Test 44 and every membership group use separated server/driver CPU cgroups;
-see [Thread Memory performance runs](../docs/testing-guide.md#thread-memory-performance-runs).
+
+Test 44 and every membership group give the CSCB tree its own server CPU
+group, with separate driver and harness groups. The required `driver-cpu`
+control checks runner/script/Slack/tmux/persona/MCP placement and the measured
+server's non-tmux descendants, with live recorded server/Slack/tmux identities,
+quotas and permissions. Loss of required identities or complete persona pairs,
+unreadable live candidates and observed placement/identity contradictions make
+it `missing`; an optional helper's proven exit is skipped only without a
+contradiction, with zombies requiring the same recorded start identity.
+
+Burst starts go through the fixed server-start broker after the harness
+establishes its own persistent scenario tmux server; ordinary shards and host
+starts keep their original path. See [Burst-driver shards](../docker/README.md#burst-driver-shards)
+for the broker, exact signal relay and interruption bounds, socket lifecycle
+and placement fields, and
+[Thread Memory performance runs](../docs/testing-guide.md#thread-memory-performance-runs)
+for performance/accounting interpretation.
 
 Recovery tests 46/65/66/67 are independent shared-mode, no-model, non-burst
 groups. Each sources `lib/scenario.sh` first, then the recovery helper, with
@@ -706,12 +721,25 @@ boundaries. Seed/seal and reopen starts, later-hang, open membership, new
 membership groups and recovery groups gain no profiling. Required measurement records,
 startup/performance evidence and numerical verdicts remain active in both states.
 
+The burst server-start broker relays existing profile requests only through
+the exact trusted preload and scenario-contained output directory. Its fixed
+relay adds no profiling opt-in or scope; `cgroup-harness.test.ts` and
+`cpu-profile.test.ts` cover that boundary.
+
 #### Member CPU sampler
 
 The membership-load sampler requires both `CSCB_TEST_DIAGNOSTICS=1` and
 `SR8_MEMBER_CPU=all` or a comma list containing the exact case kind, such as
 `SR8_MEMBER_CPU=first-rate,later-rate`. With either gate off it starts no
 process, writes no file, prints no line and performs no optional wait.
+
+The sampler still runs in the driver group and targets `shard/server`, which
+now holds the CSCB tree alone. The required placement control includes Slack
+and server descendants as well as harness exclusion. `cgroup-harness.test.ts`
+covers deterministic later-read exit/readability/reuse controls and
+contradictions retained after exit, same-cgroup baselines and signal/tmux
+cleanup using fake proc/cgroup trees and real scratch broker/tmux processes;
+these controls establish no native timing.
 
 For a scheduler/AD-kit diagnostic, pass both names through `jobsched submit`'s
 `--env` options. They inherit through the container's `/opt/ad-gate/entry.sh`,

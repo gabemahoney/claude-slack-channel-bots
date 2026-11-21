@@ -27,7 +27,7 @@ byte_mark() { if [[ -e "$1" ]]; then stat -c %s "$1"; else printf '0\n'; fi; }
 # exits with the command's own status (64 for a usage error, 137 when killed).
 sr8_verdicts() {
     local rows="${EVIDENCE}/verdicts.txt" status=0 line name failed=()
-    local verdict_re='^recorded: sr8 ([^ ]+) .* verdict=(fail|missing)$' persona_re=' persona=([^ ]+) '
+    local verdict_re='^recorded: sr8 ([^ ]+) .* verdict=(fail|missing)( |$)' persona_re=' persona=([^ ]+) '
     bun "${SR8}" "$@" > "${rows}" || status=$?
     cat "${rows}"
     (( status == 0 )) && return 0
@@ -134,6 +134,7 @@ bun "${SCENARIO_FIXTURES}/slack-stub-server.ts" --record "${SCENARIO_SLACK_RECOR
 SLACK_PID=$!
 track_pid "${SLACK_PID}"
 wait_for_file "${EVIDENCE}/slack-ready.json" 20 'Slack stub readiness'
+_scenario_placement_identity slack "${SLACK_PID}"
 CSCB_SLACK_API_URL="$(jq -er .api_url "${EVIDENCE}/slack-ready.json")"
 export CSCB_SLACK_API_URL
 [[ "${CSCB_SLACK_API_URL}" =~ ^http://127\.0\.0\.1:[0-9]+/api/$ ]] || fail 'Slack stub URL is not loopback'

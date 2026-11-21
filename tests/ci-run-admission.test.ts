@@ -3154,8 +3154,8 @@ describe('admission: admission readings, /ci-live, commitments, fits and refusal
     })
 
     test.each([
-      [1, 0, 2], [1, 3, 4], [3, 3, 12], [4, 3, 14], [5, 3, 16], [6, 3, 18], [6, 1, 14], [2, 0, 4],
-    ])('burst-driver scripts: %p shard(s) with %p of them take %p CPUs, two more for each shard that can hold one', (shards, driverScripts, cpus) => {
+      [1, 0, 2], [1, 3, 5], [3, 3, 15], [4, 3, 17], [5, 3, 19], [6, 3, 21], [6, 1, 15], [2, 0, 4],
+    ])('burst-driver scripts: %p shard(s) with %p of them take %p CPUs, three more for each shard that can hold one', (shards, driverScripts, cpus) => {
       expect(runCpus(shards, driverScripts)).toBe(cpus)
       expect(cpuFits(CI_CPUS - cpus, shards, driverScripts)).toBe(true)
       expect(cpuFits(CI_CPUS - cpus + 1, shards, driverScripts)).toBe(false)
@@ -3168,7 +3168,7 @@ describe('admission: admission readings, /ci-live, commitments, fits and refusal
       expect(driverScripts).toBeGreaterThan(MAX_SHARDS)
       const plain = admittedOf(decideAdmission(figures, defaultFullRun(), rig.listResultsDirs))
       const driven = admittedOf(decideAdmission(figures, { ...defaultFullRun(), driverScripts }, rig.listResultsDirs))
-      expect([plain.shards, driven.shards]).toEqual([MAX_SHARDS, 3])
+      expect([plain.shards, driven.shards]).toEqual([MAX_SHARDS, 2])
       expect(driven.limitsAtNext).toEqual(['cpu'])
       const pinned = decideAdmission(figures, { ...defaultFullRun(), canChooseShards: false, driverScripts }, rig.listResultsDirs)
       expect(refusalOf(pinned).summary).toBe(`${MAX_SHARDS} shard(s) need ${runCpus(MAX_SHARDS, driverScripts)} CPUs; active /ci runs hold 0 of the ${CI_CPUS} CI CPUs`)
