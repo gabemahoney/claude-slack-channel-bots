@@ -519,7 +519,7 @@ Any append attempt, saved or failed, invalidates that proof. A skip writes no te
 
 Every other compaction, startup included, rewrites in full: temporary-file write, file fsync, rename, directory fsync. Temp-image writes use at most `THREAD_MEMORY_REWRITE_CHUNK_BYTES` (256 KiB) before yielding to the event loop; appends and queue rewrites keep their whole-buffer writes. Read/create clears proof; failure at any rewrite step, before or after rename, leaves none.
 
-Maintenance waits while P has an acceptance backlog (an intake or acceptance store queued or running and not yet answered), until it clears or `THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS` (500 ms) passes from the earliest trigger served. This wait owns no queue or Thread Memory writer turn, so join saves proceed meanwhile; startup, bring-up and explicit compactions bypass it. Coalescing never moves the deadline or drops a trigger.
+Maintenance waits while P has an acceptance backlog (an intake or acceptance store queued or running and not yet answered), until it clears or `THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS` (100 ms) passes from the earliest trigger served. This wait owns no queue or Thread Memory writer turn, so join saves proceed meanwhile; startup, bring-up and explicit compactions bypass it. Coalescing never moves the deadline or drops a trigger.
 
 Quiesce and forgetting cancel waits; quiesce also drains admitted maintenance. No pre-ack work waits for maintenance, and compaction measurements exclude its backlog wait.
 

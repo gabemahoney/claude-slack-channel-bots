@@ -2596,8 +2596,8 @@ describe('Thread Memory queued join recovery', () => {
 })
 
 describe('SR-9.11 Thread Memory maintenance beside acceptance', () => {
-  test('THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS is 500 ms (SR-2.4.5)', () => {
-    expect(THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS).toBe(500)
+  test('THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS is 100 ms (SR-2.4.5)', () => {
+    expect(THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS).toBe(100)
   })
 
   // Keep the SR-8 burst cadence; virtual time, never a wall-clock sleep.
@@ -2691,6 +2691,7 @@ describe('SR-9.11 Thread Memory maintenance beside acceptance', () => {
     expect(h.completed.map(c => c.outcome)).toEqual(['rewritten'])
     await h.dirty(); h.reset()
     await h.clock.advanceTo(2 * CADENCE)
+    const reloadedDeadline = h.clock.now() + THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS
     expect(h.backlogWaitCount()).toBe(1)
     expect(writes(h)).toEqual([]); expect(h.completed).toEqual([])
     const expected = h.image(), complete = h.completion()
@@ -2700,7 +2701,8 @@ describe('SR-9.11 Thread Memory maintenance beside acceptance', () => {
     expect(h.backlogWaitCount()).toBe(0)
     await h.memory.quiesce(); await h.seal.flush()
     const calls = [...h.io.calls]
-    await h.clock.advanceTo(oldDeadline + THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS)
+    // Cross both cancelled deadlines even when the bound is below one cadence.
+    await h.clock.advanceTo(Math.max(oldDeadline, reloadedDeadline) + THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS)
     await h.memory.quiesce()
     expect(h.io.calls).toEqual(calls)
     expect(h.completed.map(c => c.outcome)).toEqual(['rewritten'])
@@ -2716,11 +2718,14 @@ describe('SR-9.11 Thread Memory maintenance beside acceptance', () => {
     await h.clock.advance(CADENCE)
     const trigger = h.clock.now()
     expect(writes(h)).toEqual([]); expect(h.completed).toEqual([]); expect(h.sealCalls).toEqual([])
-    await h.clock.advance(CADENCE / 2)
+    await h.clock.advance(THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS / 2)
     expect(writes(h)).toEqual([])
+    expect(h.backlogWaitCount()).toBe(1)
+    expect(h.clock.now()).toBeLessThan(trigger + THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS)
     const started = h.clock.now()
     backlog.release(); expect((await backlog.pending).status).toBe('accepted')
     await temp.reached
+    expect(h.backlogWaitCount()).toBe(0)
     expect(writes(h).length).toBeGreaterThan(0)
     expect(h.completed).toEqual([]); expect(h.sealCalls).toEqual([])
     await h.measurements.flush()
@@ -2763,13 +2768,27 @@ describe('SR-9.11 Thread Memory maintenance beside acceptance', () => {
     await h.clock.advance(1); await temp.reached
     expect(h.queue.hasAcceptanceBacklog!('alpha')).toBe(true)
     expect(writes(h).length).toBeGreaterThan(0)
-    // A further trigger while the actual rewrite is held cannot be dropped.
-    await h.clock.advance(CADENCE)
-    const lastTrigger = h.clock.now(), subsequent = h.completion('alpha', 2)
+    // The bound is shorter than a cadence. Hold the rewrite across two real
+    // ticks: the first requests a subsequent pass, the second must coalesce
+    // with it even after its original backlog deadline queues it on the writer.
+    await h.clock.advanceTo(Math.ceil(deadline / CADENCE) * CADENCE)
+    const subsequent = h.completion('alpha', 2), nextDeadline = h.clock.now() + THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS
+    expect(h.backlogWaitCount()).toBe(1)
+    await h.clock.advance(THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS - 1)
+    expect(h.clock.now()).toBe(nextDeadline - 1)
+    expect(h.backlogWaitCount()).toBe(1)
+    await h.clock.advance(1)
+    expect(h.clock.now()).toBe(nextDeadline)
+    expect(h.backlogWaitCount()).toBe(0)
+    const lastTrigger = Math.ceil((nextDeadline + 1) / CADENCE) * CADENCE
+    await h.clock.advanceTo(lastTrigger)
+    expect(h.backlogWaitCount()).toBe(0)
     expect(h.completed).toEqual([])
     temp.release(); await complete
     expect(h.completed[0]).toMatchObject({ key: 'alpha', startMonoMs: deadline, endMonoMs: lastTrigger, outcome: 'rewritten' })
-    backlog.release(); await backlog.pending; await subsequent
+    await subsequent
+    expect(h.queue.hasAcceptanceBacklog!('alpha')).toBe(true)
+    backlog.release(); await backlog.pending
     expect(h.completed.map(c => c.outcome)).toEqual(['rewritten', 'skipped'])
     for (let at = trigger; at <= lastTrigger; at += CADENCE) expect(h.completed.some(c => c.endMonoMs >= at)).toBe(true)
     expect(h.completed[1]!.endMonoMs).toBeGreaterThanOrEqual(lastTrigger)
