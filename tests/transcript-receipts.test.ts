@@ -25,6 +25,62 @@ import { runFixture, runRealSlice, runTest33Slice, SITE_SLICES, type RealSlice, 
 const cleanups: (() => Promise<void>)[] = []
 afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup() })
 
+test('b.88t native attribute case proof requires both exact metadata values and rewrite-stable whole parts', async () => {
+  const h = await fixture(false)
+  const records = Array.from({ length: 21 }, (_, i) => acceptedRecord(i + 1, injectedInput({ text: `case ${i + 1}` }), (i + 1) * 1000))
+  const fixed = [fixedRecord(20, buildTagParts({ user: 'Dom \u200eMoorman', text: 'plain' })),
+    fixedRecord(21, buildTagParts({ attachments: 'Re\u0301sume\u0301.pdf (application/pdf, 123 bytes)', text: 'plain' }))]
+  const run = async (parts = fixed) => {
+    writeFileSync(h.journal, [...records, ...parts].map(r => JSON.stringify(r)).join('\n') + '\n')
+    return runFixture('fixtures/real-case-assertions.ts', ['fidelity-attributes', h.options.stateDir, 'alpha', h.shimLog, h.options.stateDir])
+  }
+  expect(await run()).toMatchObject({ code: 0, err: [], out: ['recorded: native attribute values confirmed: display name and NFD attachment'] })
+  expect(await run(fixed.slice(1))).toMatchObject({ code: 1, err: ['real-case-assertions: attribute fidelity input has no fixed parts'] })
+  for (const [from, to] of [['&#8206;', ''], ['Re&#769;sume&#769;.pdf', 'Résumé.pdf'],
+    ['</channel>', '\u200e</channel>'], ['</channel>', 'a\u0300</channel>']]) {
+    const changed = fixed.map(r => ({ ...r, parts: r.parts.map(part => part.replace(from!, to!)) }))
+    const result = await run(changed)
+    expect(result.code).toBe(1)
+    expect(result.err.join('\n')).toMatch(/native attribute fidelity (?:value differs|part is rewrite-unstable)/)
+  }
+})
+
+test('b.88t test39 generator and stub profile preserve the new attribute inputs', () => {
+  const root = mkdtempSync(join(tmpdir(), 'fidelity-profile-')), path = join(root, 'control.json')
+  try {
+    const script = readFileSync(join(import.meta.dir, 'integration/test-39-fmk-real-fidelity.sh'), 'utf8')
+    const generator = script.split("<<'INPUT'\n")[1]!.split('\nINPUT\n')[0]!
+    const child = Bun.spawnSync(['python3', '-c', generator, 'fidelity', 'U0FIDELITY'], { env: hostSafeChildEnv(root, { tools: ['python3'] }), stdout: 'pipe', stderr: 'pipe' })
+    expect(child.exitCode).toBe(0)
+    const rows = Buffer.from(child.stdout).toString().trim().split('\n').map(line => JSON.parse(line))
+    expect(rows).toHaveLength(21)
+    expect(rows.slice(-2)).toEqual([
+      ['b88t-attribute-display-name', 'attribute display name', { user: 'U0FIDELITYMETA' }],
+      ['b88t-attribute-nfd-attachment', 'attribute attachment name', { subtype: 'file_share', files: [
+        { id: 'F0FIDELITYNFD', name: 'Re\u0301sume\u0301.pdf', mimetype: 'application/pdf', size: 123 },
+      ] }],
+    ])
+    writeFileSync(path, JSON.stringify({ tokens: [] }))
+    const profile = script.split("<<'ATTR_USER'\n")[1]!.split('\nATTR_USER\n')[0]!
+    const control = Bun.spawnSync(['python3', '-c', profile, path, 'U0FIDELITYMETA'], { env: hostSafeChildEnv(root, { tools: ['python3'] }), stdout: 'pipe', stderr: 'pipe' })
+    expect(control.exitCode).toBe(0)
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ tokens: [], users: { U0FIDELITYMETA: { profile: { display_name: 'Dom \u200eMoorman' } } } })
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
+test('b.88t fidelity requires the original Enter path without Enter-only recovery', async () => {
+  const h = await fixture(false)
+  await h.send(slackInput())
+  h.options.expectedCount = 1
+  const audit = () => auditReceipts({ ...h.options, noRetype: true }, h.entries(), h.adapters)
+  expect(audit()).toMatchObject({ items: 1 })
+  const sent = jsonLines(h.journal).find(r => r.kind === 'sent')
+  appendFileSync(h.journal, JSON.stringify({ ...sent, attempt: 2, send_kind: 'enter' }) + '\n')
+  expect(audit).toThrow('Text fidelity case needed Enter-only recovery')
+  // Ordinary recovery remains permitted outside a fidelity run.
+  expect(h.audit()).toMatchObject({ items: 1 })
+})
+
 /** Pure controls of the actual thread CLI verdict, after the independent
  * complete receipt audit. Wrappers and queue records use production builders.
  * These are synthetic evidence, never a native/performance acceptance. */

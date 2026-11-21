@@ -54,7 +54,7 @@ export const SITE_SLICES = {
   // pinned by the static guard in transcript-receipts.test.ts, not here.
   test39: { script: 'integration/test-39-fmk-real-fidelity.sh', after: 'INPUT\n)\n', before: 'case_assert fidelity-shapes',
     requires: ['real_dm "${REAL_LABEL}" "${BODY}"', 'real_wait_delivery "${REAL_KEY}" "${COUNT}" no-retype'],
-    preset: [`INPUTS=('"fidelity one"' '"fidelity two"')`], tools: ['jq', 'python3'] },
+    preset: [`INPUTS=('["synthetic-one","fidelity one"]' '["synthetic-two","fidelity two"]')`], tools: ['jq', 'python3'] },
   test104: { script: 'real-agent/test-104-fmk-real-idle-compact.sh', after: 'real_fault send-keys no_enter unknown-untyped 1\n', before: 'real_finish',
     requires: ['real_dm "${REAL_LABEL}"', 'real_wait_delivery "${REAL_KEY}" 3'], preset: [], tools: [] },
   // AC106 after its duplicate copy exists: the counting query and its checks.

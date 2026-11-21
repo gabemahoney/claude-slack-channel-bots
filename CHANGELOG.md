@@ -8,6 +8,7 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ### Fixed
 
+- Messages containing invisible Unicode characters, NFC composition sequences, paragraph separators or literal `<pasted_content>` text now escape those native-input rewrites before delivery, including sender/channel names, attachment filenames and other tag attributes, so an exact receipt can confirm them without repeated delivery blocking later messages (b.88t).
 - Recorded uncertain agent-director input (`ErrSubmissionUnconfirmed`) pauses automatic input for the affected persona. A queue `submission-blocked` record with reason `ad-input-unconfirmed`, or an `ad-input-holds/<hash>.json` record at step `uncertain`, keeps custody across CSCB restarts; unreadable/invalid holds stay fail-closed. An observed fresh spawn with a new session or resume after AD reported `missing`/`ended` releases the hold into receipt-guarded recovery.
 
   A CSCB-only restart on the same live launch stays held. For manual recovery, stop CSCB, follow "Unresolved ordinary input" in the "Operator actions" section of agent-director's README, remove only the reviewed hold at its reported path, and restart. A persona agent never removes its own record; see [recovery, release evidence and the two notices](skills/debug-slack-channel-bots/SKILL.md#uncertain-input-and-retained-delivery).

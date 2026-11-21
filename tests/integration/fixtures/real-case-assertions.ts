@@ -284,6 +284,19 @@ try {
       const seq=workloadItem(j,ordinal).seq
       const f=j.find(r=>r.kind==='fixed'&&r.seq===seq);check(f?.parts?.length===1&&Buffer.byteLength(f.parts[0])===bytes,'single-part native fidelity size differs')
     }
+  } else if(command==='fidelity-attributes') {
+    const j=cumulativeJournal()
+    for(const [ordinal,attribute,expected] of [[20,'user','Dom &#8206;Moorman'],
+      [21,'attachments','Re&#769;sume&#769;.pdf (application/pdf, 123 bytes)']] as const) {
+      const item=workloadItem(j,ordinal), fixed=j.find(r=>r.kind==='fixed'&&r.seq===item.seq)
+      check(fixed?.parts?.length>0,'attribute fidelity input has no fixed parts')
+      for(const part of fixed.parts) {
+        check(part.includes(attribute+'="'+expected+'"'),'native attribute fidelity value differs')
+        check(!/[\p{Default_Ignorable_Code_Point}\p{Cf}\u2028\u2029]/u.test(part)&&part.normalize('NFC')===part,
+          'native attribute fidelity part is rewrite-unstable')
+      }
+    }
+    console.log('recorded: native attribute values confirmed: display name and NFD attachment')
   } else if(command==='unknown-proof') {
     await confirmReceipts()
     const faults=readShimLog(shim!).split('\n').filter(l=>l.startsWith('fault\t')).map(l=>{const f=l.split('\t');return {at:Number(f[1])*1000,words:shimWords(f[5]!)}})

@@ -506,7 +506,7 @@ tests/
     test-36-fmk-real-crash.sh      # server SIGKILL between text and Enter, then durable recovery
     test-37-fmk-real-mcp.sh        # server restart, test-only MCP drop, deferred reconnect and an occupied draft
     test-38-fmk-real-cron.sh       # three down-persona fires in order, fire-time timestamps and non-loopback bind
-    test-39-fmk-real-fidelity.sh   # Unicode and 850/1,400/1,900-byte bodies, exact receipts with no retype
+    test-39-fmk-real-fidelity.sh   # Unicode body/attribute rewrites, NFD attachment/display names, paste frames, 850/1,400/1,900-byte bodies; exact receipts, no retype
     test-40-fmk-real-downgrade.sh  # operator downgrade to published 0.18.0 on native Claude 2.1.280, preserved references, held/queued content and untouched Thread Memory
     test-41-fmk-real-codex.sh      # guarded Codex 0.159.2 D1 receipt-only gate: native observations, FIFO/faults,
                                    # actual harness SIGKILL/recovery and trailing @/$ fidelity; final native gate passed

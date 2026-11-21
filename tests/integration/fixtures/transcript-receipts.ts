@@ -393,6 +393,9 @@ export function auditReceipts(options: AuditOptions, entries: readonly Transcrip
       if (typed.some(s => !Number.isFinite(s.at) || s.at < receivedAt)) throw new Error('Missing, invalid or negative typing measurement')
       if (typed.some(s => s.at < partDelivered)) throw new Error('Successor send preceded prior receipt/delivery log')
       if (options.noRetype && typed.length !== 1) throw new Error('Text fidelity case retyped')
+      if (options.noRetype && journal.some(r => r.kind === 'sent' && r.seq === item.seq && r.part === part && r.send_kind === 'enter')) {
+        throw new Error('Text fidelity case needed Enter-only recovery')
+      }
       firstTyped = Math.min(firstTyped, typed[0]!.at)
       if (!Number.isFinite(delivered.at)) throw new Error('Invalid durable delivery timestamp')
       partDelivered = delivered.at

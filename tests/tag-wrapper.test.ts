@@ -1,13 +1,15 @@
 import { describe, expect, spyOn, test } from 'bun:test'
 import {
   buildReactionNoticeMessage, buildTagParts, buildWrapper, escapeAttr, escapeBody, replaceLoneSurrogates, tagByteLength, tagMaxBytesFor,
-  TAG_ATTRIBUTE_ORDER, TAG_MAX_BYTES, TAG_MAX_BYTES_MACOS, TAG_MIN_BODY_BYTES, TAG_SOURCE,
-  type ReactionNoticeInput, type TagMessage,
+  TAG_ATTRIBUTE_ORDER, TAG_MAX_BYTES, TAG_MAX_BYTES_MACOS, TAG_MIN_BODY_BYTES, TAG_NFC_MAX_SUFFIX_UNITS, TAG_SOURCE,
+  type ReactionNoticeInput, type TagAttributes, type TagMessage,
 } from '../src/tag-wrapper'
 import cases from './fixtures/delivery-wrapper/wrapper-cases.json'
 import edges from './fixtures/delivery-wrapper/escaping-edges.json'
 import { TAG_DESCRIPTION } from '../src/tag-description.ts'
 import * as previous from './fixtures/previous-tag-wrapper/tag-wrapper.ts'
+import { receiptTextMatches } from '../src/delivery-receipt.ts'
+import { auditedAICorpus } from './real-agent/ai-fixture-audit.ts'
 
 const LIMITS = [
   { name: 'default', limit: TAG_MAX_BYTES },
@@ -40,18 +42,37 @@ function bodiesOf(parts: string[], expectedBody: string, limit = TAG_MAX_BYTES):
 }
 
 describe('wrapper.py byte parity and escaping', () => {
+  test('b.88t preserves the audited AI corpus and exact canonical typed wrappers', () => {
+    const { canonical, ai } = auditedAICorpus()
+    expect(canonical).toEqual(cases)
+    for (const row of [...canonical, ...ai]) expect(Buffer.from(buildWrapper(row.msg))).toEqual(Buffer.from(row.typed))
+  })
+  // Policy amendments are independently written literals. Preserve the
+  // canonical Python/lookalike reference bytes and their SOURCE.txt provenance.
+  const bodyAmendments: Record<string, string> = {
+    'feff-not-python-whitespace': 'before&#65279;after <other&#65279;channel>',
+    'plain-unicode': '猫🦀e&#769;&#8232;&#8233;',
+    'python-space-U+2000': '&lt;&#8192;/ &#8192;ChAnNeL>',
+    'python-space-U+2001': '&lt;&#8193;/ &#8193;ChAnNeL>',
+    'python-space-U+2029': '&lt;&#8233;/ &#8233;ChAnNeL>',
+    'ignorable-outside-opener-preserved': 'x&#8203;y&lt;channel>z&#65279;',
+    'negative-embedded-ignorable-in-word': '<chan&#8203;nel>',
+  }
+  const attributeAmendments: Record<string, string> = {
+    'unicode-and-format-characters': '猫🦀e&#769;&#65279;&#8203;',
+  }
   test.each(cases)('$name matches the independent Python wrapper exactly', ({ msg, typed }) => {
     expect(Buffer.from(buildWrapper(msg))).toEqual(Buffer.from(typed))
     expect(buildTagParts(msg)).toEqual([typed])
     expect(buildTagParts(msg, tagMaxBytesFor('linux'))).toEqual([typed])
   })
 
-  test.each(edges.reference.attributes)('Python attribute edge: $name', ({ input, expected }) => {
-    expect(escapeAttr(input)).toBe(expected)
+  test.each(edges.reference.attributes)('Python attribute edge: $name', ({ name, input, expected }) => {
+    expect(escapeAttr(input)).toBe(attributeAmendments[name] ?? expected)
   })
 
-  test.each([...edges.reference.bodies, ...edges.lookalikes])('body edge: $name', ({ input, expected }) => {
-    expect(escapeBody(input)).toBe(expected)
+  test.each([...edges.reference.bodies, ...edges.lookalikes])('body edge: $name', ({ name, input, expected }) => {
+    expect(escapeBody(input)).toBe(bodyAmendments[name] ?? expected)
   })
 
   test.each([
@@ -265,22 +286,212 @@ describe.each(LIMITS)('metadata truncation preserves the minimum body allowance 
   })
 })
 
-// Native input observations extend body escaping only; reference corpus is unchanged.
+// Native input cases extend the escaping policy; the reference corpus is unchanged.
 describe('native input rewrites', () => {
+  test('pins the NFC suffix work bound', () => {
+    expect(TAG_NFC_MAX_SUFFIX_UNITS).toBe(64)
+  })
+  test('b.88t bounds retained marks by escaping the original code point as a segment boundary', () => {
+    const raw = 'x' + '\u0316'.repeat(TAG_NFC_MAX_SUFFIX_UNITS + 2) + '\u212b'
+    const expected = 'x' + '\u0316'.repeat(TAG_NFC_MAX_SUFFIX_UNITS - 1) + '&#790;\u0316\u0316&#8491;'
+    expect(escapeBody(raw)).toBe(expected)
+    expect(expected.normalize('NFC')).toBe(expected)
+    expect(escapeBody(raw.slice(0, -1))).toBe(expected.replace('&#8491;', ''))
+  })
+  test('b.88t normalizes only bounded strings, even in an otherwise stable body', () => {
+    const normalize = String.prototype.normalize
+    let largest = 0
+    const calls = spyOn(String.prototype, 'normalize').mockImplementation(function (this: string, form?: string) {
+      largest = Math.max(largest, this.length)
+      return normalize.call(this, form)
+    })
+    try {
+      escapeBody('x' + '\u0316'.repeat(40000))
+      escapeBody('x' + '\u0316'.repeat(40000) + '\u212b')
+      escapeAttr('x' + '\u0316'.repeat(40000))
+      escapeAttr('x' + '\u0316'.repeat(40000) + '\u212b')
+    } finally { calls.mockRestore() }
+    expect(largest).toBeLessThanOrEqual(TAG_NFC_MAX_SUFFIX_UNITS + 2)
+  })
+  // Regression watchdog, not a production latency promise. The former 40k
+  // suffix walk takes about 790 ms here; bounded suffix work needs under 25 ms.
+  const NFC_LONG_BODY_BUDGET_MS = 250
+  test.each([5000, 10000, 20000, 40000])('b.88t bounds NFC work for %i stable marks beside an unstable singleton', count => {
+    const raw = 'x' + '\u0316'.repeat(count) + '\u212b'
+    const started = performance.now()
+    const escaped = escapeBody(raw)
+    const elapsedMs = performance.now() - started
+    expect(escaped.normalize('NFC')).toBe(escaped)
+    expect(escaped).not.toMatch(/[\p{Default_Ignorable_Code_Point}\p{Cf}\u2028\u2029]/u)
+    expect(escaped.replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code)))).toBe(raw)
+    console.info(`b.88t NFC cost: marks=${count} elapsed_ms=${elapsedMs.toFixed(2)} budget_ms=${NFC_LONG_BODY_BUDGET_MS}`)
+    expect(elapsedMs).toBeLessThan(NFC_LONG_BODY_BUDGET_MS)
+  })
+
+  const removed = [0x00ad, 0x034f, 0x061c, 0x115f, 0x180e, 0x200b, 0x200c, 0x200d, 0x200e, 0x200f,
+    0x202a, 0x202e, 0x2060, 0x2061, 0x2064, 0x2066, 0x2069, 0x3164, 0xfe0f, 0xfeff, 0xffa0, 0xfff9, 0xe0041,
+    // Unobserved class members: DICP marks/fillers, Cf outside DICP, supplementary variation selector.
+    0x1160, 0x17b4, 0x0600, 0x06dd, 0xfffb, 0xe0100]
+  const nativeRewrite = (text: string) => text.replace(/[\p{Default_Ignorable_Code_Point}\p{Cf}]/gu, '')
+    .replace(/[\u2028\u2029]/g, '\n').normalize('NFC').replace(/<(\/?pasted_content)/gi, '<\\$1')
+  const frame = (text: string) => `<pasted_content id="native">\n${text}\n</pasted_content id="native">`
+  const reporter = '1. \u200eDom Moorman'
+  const samples: Array<[string, string]> = [
+    ...removed.map(cp => [`U+${cp.toString(16).toUpperCase()}`, `a${String.fromCodePoint(cp)}b`] as [string, string]),
+    ['paragraph separator', 'a\u2029b'], ['reporter short', reporter],
+    ['reporter 22 lines', [reporter, ...Array.from({ length: 21 }, (_, i) => `line ${i + 2}`)].join('\n')],
+    ['emoji ZWJ and VS16', '👩🏽‍💻 👨‍👩‍👧‍👦 ❤️'], ['test-39 RTL', 'RTL \u200fשלום\u200e'],
+    ['grave', 'a\u0300'], ['circumflex', 'a\u0302'], ['tilde', 'a\u0303'], ['ring', 'a\u030a'], ['cedilla', 'c\u0327'],
+    ['Hangul L+V', '\u1100\u1161'], ['Hangul LV+T', '\uac00\u11a8'], ['singleton Angstrom', '\u212b'],
+    ['non-adjacent composition', 'a\u0316\u0301'], ['non-adjacent grave composition', 'a\u0316\u0300'],
+    ['canonical reordering', 'x\u0315\u0300'],
+    ['singleton combining decomposition', '\u0344'], ['singleton angle bracket', '\u2329'],
+    ['frame-leading combining overlay', '\u0338'],
+  ]
+  test.each(samples)('b.88t %s survives native rewriting with exact receipts', (_name, text) => {
+    const escaped = escapeBody(text)
+    expect(escaped).not.toMatch(/[\p{Default_Ignorable_Code_Point}\p{Cf}\u2028\u2029]/u)
+    expect(escaped.normalize('NFC')).toBe(escaped)
+    expect(escaped).not.toBe(text)
+    for (const part of buildTagParts(injected(text))) {
+      const rewritten = nativeRewrite(part)
+      expect(rewritten).toBe(part)
+      expect(receiptTextMatches(rewritten, part)).toBe(true)
+      expect(receiptTextMatches(frame(rewritten), part)).toBe(true)
+      expect(receiptTextMatches(rewritten + '!', part)).toBe(false)
+    }
+  })
+
+  test.each(LIMITS)('b.88t frame boundary stays NFC-stable after splitting at the $name limit', ({ limit }) => {
+    const prefix = 'x'.repeat(limit - Buffer.byteLength(injectedFrame('2/2')))
+    const parts = buildTagParts(injected(prefix + '\u0338' + 'z'.repeat(limit)), limit)
+    expect(escapeBody('\u0338')).toBe('&#824;')
+    for (const part of parts) expect(part.normalize('NFC')).toBe(part)
+  })
+
+  test.each(removed)('b.88t decimal-escapes class code point %i even without a base', cp => {
+    expect(escapeBody(String.fromCodePoint(cp))).toBe(`&#${cp};`)
+  })
+
+  test.each([
+    ['a\u0300', 'a&#768;'], ['a\u0302', 'a&#770;'], ['a\u0303', 'a&#771;'], ['a\u030a', 'a&#778;'], ['c\u0327', 'c&#807;'],
+    ['\u1100\u1161', '\u1100&#4449;'], ['\uac00\u11a8', '\uac00&#4520;'], ['\u212b', '&#8491;'],
+    ['a\u0316\u0300', 'a\u0316&#768;'], ['x\u0315\u0300', 'x\u0315&#768;'], ['\u0344', '&#836;'],
+    ['x\u0316', 'x\u0316'], ['é', 'é'], ['\u0301\u0308', '&#769;&#776;'],
+  ])('b.88t escapes NFC changes without replacing original code points: %s', (raw, encoded) => {
+    expect(escapeBody(raw!)).toBe(encoded!)
+  })
+
+  test.each(['<pasted_content id="x">quoted</pasted_content>', '<PASTED_CONTENT id="x">quoted</PASTED_CONTENT>',
+    '<pasted_content id="x">\nquoted\n</pasted_content id="x">'])('b.88t neutralizes literal paste frames: %s', literal => {
+    for (const text of [literal, ['first', literal, ...Array.from({ length: 20 }, () => 'line')].join('\n')]) {
+      expect(escapeBody(text)).toBe(text.replace(/</g, '&lt;'))
+      for (const part of buildTagParts(injected(text))) {
+        expect(part).not.toMatch(/<\/?pasted_content/i)
+        expect(receiptTextMatches(nativeRewrite(part), part)).toBe(true)
+        expect(receiptTextMatches(frame(nativeRewrite(part)), part)).toBe(true)
+      }
+    }
+  })
+
+  test.each(LIMITS)('b.88t keeps decimal escapes and surrogate pairs whole at the $name limit', ({ limit }) => {
+    // Move each kind of escape through every possible boundary offset, without separators.
+    for (const [raw, encoded] of [['\u200e', '&#8206;'], ['\u{e0041}', '&#917569;'], ['e\u0300', 'e&#768;'],
+      ['\u2028', '&#8232;'], ['\u0301', '&#769;'], ['\u0308', '&#776;']] as const) {
+      for (let offset = 0; offset < encoded.length + 4; offset++) {
+        const prefix = 'x'.repeat(limit - Buffer.byteLength(injectedFrame('2/2')) - offset)
+        const text = prefix + raw + '🦀'.repeat(limit)
+        const bodies = bodiesOf(buildTagParts(injected(text), limit), prefix + encoded + '🦀'.repeat(limit), limit)
+        for (const body of bodies) expect(body).not.toMatch(/&(?:#\d*)?$/)
+      }
+    }
+  })
+
   test.each([
     ['line separator', '\u2028', '&#8232;'],
     ['combining acute', 'e\u0301', 'e&#769;'],
     ['combining diaeresis', 'u\u0308', 'u&#776;'],
-  ])('escapes %s in the body while preserving attribute bytes', (_name, raw, escaped) => {
+  ])('escapes %s in both body and attributes', (_name, raw, escaped) => {
     expect(escapeBody(raw)).toBe(escaped)
-    expect(escapeAttr(raw)).toBe(raw)
+    expect(escapeAttr(raw)).toBe(escaped)
     expect(buildTagParts(injected(raw))).toEqual([injectedFrame().replace('></channel>', `>${escaped}</channel>`)])
+  })
+})
+
+describe('native attribute rewrites', () => {
+  const rewrite = (text: string) => text.replace(/[\p{Default_Ignorable_Code_Point}\p{Cf}]/gu, '').replace(/[\u2028\u2029]/g, '\n').normalize('NFC')
+  function exactPart(part: string, limit: number) {
+    expect(Buffer.byteLength(part)).toBeLessThanOrEqual(limit)
+    expect(part).not.toMatch(/[\p{Default_Ignorable_Code_Point}\p{Cf}\u2028\u2029]/u)
+    expect(part.normalize('NFC')).toBe(part)
+    expect(rewrite(part)).toBe(part)
+    expect(receiptTextMatches(rewrite(part), part)).toBe(true)
+    expect(receiptTextMatches(`<pasted_content id="attr">\n${rewrite(part)}\n</pasted_content id="attr">`, part)).toBe(true)
+  }
+  test.each([
+    ['&amp; "\u200e < a\u0300 >', '&amp;amp; &quot;&#8206; &lt; a&#768; &gt;'],
+    ['Re\u0301sume\u0301.pdf', 'Re&#769;sume&#769;.pdf'],
+    ['\u0338\u2028\u2029\u212b', '&#824;&#8232;&#8233;&#8491;'],
+    ['a\u0316\u0300 \u1100\u1161 \uac00\u11a8', 'a\u0316&#768; \u1100&#4449; \uac00&#4520;'],
+  ])('b.88t attribute encoding keeps XML and native escapes in order: %s', (raw, expected) => {
+    expect(escapeAttr(raw)).toBe(expected)
+  })
+  test.each([...TAG_ATTRIBUTE_ORDER])('b.88t attribute %s uses the shared protection', key => {
+    const part = buildWrapper(injected('plain', { [key]: '\u200e\u00ad\u034f\u{e0041}\ufe0f\u0338a\u0300\u2029' }))
+    exactPart(part, TAG_MAX_BYTES)
+  })
+  describe.each(LIMITS)('$name limit', ({ limit }) => {
+    test.each([
+      ['user', 'Dom \u200eMoorman\u00ad\u034f\u{e0041}'],
+      ['attachments', 'Re\u0301sume\u0301.pdf (application/pdf, 123 bytes)'],
+      ['channel_name', 'team\u2060news'],
+    ] as const)('b.88t attribute %s survives native rewrites with plain and multipart bodies', (key, value) => {
+      for (const text of ['plain', 'one\ntwo 🦀 '.repeat(limit)]) {
+        const message = injected(text, { [key]: value })
+        const parts = buildTagParts(message, limit)
+        expect(parts.length > 1).toBe(text !== 'plain')
+        bodiesOf(parts, text, limit)
+        for (const part of parts) exactPart(part, limit)
+        if (text === 'plain') expect(buildWrapper(message)).toBe(parts[0]!)
+      }
+    })
+    test.each(['attachments', 'user', 'channel_name'] as const)('b.88t attribute %s trims on original code points with escaped byte budgets', key => {
+      const rawUnit = '\u200e&"<>🦀a\u0300'
+      const tokens = ['&#8206;', '&amp;', '&quot;', '&lt;', '&gt;', '🦀', 'a', '&#768;']
+      const attrs = key === 'user' ? 'user="" ts="1792000000.123456"'
+        : key === 'channel_name' ? 'channel_name="" user="…" ts="1792000000.123456"'
+          : 'user="interject" ts="1792000000.123456" attachments=""'
+      const emptyFrame = `<channel source="${TAG_SOURCE}" ${attrs}></channel>`
+      const budget = limit - TAG_MIN_BODY_BYTES - Buffer.byteLength(emptyFrame + '…')
+      let expected = ''
+      for (let i = 0; ; i++) {
+        const next = expected + tokens[i % tokens.length]!
+        if (Buffer.byteLength(next) > budget) break
+        expected = next
+      }
+      const text = 'x'.repeat(TAG_MIN_BODY_BYTES)
+      const parts = buildTagParts(injected(text, { [key]: rawUnit.repeat(limit) }), limit)
+      expect(parts).toHaveLength(1)
+      const part = parts[0]!
+      expect(part).toBe(emptyFrame.replace(`${key}=""`, `${key}="${expected}…"`).replace('></channel>', `>${text}</channel>`))
+      const encoded = new RegExp(`${key}="([^"]*)"`).exec(part)![1]!
+      expect(encoded).toMatch(/^(?:[^&]|&(?:amp|quot|lt|gt|#\d{1,7});)*$/u)
+      expect(Buffer.from(part).toString()).toBe(part)
+      exactPart(part, limit)
+    })
+    test('b.88t attribute protection also applies to Reaction Notice tags', () => {
+      const part = buildTagParts(buildReactionNoticeMessage({ chat_id: 'C0123456789', channel_name: 'team\u200b', message_id: '1',
+        user: 'Dom \u200eMoorman', user_id: 'U0123456789', ts: '2', reaction: 'added', emoji: 'heart\ufe0f' }), limit)[0]!
+      expect(part).toContain('user="Dom &#8206;Moorman"')
+      expect(part).toContain('emoji="heart&#65039;"')
+      exactPart(part, limit)
+    })
   })
 })
 
 // t2.yiv.sf.ws (fix round 2): sizing encoded each body character with a new
 // TextEncoder, and every body and attribute went through a per-character array.
-describe('the formatter gives the previous formatter\'s exact output', () => {
+describe('the formatter gives the previous formatter\'s output with explicit native-input amendments', () => {
   const ALPHABET = ['a', 'Z', '9', ' ', '_', '/', '／', '\n', '\r\n', '\r', '\t', '\x00', '\x07', '\x1f', '\x7f', '\x85', '\x9f', '&', '"', '>',
     '<', '＜', '﹤', '‹', '〈', '⟨', '〈', '❮', 'channel', 'CHANNEL', 'Channels', 'ｃｈａｎｎｅｌ',
     '​', '­', '⁠', '　', ' ', ' ', ' ', 'é', 'ü', '́', 'é', '中', 'ࠀ', '߿',
@@ -292,11 +503,62 @@ describe('the formatter gives the previous formatter\'s exact output', () => {
     return Array.from({ length: count }, () => Array.from({ length: Math.floor(next() * maxParts) }, () => ALPHABET[Math.floor(next() * ALPHABET.length)]).join(''))
   }
   const texts = [...corpus(400, 40), ...corpus(40, 900), 'x'.repeat(5000), '🙂'.repeat(1200), 'é '.repeat(2500), '\ud800'.repeat(700)]
+  // Independent, fixed expectations for every newly escaped character in this
+  // corpus. Keep the frozen formatter and the entire corpus; compare all bytes.
+  const amended = (text: string) => text.replace(/[\u00ad\u200b\u2060\u2029\u2329]/g, c => ({
+    '\u00ad': '&#173;', '\u200b': '&#8203;', '\u2060': '&#8288;', '\u2029': '&#8233;', '\u2329': '&#9001;',
+  })[c]!)
+  const amendedAttr = (text: string) => amended(text).replace(/[\u0301\u0308\u2028]/g, c => ({
+    '\u0301': '&#769;', '\u0308': '&#776;', '\u2028': '&#8232;',
+  })[c]!)
+  const referenceAttr = (text: string) => amendedAttr(previous.escapeAttr(text))
+  function referenceWrapper(message: TagMessage): string {
+    const legacy = previous.buildWrapper({ ...message, text: amended(previous.escapeBody(message.text ?? '')) })
+    const end = legacy.indexOf('>') + 1
+    return amendedAttr(legacy.slice(0, end)) + legacy.slice(end)
+  }
+  /** Linear scalar-prefix budget oracle; the frozen formatter still renders
+   * and splits. Equal-byte ASCII placeholders let it size the new attributes
+   * without feeding already-escaped entities back through its XML encoder. */
+  function referenceParts(message: TagMessage): string[] {
+    let count = 1
+    for (;;) {
+      const attrs = { ...message, text: '' }
+      const part = count > 1 ? `${count}/${count}` : undefined
+      const frameBytes = () => Buffer.byteLength(referenceWrapper({ ...attrs, part }))
+      for (const key of ['attachments', 'user', 'channel_name'] as const) {
+        if (frameBytes() <= TAG_MAX_BYTES - TAG_MIN_BODY_BYTES) break
+        const raw = attrs[key]
+        if (!raw) continue
+        const chars = Array.from(previous.replaceLoneSurrogates(raw))
+        attrs[key] = ''
+        const budget = TAG_MAX_BYTES - TAG_MIN_BODY_BYTES - frameBytes() - Buffer.byteLength(` ${key}=""…`)
+        let kept = '', bytes = 0
+        for (const c of chars) {
+          const size = Buffer.byteLength(referenceAttr(c))
+          if (bytes + size > budget) break
+          kept += c; bytes += size
+        }
+        attrs[key] = kept + '…'
+      }
+      const placeholders = Object.fromEntries(TAG_ATTRIBUTE_ORDER.filter(key => attrs[key] !== undefined)
+        .map(key => [key, 'x'.repeat(Buffer.byteLength(referenceAttr(attrs[key]!)))]))
+      expect(Buffer.byteLength(previous.buildWrapper({ ...placeholders, text: '', part }))).toBe(frameBytes())
+      expect(frameBytes()).toBeLessThanOrEqual(TAG_MAX_BYTES - TAG_MIN_BODY_BYTES)
+      const parts = previous.buildTagParts({ ...placeholders, text: amended(previous.escapeBody(message.text ?? '')) })
+      if (parts.length !== count) { count = parts.length; continue }
+      return parts.map(tag => {
+        const end = tag.indexOf('>') + 1
+        return tag.slice(0, end).replace(/ ([a-z_]+)="x*"/g, (literal, key: keyof TagAttributes) =>
+          attrs[key] === undefined ? literal : ` ${key}="${referenceAttr(attrs[key]!)}"`) + tag.slice(end)
+      })
+    }
+  }
 
   test('escaping, sizing and surrogate replacement match on every corpus string', () => {
     for (const text of texts) {
       expect([escapeBody(text), escapeAttr(text), replaceLoneSurrogates(text), tagByteLength(text)])
-        .toEqual([previous.escapeBody(text), previous.escapeAttr(text), previous.replaceLoneSurrogates(text), previous.tagByteLength(text)])
+        .toEqual([amended(previous.escapeBody(text)), referenceAttr(text), previous.replaceLoneSurrogates(text), previous.tagByteLength(text)])
     }
   })
 
@@ -305,8 +567,8 @@ describe('the formatter gives the previous formatter\'s exact output', () => {
     texts.forEach((text, i) => {
       const message: TagMessage = { chat_id: 'C0TEST001', ts: '1700000000.000001', via: 'mention', user: attributeTexts[i % attributeTexts.length]!,
         ...(i % 3 === 0 ? { attachments: attributeTexts[(i + 7) % attributeTexts.length]!.repeat(4), attachment_count: '2' } : {}), text }
-      expect(buildTagParts(message)).toEqual(previous.buildTagParts(message))
-      expect(buildWrapper(message)).toBe(previous.buildWrapper(message))
+      expect(buildTagParts(message)).toEqual(referenceParts(message))
+      expect(buildWrapper(message)).toBe(referenceWrapper(message))
     })
   })
 

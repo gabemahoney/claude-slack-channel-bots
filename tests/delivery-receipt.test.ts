@@ -201,6 +201,12 @@ describe('real delivery timeout evidence (synthetic, no native launch)', () => {
 })
 
 describe('exact matching and agent schema', () => {
+  test('b.88t never normalizes native rewrites or decodes typed decimal entities', () => {
+    for (const [record, expected] of [['á', 'a\u0301'], ['ab', 'a\u200eb'], ['a\nb', 'a\u2029b'],
+      ['a\u200eb', 'a&#8206;b'], ['a\u0300', 'a&#768;'], ['<\\pasted_content id="x">', '<pasted_content id="x">']]) {
+      expect(receiptTextMatches(record!, expected!)).toBe(false)
+    }
+  })
   test.each([
     ['raw', 'a\nb', 'a\nb', true], ['meaningful LF', 'a\nb', 'ab', false],
     ['whole paste', pastedText('a\nb'), 'a\nb', true],
