@@ -741,6 +741,14 @@ contradictions retained after exit, same-cgroup baselines and signal/tmux
 cleanup using fake proc/cgroup trees and real scratch broker/tmux processes;
 these controls establish no native timing.
 
+Its eight broker/launcher/tmux cases needing real `/proc` start identities
+follow `ended-life.test.ts`, skipping with
+`[skip: /proc/self does not match process.pid]` when the PID namespace differs
+from `/proc`, as in a sandboxed host run. Matching environments, including the
+scheduler image, run all eight; fake proc/cgroup controls are unaffected by this namespace gate.
+Test roots sit directly under `/tmp`, regardless of `TMPDIR`, because the
+broker accepts only `/tmp/test-*` roots.
+
 For a scheduler/AD-kit diagnostic, pass both names through `jobsched submit`'s
 `--env` options. They inherit through the container's `/opt/ad-gate/entry.sh`,
 the image entrypoint and `tests/runner.sh` to membership-load, and the launcher

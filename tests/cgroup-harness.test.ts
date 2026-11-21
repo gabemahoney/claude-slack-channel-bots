@@ -1,8 +1,7 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, symlinkSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, writeFileSync, symlinkSync } from 'node:fs'
 import { join } from 'node:path'
-import { tmpdir } from 'node:os'
 import * as evidence from './integration/fixtures/sr8-evidence.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import { CPUS_PER_SHARD, DRIVER_CPUS, shardCpus } from '../scripts/ci-run.ts'
@@ -10,9 +9,11 @@ import { CPUS_PER_SHARD, DRIVER_CPUS, shardCpus } from '../scripts/ci-run.ts'
 const repo = join(import.meta.dir, '..'), fixtures = join(import.meta.dir, 'integration/fixtures')
 const scenario = readFileSync(join(import.meta.dir, 'integration/lib/scenario.sh'), 'utf8')
 const launcher = existsSync(join(fixtures, 'server-start.sh')) ? readFileSync(join(fixtures, 'server-start.sh'), 'utf8') : ''
+const procMatchesPid = readlinkSync('/proc/self') === String(process.pid)
+const nativeSkipReason = procMatchesPid ? '' : ' [skip: /proc/self does not match process.pid]'
 let root: string
 const sockets: { stop(close: boolean): void }[] = []
-beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'test-harness-')) })
+beforeEach(() => { root = mkdtempSync('/tmp/test-harness-') })
 afterEach(() => { for (const socket of sockets.splice(0)) socket.stop(true); rmSync(root, { recursive: true, force: true }) })
 function declaration(text: string, name: string) {
   const match = text.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, 'm'))
@@ -61,7 +62,7 @@ function brokerSetup() {
     'bash "$HOME/server-start.sh" --serve "$HOME/spool" & broker=$!', 'trap \'kill "$broker" 2>/dev/null || :\' EXIT',
   ]
 }
-test('server start launcher preserves output/status, uses a fixed command and records the real CLI PID', () => {
+test.skipIf(!procMatchesPid)('server start launcher preserves output/status, uses a fixed command and records the real CLI PID' + nativeSkipReason, () => {
   const child = shell([...brokerSetup(), 'rc=0; bash "$HOME/server-start.sh" start || rc=$?', 'echo "rc=$rc"', 'cat "$HOME/cscb-processes"'].join('\n'))
   expect(child.error).toBeUndefined(); expect(child.status).toBe(0)
   const pid = child.stdout.match(/^cli-pid=(\d+)$/m)?.[1]
@@ -87,7 +88,7 @@ test.each(['BUN_OPTIONS=--preload=bad', 'SLACK_STATE_DIR=/tmp/elsewhere', 'CSCB_
   const child = shell([...brokerSetup(), `export ${input}`, 'rc=0; bash "$HOME/server-start.sh" start || rc=$?; echo "rc=$rc"'].join('\n'))
   expect(child.error).toBeUndefined(); expect(child.stdout).toBe('rc=64\n')
 })
-test('server launcher drops arbitrary caller loaders and environment', () => {
+test.skipIf(!procMatchesPid)('server launcher drops arbitrary caller loaders and environment' + nativeSkipReason, () => {
   const setup = brokerSetup()
   writeFileSync(join(root, 'cli.ts'), `console.log(JSON.stringify({node:process.env.NODE_OPTIONS,extra:process.env.EXTRA,home:process.env.HOME,path:process.env.PATH,dry:process.env.SLACK_DRY_RUN}));\n`)
   const child = shell([...setup, 'export EXTRA=forbidden NODE_OPTIONS=--trace-warnings SLACK_DRY_RUN=1', 'bash "$HOME/server-start.sh" start'].join('\n'))
@@ -104,7 +105,7 @@ test('server launcher refuses crafted requests that bypass the caller allowlist'
   ].join('\n'))
   expect({ status: child.status, stdout: child.stdout, stderr: child.stderr }).toEqual({ status: 0, stdout: 'exit 64\nexit 64\nexit 64\nrefused\n', stderr: '' })
 })
-test('server launcher preserves the existing profile opt-in through its fixed trusted preload', () => {
+test.skipIf(!procMatchesPid)('server launcher preserves the existing profile opt-in through its fixed trusted preload' + nativeSkipReason, () => {
   const setup = brokerSetup(), preload = join(root, 'preload.ts')
   writeFileSync(preload, "import { writeFileSync } from 'node:fs'; writeFileSync(process.env.CSCB_TEST_CPU_PROFILE_DIR + '/loaded', 'yes')\n", { mode: 0o644 })
   writeFileSync(join(root, 'server-start.sh'), plantedLauncher().replaceAll('/tests/integration/fixtures/cpu-profile-preload.ts', preload))
@@ -121,7 +122,7 @@ test('server launcher refuses an other-writable entry file', () => {
   expect(child.status).toBe(70); expect(child.stderr).toContain('untrusted launcher path')
 })
 
-test('harness tmux first launch, two personas and empty restart retain the owned scratch socket; cleanup reaps empty server', () => {
+test.skipIf(!procMatchesPid)('harness tmux first launch, two personas and empty restart retain the owned scratch socket; cleanup reaps empty server' + nativeSkipReason, () => {
   const prestart = declaration(scenario, '_scenario_harness_tmux').replace('"/proc/${pid}/cgroup"', '"${SCENARIO_ROOT}/group"')
   const child = shell([
     'mkdir "$HOME/tmux"; export TMUX_TMPDIR="$HOME/tmux"; SCENARIO_REAL_TMUX="$(command -v tmux)"; SCENARIO_TMUX_STOP_S=2',
@@ -467,7 +468,7 @@ test('ordinary shared group counters, unavailable counters and changed group ide
   p.counters('/', 40)
   expect(p.run('conditions', root, '50', p.mark).stdout).toContain('nr_periods_delta=unknown')
 })
-test.each(['TERM', 'INT', 'HUP'] as const)('round17 regression: broker relays %s before and after PID discovery, preserving output/status', signal => {
+test.skipIf(!procMatchesPid).each(['TERM', 'INT', 'HUP'] as const)('round17 regression: broker relays %s before and after PID discovery, preserving output/status' + nativeSkipReason, signal => {
   const setup = brokerSetup()
   const consumed = 'pid) remote="${value}" ;;'
   expect(plantedLauncher()).toContain(consumed)
@@ -513,7 +514,7 @@ PY`].join('\n'), 25000)
     stage, consumed: stage === 'after', code, out: `long lived\nsignal=SIG${signal}\n`, err: `signal stderr=SIG${signal}\n`, received: `SIG${signal}`, bounded: true,
   })))
 }, 30000)
-test('broker interruption with no remote PID or responsive CLI has bounded cleanup', () => {
+test.skipIf(!procMatchesPid)('broker interruption with no remote PID or responsive CLI has bounded cleanup' + nativeSkipReason, () => {
   const setup = brokerSetup()
   writeFileSync(join(root, 'cli.ts'), `import {writeFileSync} from 'node:fs'; process.on('SIGTERM',()=>{}); writeFileSync(${JSON.stringify(join(root, 'ready'))},String(process.pid)); setInterval(()=>{},1000)\n`)
   const child = shell([...setup, `python3 - "$HOME" <<'PY'

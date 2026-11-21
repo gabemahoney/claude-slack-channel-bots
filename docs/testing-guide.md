@@ -278,6 +278,14 @@ New features that add significant logic should get their own test file (e.g., `s
 | ci-live/checks/membership-setup.ts, channel-membership-readiness.ts | ci-live-membership-setup.test.ts | Current-app provisioning, subscription and one-time reinstall evidence; real readiness handler and PID/installation checks, guarded recording and shared choices; setup-ready/setup-restart success, unknown, mismatch, silence and restart controls with content-free records. |
 | test-measurements.ts | test-measurements.test.ts | All allowlisted record kinds, source mappers, omission of malformed/incomplete facts, buffered ordered writes, rollback/retry and shutdown draining. thread-compaction serialization pins field order and completion-time at_mono_ms through threadCompactionMeasurement, with safe observer mapping and no message content. |
 
+`cgroup-harness.test.ts` follows `ended-life.test.ts`: its eight broker/launcher/tmux
+cases needing real `/proc` start identities skip with
+`[skip: /proc/self does not match process.pid]` when the PID namespace differs
+from `/proc`, as in a sandboxed host run. Matching environments, including the
+scheduler image, run all eight; fake proc/cgroup controls are unaffected by this namespace gate.
+Test roots sit directly under `/tmp`, regardless of `TMPDIR`, because the
+broker accepts only `/tmp/test-*` roots.
+
 ### Agent-director call-budget checks
 
 The startup sweep makes one service-filtered `list` and one `get` per applied persona's own `cscb_<key>` row, live or finished, before its latch/cwd verdict. A stray gets one `get` just before its kill when a hold needs its directory. Kept pre-persona rows and strays swept without holds get none. `tests/session-manager.test.ts` checks Light Row inputs, exact read counts/order, missing-data safety, directory/session use and old-life holds. Unconfigured own-ID verdicts and retired-entry clears need only light facts; note-only logs cause no read. The sweep finishes before Slack connects, outside test-32's measured windows; changes still run test-32 and every integration script whose call assertions they affect. `tests/fmk-source-audit.test.ts` rejects raw `ListRow` use or dropped keys in the sweep's narrowed projection and inferred dropped-field reads from list results, with planted indexed/aliased/iterated list violations and a legal get-result control.
