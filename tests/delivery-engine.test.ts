@@ -34,6 +34,239 @@ async function harness(options: Parameters<typeof makeEngineHarness>[0] = {}) { 
 async function start(h: EngineHarness, key = 'alpha') { await h.tick(key) }
 async function delivered(h: EngineHarness, key = 'alpha') { await h.until(() => h.queue.openCount(key) === 0) }
 
+describe('b.6cg operator abandonment', () => {
+  test('abandoning an earlier released Memory Hold preserves the other item in receipt wait', async () => {
+    const h = await harness(); h.p().autoReceipt = false
+    await h.queue.accept('alpha', heldSlackInput(memoryHold(h.clock.now())))
+    const b = await h.accept('B')
+    h.engine.wake('alpha'); await h.clock.advance(ENTER_DELAY_MS + DELIVERY_ROW_POLL_MS)
+    expect(h.engine.snapshot('alpha')?.e.phase).toBe('receipt')
+    await h.queue.resolveHolds('alpha', [{ seq: 1, outcome: 'released', at: h.clock.now() }])
+    const before = structuredClone(h.engine.snapshot('alpha')!.e)
+    expect(before.target).toEqual([b.accepted.seq, 1])
+    expect(await h.engine.abandonHead('alpha', 1)).toBe('abandoned')
+    expect(h.engine.running('alpha')).toBe(true)
+    expect(h.engine.snapshot('alpha')!.e).toEqual(before)
+    expect(h.lifecycle.owner('alpha')).toBe('delivery')
+    expect(h.engine.status('alpha')?.seq).toBe(b.accepted.seq)
+    h.p().autoReceipt = true
+    await h.clock.advance(RECEIPT_WAIT_MS + RETYPE_BACKOFF_MS[0] + DELIVERY_ROW_POLL_MS * 2)
+    expect(h.queue.item('alpha', b.accepted.seq)!.delivered).toBe(true)
+    expect(h.textCalls().every(call => call.params.text === 'B')).toBe(true)
+    expect(h.queue.item('alpha', 1)!.delivered).toBe(false)
+  })
+
+  test.each(['memory', 'post'] as const)('abandoning the last open item leaves an unresolved %s hold intact and makes no AD calls', async kind => {
+    const h = await harness(); h.p().autoReceipt = false
+    const a = await h.accept('head')
+    const held = await h.queue.accept('alpha', heldSlackInput(HOLD_FIELDS[kind](h.clock.now())))
+    if (held.status === 'failed') throw new Error('hold fixture store failed')
+    h.engine.wake('alpha'); await h.clock.advance(ENTER_DELAY_MS + DELIVERY_ROW_POLL_MS)
+    expect(h.engine.snapshot('alpha')?.e.phase).toBe('receipt')
+    const calls = [...h.calls], hold = h.queue.item('alpha', held.seq!)
+    expect(await h.engine.abandonHead('alpha', a.accepted.seq)).toBe('abandoned')
+    await h.clock.advance(DELIVERY_ROW_POLL_MS * 2)
+    expect(h.engine.running('alpha')).toBe(false)
+    expect(h.queue.item('alpha', held.seq!)).toEqual(hold)
+    expect(h.queue.item('alpha', held.seq!)!.hold?.state).toBe('unresolved')
+    expect(h.calls).toEqual(calls)
+    expect(await h.engine.abandonHead('alpha', held.seq!)).toBe('not-head')
+  })
+
+  test('last-item abandonment retires on clock timers alone and releases deferred reconnect', async () => {
+    const h = await harness()
+    h.p().autoReceipt = false
+    const a = await h.accept('last open item')
+    h.engine.wake('alpha')
+    await h.clock.advance(ENTER_DELAY_MS + DELIVERY_ROW_POLL_MS)
+    expect(h.engine.snapshot('alpha')?.e.phase).toBe('receipt')
+    let reconnects = 0
+    h.lifecycle.setReconnect(async key => { reconnects++; h.lifecycle.clearDeferred(key) })
+    h.lifecycle.defer('alpha')
+    const calls = [...h.calls]
+    expect(await h.engine.abandonHead('alpha', a.accepted.seq)).toBe('abandoned')
+    await h.clock.advance(NOT_NOW_RETRY_MS[0] + DELIVERY_ROW_POLL_MS)
+    expect(h.queue.openCount('alpha')).toBe(0)
+    expect(h.engine.running('alpha')).toBe(false)
+    expect(h.lifecycle.owner('alpha')).toBe('free')
+    expect(reconnects).toBe(1)
+    expect(h.lifecycle.deferred('alpha')).toBeUndefined()
+    expect(h.calls).toEqual(calls)
+    expect(h.clock.pending()).toEqual([])
+  })
+
+  test.each(['receipt', 'backoff'] as const)('abandon during %s moves to B, clears A state and never types A again', async phase => {
+    const h = await harness()
+    h.p().autoReceipt = false
+    const a = await h.accept('never taken in'), b = await h.accept('later message')
+    await h.tick()
+    await h.until(() => h.engine.snapshot('alpha')?.e.phase === 'receipt')
+    if (phase === 'backoff') await h.until(() => h.events.some(e => e.type === 'waiting' && e.reason === 'backoff') && h.textCalls().length >= 2)
+    expect(new Set(h.textCalls().map(c => c.params.text))).toEqual(new Set(['never taken in']))
+    expect(h.queue.openCount('alpha')).toBe(2)
+    const at = h.clock.now(), keysBefore = h.keyCalls().length
+    expect(await h.engine.abandonHead('alpha', a.accepted.seq)).toBe('abandoned')
+    expect(h.queue.item('alpha', a.accepted.seq)!.abandoned?.at).toBe(at)
+    expect(h.queue.openCount('alpha')).toBe(1)
+    expect(h.events.filter(e => e.type === 'item-abandoned')).toEqual([{ type: 'item-abandoned', key: 'alpha', seq: a.accepted.seq, at }])
+    h.p().autoReceipt = true
+    await delivered(h)
+    await h.advance(RETYPE_BACKOFF_MS.at(-1)! * 2)
+    expect(h.keyCalls().slice(keysBefore).filter(c => c.params.no_enter).map(c => c.params.text)).toEqual(['later message'])
+    expect(h.queue.item('alpha', a.accepted.seq)!.delivered).toBe(false)
+    expect(h.queue.item('alpha', b.accepted.seq)!.delivered).toBe(true)
+    expect(h.events.filter(e => e.type === 'item-delivered').map(e => e.seq)).toEqual([b.accepted.seq])
+    expect(h.errors).toEqual([])
+  })
+
+  test('between text and Enter is busy and changes neither keys nor journal', async () => {
+    const h = await harness()
+    await h.accept('head'); await h.accept('later')
+    await h.tick()
+    expect(h.engine.snapshot('alpha')?.e.phase).toBe('enter')
+    const before = h.records(), keys = h.keyCalls().length
+    expect(await h.engine.abandonHead('alpha', 1)).toBe('busy')
+    expect(h.records()).toEqual(before)
+    expect(h.keyCalls()).toHaveLength(keys)
+    expect(h.events.filter(e => e.type === 'item-abandoned')).toEqual([])
+    await delivered(h)
+    expect(h.textCalls().map(c => c.params.text)).toEqual(['head', 'later'])
+  })
+
+  test.each(['text', 'recovery-enter'] as const)('a call begun during an in-flight %s refuses busy after the running tick settles', async operation => {
+    const h = await harness()
+    await h.accept('head')
+    if (operation === 'recovery-enter') await h.queue.append('alpha', sentRecord(1, 1, 'text', {
+      at: h.clock.now() - RETYPE_BACKOFF_MS[0]!, transcript_path: h.p().path, session_id: h.p().row.session_id,
+    }))
+    expect(typeof h.engine.abandonHead).toBe('function')
+    const entered = Promise.withResolvers<void>(), gate = Promise.withResolvers<undefined>()
+    h.p().keyHook = async params => {
+      if (operation === 'text' ? params.no_enter : params.key === 'Enter') { entered.resolve(); return gate.promise }
+      return undefined
+    }
+    h.engine.wake('alpha')
+    const ticking = h.advance(RETYPE_BACKOFF_MS[0]! + RECEIPT_WAIT_MS + ENTER_DELAY_MS)
+    await entered.promise
+    expect(h.lifecycle.owner('alpha')).toBe('delivery')
+    const pending = h.engine.abandonHead('alpha', 1)
+    gate.resolve(undefined)
+    expect(await pending).toBe('busy')
+    await ticking
+    expect(h.queue.item('alpha', 1)!.abandoned).toBeUndefined()
+    expect(h.events.filter(e => e.type === 'item-abandoned')).toEqual([])
+  })
+
+  test('a delivery lease held by another send cannot be released by abandonment', async () => {
+    const h = await harness()
+    await h.accept('head')
+    const release = h.lifecycle.acquire('alpha', 'delivery')!
+    expect(release).toBeDefined()
+    try {
+      expect(await h.engine.abandonHead('alpha', 1)).toBe('busy')
+      expect(h.lifecycle.owner('alpha')).toBe('delivery')
+      expect(h.queue.openCount('alpha')).toBe(1)
+      expect(h.keyCalls()).toEqual([])
+    } finally { release() }
+  })
+
+  test('unknown, delivered, non-head and repeated requests are refused without an event', async () => {
+    const h = await harness()
+    await h.accept('done'); await h.queue.append('alpha', deliveredRecord())
+    await h.accept('head'); await h.accept('later')
+    h.p().held = true
+    for (const [seq, answer] of [[99, 'unknown'], [1, 'delivered'], [3, 'not-head']] as const) {
+      expect(await h.engine.abandonHead('alpha', seq)).toBe(answer)
+    }
+    expect(h.events.filter(e => e.type === 'item-abandoned')).toEqual([])
+    expect(await h.engine.abandonHead('alpha', 2)).toBe('abandoned')
+    expect(await h.engine.abandonHead('alpha', 2)).toBe('already-abandoned')
+    expect(h.events.filter(e => e.type === 'item-abandoned')).toHaveLength(1)
+    expect(h.keyCalls()).toEqual([])
+  })
+
+  test('restart and compaction project only remaining work into the unchanged FIFO policy', async () => {
+    const h = await harness()
+    h.p().autoReceipt = false
+    const a = await h.accept('head'), b = await h.accept('later')
+    await h.tick(); await h.until(() => h.engine.snapshot('alpha')?.e.phase === 'receipt')
+    expect(await h.engine.abandonHead('alpha', a.accepted.seq)).toBe('abandoned')
+    h.p().held = true
+    await h.queue.compact('alpha'); await h.restartServer(); await h.tick()
+    const knowledge = h.engine.snapshot('alpha')!
+    expect(knowledge.p.accepted).toEqual([b.accepted.seq])
+    expect(knowledge.p.fixed).toEqual([b.accepted.seq])
+    expect(knowledge.p.sent.some(s => s.item === a.accepted.seq)).toBe(false)
+    expect(knowledge.p.delivered.some(([seq]) => seq === a.accepted.seq)).toBe(false)
+    expect(selectDeliveryTarget(knowledge)).toEqual([b.accepted.seq, 1])
+    expect(h.engine.status('alpha')).toMatchObject({ seq: b.accepted.seq, count: 1, retypeCount: 0, receiptWorking: false })
+    expect(h.engine.status('alpha')?.partialReceipt).toBeUndefined()
+    const offset = h.textCalls().length
+    h.p().autoReceipt = true; h.p().held = false
+    await delivered(h)
+    expect(h.textCalls().slice(offset).map(c => c.params.text)).toEqual(['later'])
+    expect(h.records().filter(r => r.kind === 'abandoned')).toHaveLength(1)
+  })
+
+  test('partial receipt, receipt-working and escalating retries do not carry into the next item', async () => {
+    const h = await harness()
+    const text = partialReceiptText
+    await h.accept(text); await h.accept('next')
+    h.p().autoReceipt = false
+    h.p().keyHook = params => {
+      if (params.key === 'Enter') appendTranscript(h.p().path, [promptEntry(partialReceiptSuffix)])
+      return undefined
+    }
+    await h.tick()
+    await h.until(() => h.textCalls().length >= 3 && h.engine.snapshot('alpha')?.e.phase === 'receipt')
+    expect(h.engine.status('alpha')?.partialReceipt).toBeDefined()
+    h.p().row.state = 'working'
+    await h.advance(DELIVERY_ROW_POLL_MS)
+    expect(h.engine.status('alpha')?.receiptWorking).toBe(true)
+    expect(await h.engine.abandonHead('alpha', 1)).toBe('abandoned')
+    h.p().keyHook = undefined; h.p().row.state = 'waiting'
+    const before = h.textCalls().length
+    await h.until(() => h.textCalls().length > before)
+    const first = h.textCalls().at(-1)!
+    expect(first.params.text).toBe('next')
+    expect(h.engine.status('alpha')).toMatchObject({ seq: 2, retypeCount: 0, receiptWorking: false })
+    expect(h.engine.status('alpha')?.partialReceipt).toBeUndefined()
+    await h.until(() => h.textCalls().length > before + 1)
+    expect(h.textCalls().at(-1)!.at - first.at).toBeLessThanOrEqual(ENTER_DELAY_MS + RECEIPT_WAIT_MS + RETYPE_BACKOFF_MS[0]! + DELIVERY_ROW_POLL_MS * 2)
+    h.p().autoReceipt = true
+    await delivered(h)
+    expect(h.queue.item('alpha', 1)!.delivered).toBe(false)
+  })
+
+  test('not-now retry steps reset for B after abandoning repeatedly refused A', async () => {
+    const h = await harness()
+    await h.accept('A'); await h.accept('B')
+    h.p().keyHook = params => params.no_enter ? errPaneChanged() : undefined
+    await h.tick(); await h.until(() => h.textCalls().length >= 3)
+    expect(await h.engine.abandonHead('alpha', 1)).toBe('abandoned')
+    const start = h.textCalls().length
+    await h.until(() => h.textCalls().length >= start + 2)
+    const [first, retry] = h.textCalls().slice(start)
+    expect(first!.params.text).toBe('B'); expect(retry!.params.text).toBe('B')
+    expect(retry!.at - first!.at).toBeLessThanOrEqual(NOT_NOW_RETRY_MS[0]! + DELIVERY_ROW_POLL_MS * 2)
+    h.p().keyHook = undefined
+    await delivered(h)
+    expect(h.queue.item('alpha', 1)!.delivered).toBe(false)
+  })
+
+  test('a pending journal write refuses busy and leaves the head available for normal recovery', async () => {
+    const h = await harness()
+    await h.accept('head'); h.failAppend('sent', 2)
+    await h.tick()
+    expect(h.engine.snapshot('alpha')?.writer.kind).toBe('sent')
+    expect(h.keyCalls()).toEqual([])
+    expect(await h.engine.abandonHead('alpha', 1)).toBe('busy')
+    expect(h.queue.item('alpha', 1)!.abandoned).toBeUndefined()
+    await delivered(h)
+    expect(h.textCalls().map(c => c.params.text)).toEqual(['head'])
+  })
+})
+
 async function hold(h: EngineHarness, ts: string = THREAD_ROOTS.secondary, key = 'alpha', field: (at: number) => HoldField = memoryHold) {
   const input = heldSlackInput(field(h.clock.now()), { ts, key: { chat_id: 'C0TEST001', ts } })
   const result = await h.queue.acceptDecided(key, input.key, () => ({ store: input }))

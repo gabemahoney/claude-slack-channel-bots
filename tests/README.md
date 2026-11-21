@@ -551,6 +551,8 @@ tests/
     test-68-fmk-busy-send.sh       # packed queue/engine: actual legacy text/Enter and receipts on uncovered launches; synthetic covered custody,
                                    # safe fallback after a fresh get, held-to-Final and unknown lookup recovery without resend, default-off reconnect;
                                    # native stub receipt counts reject accidental covered input; no native E2 transport or E6 reconnect proof
+    test-69-fmk-abandon-head.sh    # real server/CLI with stub agents: abandon a blocked threaded Slack or interject head by logged ts,
+                                   # exact refusals, original-conversation/destination notices, retained journal bytes and successor delivery
     lib/
       membership-load.sh           # selected strict/open fault group, fresh 100,000-join cases and unchanged per-case verdicts
       shared-channel-recovery.sh   # independent production-path setup, observations and cumulative recovery closure
@@ -639,6 +641,11 @@ test-4, each when present; then every other script by ascending number, so
 `test-0-fmk-harness-self-check.sh` follows Test 4 and test-9 comes before
 test-12. Each shard runs test-1 first, then its assigned scripts in that
 order (see Script names, prerequisites and canonical order, and Sharding).
+Test 69 follows Test 68 in canonical order and belongs to scheduler lane 1:
+no native model, burst driver or network install, and only universal test-1
+as a prerequisite. Its duration-table value of 180 seconds is an **unmeasured
+estimate**, allowing two production-timed receipt/retype windows, successor
+delivery and setup/cleanup. Replace it with the scheduler run's measurement.
 
 A new scenario script needs no runner edit, but this layout names every
 `tests/integration/test-*.sh` on disk and no other script:

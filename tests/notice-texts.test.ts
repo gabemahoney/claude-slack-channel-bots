@@ -87,6 +87,7 @@
  */
 
 import { describe, expect, test } from 'bun:test'
+import * as abandonmentNotices from '../src/delivery-notices.ts'
 import { buildAdInputHoldNotice, buildAdDeliveryUnconfirmedNotice } from '../src/ad-input-notices.ts'
 
 import { NEVER_DELETE_ROW_PHRASE, NO_KILL_SENT_PHRASE, RETRY_KILL_LATER_PHRASE } from '../src/ad-description-phrases.ts'
@@ -244,7 +245,8 @@ import {
   buildThreadMemoryCompactionRecoveredLine, buildThreadMemorySealSavedLine, buildThreadMemoryHoldsResolvedLine,
   type ThreadMemoryLoss,
 } from '../src/thread-memory-reports.ts'
-import { THREAD_MEMORY_DIAGNOSTIC_CLASSES, buildPostAcceptPreparationFailedLine } from '../src/persona-diagnostics.ts'
+import { THREAD_MEMORY_DIAGNOSTIC_CLASSES, buildPostAcceptPreparationFailedLine, buildMessageAbandonedLine } from '../src/persona-diagnostics.ts'
+import { slackInput } from './test-helpers/delivery-queue.ts'
 import { describeSlackCallFailure } from '../src/persona-connection-errors.ts'
 import { PERSONA_DIAGNOSTIC_CLASSES, SHARED_STATE_STAGED_SLACK_RETRY_WARNING } from '../src/persona-diagnostics.ts'
 import {
@@ -1168,7 +1170,24 @@ function capEntries(): NoticeEntry[] {
  * A new notice joins here (and an id leaves `NOT_APPLICABLE` once a builder
  * is exported).
  */
+const ABANDON_CONFIGURED_NAMES = [
+  { label: 'token-shaped configured name', name: fakeToken(BOT_TOKEN_PREFIX, 'abandon-name') },
+  { label: 'URL-shaped configured name', name: 'https://configured.invalid/ops?team=blue&name=<Ops>' },
+]
 const NOTICE_CATALOGUE: readonly NoticeEntry[] = Object.freeze([
+  // The explicit regression below fails if the builder is missing. Defer its
+  // catalogue rows until it exists so regression-first collection still runs
+  // every pre-existing notice check instead of throwing at module load.
+  ...typeof abandonmentNotices.buildMessageAbandonedNotice === 'function' ? [
+    entry('common', 'buildMessageAbandonedNotice', 'operator abandonment', () => abandonmentNotices.buildMessageAbandonedNotice(PERSONA.name, 'U0SENDER1')),
+    entry('common', 'buildMessageAbandonedNotice', 'operator abandonment with untrusted sender', () => abandonmentNotices.buildMessageAbandonedNotice(PERSONA.name, sentinelInMessage('sender <name> &'))),
+    ...ABANDON_CONFIGURED_NAMES.map(({ label, name }) => {
+      const ref = renderPersonaRef(name, KEY), escaped = escapeSlackControlCharacters(ref)
+      return entry('common', 'buildMessageAbandonedNotice', label,
+        () => abandonmentNotices.buildMessageAbandonedNotice(ref, sentinelInMessage('sender <name> &')),
+        [` for ${escaped} was not delivered.`])
+    }),
+  ] : [],
   ...[PERSONA, { key: KEY }, { key: KEY, name: 'Alpha "quoted"\nname' }].flatMap((persona, index) => [
     entry('common', buildAdInputHoldNotice.name, `input hold persona ${index}`, () => buildAdInputHoldNotice(persona, '/state/ad-input-holds/reviewed.json')),
     entry('common', buildAdDeliveryUnconfirmedNotice.name, `delivery hold persona ${index}`, () => buildAdDeliveryUnconfirmedNotice(persona)),
@@ -1236,6 +1255,7 @@ const NAMED_SLACK_NOTICES: readonly string[] = Object.freeze([
   buildCoveredDeliveryBlockedNotice.name,
   buildMessageNotSavedNotice.name,
   buildMessageSavedAfterRetryNotice.name,
+  abandonmentNotices.buildMessageAbandonedNotice.name,
   buildDeliveryStuckNotice.name,
   buildMessageNotTakenInNotice.name,
   buildMessagesWaitingNotice.name,
@@ -1554,6 +1574,37 @@ const LOG_ONLY_GROUPS: readonly NoticeGroup[] = Object.freeze(["teardown", "star
 
 /** Every catalogue entry with its title, for `test.each`. */
 const CASES = NOTICE_CATALOGUE.map((e) => [titleOf(e), e] as const)
+
+test('b.6cg abandonment builder is catalogued and never advertises the operator command', () => {
+  expect(typeof abandonmentNotices.buildMessageAbandonedNotice).toBe('function')
+  const entries = NOTICE_CATALOGUE.filter(e => e.builder === 'buildMessageAbandonedNotice')
+  expect(entries.map(e => e.variant)).toEqual(['operator abandonment', 'operator abandonment with untrusted sender', ...ABANDON_CONFIGURED_NAMES.map(n => n.label)])
+  for (const notice of NOTICE_CATALOGUE) {
+    const text = notice.render()
+    expect(text).not.toMatch(/abandon[-_ ]?message/i)
+    assertNoLeak(withoutConfiguredSpans(text, notice.configuredSpans), titleOf(notice))
+  }
+})
+
+test.each(ABANDON_CONFIGURED_NAMES)('b.6cg $label is preserved only in the configured span', ({ name }) => {
+  const ref = renderPersonaRef(name, KEY), escaped = escapeSlackControlCharacters(ref)
+  const notice = abandonmentNotices.buildMessageAbandonedNotice(ref, sentinelInMessage('sender <name> &'))
+  expect(notice).toContain(` for ${escaped} was not delivered.`)
+  expect(notice).not.toContain('&amp;amp;')
+  const accepted = { v: 1 as const, kind: 'accepted' as const, seq: 1,
+    ...slackInput({ channel: sentinelInMessage('channel'), user: sentinelInMessage('user') }), received_at: 2000, ts: sentinelInMessage('ts') }
+  const line = buildMessageAbandonedLine(ref, accepted, 2000)
+  expect(line).toContain(`persona=${ref} source=slack`)
+  const cleanNotice = withoutConfiguredSpans(notice, [` for ${escaped} was not delivered.`])
+  const cleanLine = withoutConfiguredSpans(line, [`persona=${ref} source=slack`])
+  assertNoLeak({ notice: cleanNotice, line: cleanLine })
+  // The exclusion permits one configured occurrence, never a second in an error/sender.
+  // Ordinary URLs are allowed by assertNoLeak. Use a credential-bearing
+  // sensitivity value for that row, keeping same-name duplication for tokens.
+  const leaked = name.includes('://') ? fakeToken(BOT_TOKEN_PREFIX, 'abandon-untrusted') : name
+  expect(() => assertNoLeak(`${cleanNotice} ${leaked}`)).toThrow('assertNoLeak')
+  expect(() => assertNoLeak(`${cleanLine} ${leaked}`)).toThrow('assertNoLeak')
+})
 
 /** The entries posted to Slack: every entry outside `LOG_ONLY_GROUPS`. */
 const SLACK_CASES = CASES.filter(([, e]) => !LOG_ONLY_GROUPS.includes(e.group))
@@ -2286,12 +2337,26 @@ describe('a description quoted from agent-director is redacted and capped at MAX
     expect(text).not.toContain(CAP_TAIL)
   })
 
-  test('every builder that quotes agent-director has a redaction-and-cap row', () => {
+  // Metadata only: the configured persona reference must remain uncapped, and
+  // sender follows the uncapped convention of the sibling delivery notices.
+  // Its hostile-sender row redacts metadata, never an agent-director quote.
+  const metadataOnlyBuilders = new Set(['buildMessageAbandonedNotice'])
+
+  function missingDescriptionCaps(entries: readonly NoticeEntry[]): string[] {
     // Thread Memory quotes storage errors, not agent-director descriptions;
     // its loss notice has its own final-message budget below.
-    const quoting = new Set(NOTICE_CATALOGUE.filter((e) => e.group !== 'thread-memory' && e.group !== 'shared-state' && redacted.some((r) => e.render().includes(r))).map((e) => e.builder))
-    const capped = new Set(capRows.map(([, e]) => e.builder))
-    expect([...quoting].filter((builder) => !capped.has(builder)).sort()).toEqual([])
+    const quoting = new Set(entries.filter((e) => e.group !== 'thread-memory' && e.group !== 'shared-state' && !metadataOnlyBuilders.has(e.builder) && redacted.some((r) => e.render().includes(r))).map((e) => e.builder))
+    const capped = new Set(entries.filter(e => e.variant.endsWith(CAP_VARIANT)).map(e => e.builder))
+    return [...quoting].filter((builder) => !capped.has(builder)).sort()
+  }
+
+  test('every builder that quotes agent-director has a redaction-and-cap row', () => {
+    expect(missingDescriptionCaps(NOTICE_CATALOGUE)).toEqual([])
+  })
+
+  test('self-check: a real AD-description builder without its cap row is still caught', () => {
+    const withoutCap = NOTICE_CATALOGUE.filter(e => !(e.builder === spawnFailureNoticeText.name && e.variant.endsWith(CAP_VARIANT)))
+    expect(missingDescriptionCaps(withoutCap)).toEqual([spawnFailureNoticeText.name])
   })
 })
 

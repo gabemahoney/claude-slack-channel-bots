@@ -1,9 +1,10 @@
 /** Best-effort correction of an existing notice, using its original Slack identity. */
 import type { PostedPersonaNotice } from './persona-notifier.ts'
 import type { PersonaConnectionClock } from './persona-connections.ts'
+import type { WebClient } from '@slack/web-api'
 import { describeSlackCallFailure } from './persona-connection-errors.ts'
 import { OWN_POST_CANCELLED } from './persona-destination.ts'
-import { ownPostAnswerOfError, ownPostAnswerOfPost, type OwnPostAnswer, type OwnPostStart } from './own-post.ts'
+import { ownPostAnswerOfError, ownPostAnswerOfPost, type OwnPostAnswer, type OwnPostStart, type OwnPostObserver, type OwnPostTarget } from './own-post.ts'
 import { SERVER_POST_EVENT_TYPE } from './server-post.ts'
 
 export const NOTICE_CORRECTION_TIMEOUT_MS = 10_000
@@ -18,7 +19,7 @@ export interface NoticeCorrectionDeps {
 }
 
 /** A late Slack answer cannot restart work after the bound or lifecycle cancellation. */
-function attempt(call: () => Promise<unknown>, deps: NoticeCorrectionDeps): Promise<NoticeCorrectionOutcome> {
+function attempt(call: () => Promise<unknown>, deps: Omit<NoticeCorrectionDeps, 'logOutcome'>): Promise<NoticeCorrectionOutcome> {
   if (deps.signal.aborted || !deps.isActive()) return Promise.resolve({ outcome: 'cancelled' })
   return new Promise(resolve => {
     let settled = false
@@ -37,6 +38,42 @@ function attempt(call: () => Promise<unknown>, deps: NoticeCorrectionDeps): Prom
       void call().then(() => finish({ outcome: 'success' }), error => finish({ outcome: 'failed', reason: describeSlackCallFailure(error) }))
     } catch (error) { finish({ outcome: 'failed', reason: describeSlackCallFailure(error) }) }
   })
+}
+
+export type OriginalConversationPoster = (key: string, target: OwnPostTarget, text: string,
+  life: Omit<NoticeCorrectionDeps, 'logOutcome'>) => Promise<NoticeCorrectionOutcome>
+
+/** One source-conversation notice, outside destination retries. Bound the whole
+ * wait, including intent readiness. A call already sent still reports its late
+ * Slack outcome to the original own-post owner, never starting another post. */
+export function createOriginalConversationPoster(deps: {
+  clientFor(key: string): Pick<WebClient, 'chat'> | undefined
+  ownPosts?: OwnPostObserver
+}): OriginalConversationPoster {
+  return (key, target, text, life) => {
+    let waiting = true
+    return attempt(async () => {
+      const client = deps.clientFor(key)
+      if (!client) throw new Error('persona client unavailable')
+      let op: OwnPostStart | undefined
+      try {
+        op = deps.ownPosts?.start(key, 'notice', target, { kind: 'text', text })
+        if (op?.ready) await op.ready
+      } catch { /* join bookkeeping cannot prevent the notice */ }
+      const end = (answer: OwnPostAnswer) => {
+        try { deps.ownPosts?.end(op?.operation, answer) } catch { /* bookkeeping cannot change the Slack outcome */ }
+      }
+      if (!waiting || life.signal.aborted || !life.isActive()) {
+        end({ kind: 'failed', code: OWN_POST_CANCELLED }); return
+      }
+      try {
+        const response = await client.chat.postMessage({ channel: target.channel, text,
+          ...(target.parent ? { thread_ts: target.parent } : {}),
+          metadata: { event_type: SERVER_POST_EVENT_TYPE, event_payload: {} } })
+        end(ownPostAnswerOfPost(target.channel, response))
+      } catch (error) { end(ownPostAnswerOfError(error)); throw error }
+    }, life).finally(() => { waiting = false })
+  }
 }
 
 /**

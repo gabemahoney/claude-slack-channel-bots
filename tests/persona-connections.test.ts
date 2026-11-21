@@ -1375,6 +1375,7 @@ describe('diagnostic lines', () => {
     expect(new Set(PERSONA_DIAGNOSTIC_CLASSES).size).toBe(PERSONA_DIAGNOSTIC_CLASSES.length)
     expect([...PERSONA_DIAGNOSTIC_CLASSES].sort()).toEqual(([
       'delivery-stuck',
+      'message-abandoned',
       'message-delivered',
       'message-not-saved',
       'message-not-taken-in',

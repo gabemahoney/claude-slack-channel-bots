@@ -103,9 +103,11 @@ CSCB stores accepted messages and Reaction Notices, then types their text into t
 
 A message from Slack carries a `via` attribute that says how it reached the persona; an injected message (a scheduled prompt or an `/interject` message) carries no `via`. Which channels a persona serves, and at which delivery, depends on the channel mode (see [Channel modes](channel-modes.md#channel-modes)).
 
-A received item is durably stored; delivered means its complete text is confirmed in the bot’s transcript, whose records confirm only that exact message, never whether the bot is idle. Delivery is at-least-once: an unconfirmed item is offered again, so the bot may see it more than once.
+A received item is durably stored; delivered means its complete text is confirmed in the bot’s transcript, whose records confirm only that exact message, never whether the bot is idle. Delivery is at-least-once: an open, unconfirmed item is offered again, so the bot may see it more than once.
 
-Each persona takes Slack messages, Reaction Notices, `/interject` and scheduled prompts in arrival order, with one item in flight; the next waits until the previous item is confirmed delivered or a Reaction Notice is excluded before delivery. There is no age cutoff. A thread reply can be held first, and gets its queued reaction only once released:
+Each persona takes Slack messages, Reaction Notices, `/interject` and scheduled prompts in arrival order, with one item in flight; the next waits until the previous item is confirmed delivered, a Reaction Notice is excluded before delivery, or an operator stops an undeliverable head. That manual action keeps its text and attempts a *Message not delivered* notice; the queued reaction stays, with no delivered reaction or reply reminder.
+
+There is no age cutoff or automatic expiry. A thread reply can be held first, and gets its queued reaction only once released:
 
 - **A reply racing the persona's own post** waits while one of its posts is pending, either in that thread or as a new channel message that may have started it. It waits up to 3 seconds for the post's answer, and everything behind it waits too. It is released when a post lands in that thread or the 3 seconds pass, and withdrawn, never delivered, when every post landed elsewhere or failed.
 - **A reply in a thread whose Thread Memory can't be read** waits while later items pass it, and is delivered only if the persona turns out to be in that thread. A racing reply waits this way instead of being withdrawn when its thread can't be read.

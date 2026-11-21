@@ -9,6 +9,7 @@ import { createDeliveryPreparation } from '../../src/delivery-intake.ts'
 import { createMemoryHoldResolver, type MemoryHoldResolver, type MemoryHoldEvent, type MemoryHoldMode } from '../../src/memory-holds.ts'
 import { createPostHoldResolver, type PostHoldResolver, type PostHoldEvent, type StoredPostHold } from '../../src/post-holds.ts'
 import { createDeliveryReporting } from '../../src/delivery-notices.ts'
+import { createOriginalConversationPoster } from '../../src/notice-correction.ts'
 import { setDeliveryLifecycle } from '../../src/session-manager.ts'
 import { createThreadMemory, type ThreadMemory, type ThreadMemoryEvent, type ThreadMemoryOptions } from '../../src/thread-memory.ts'
 import { createThreadMemorySeal, type ThreadMemorySeal, type ThreadMemorySealEvent, type ThreadMemorySealOptions } from '../../src/thread-memory-seal.ts'
@@ -2392,6 +2393,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     let unsubscribeThreadMemory: (() => void) | undefined
     const reporting = threadMemory === undefined ? undefined : createDeliveryReporting({
       queue, episodes, persona: getAppliedPersona,
+      postOriginalNotice: createOriginalConversationPoster({ clientFor, ownPosts }),
       state: key => ({ up: !stopped && isPersonaUp(key) }), log,
       notify: (key, text) => noticeStack.notifier.notify(key, text), now: connections.clock.now,
       queued: createQueuedAckCallback({ queue, clientFor, getReaction: () => getReplySettings().queued_ack_reaction }),

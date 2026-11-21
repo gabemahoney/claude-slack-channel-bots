@@ -833,6 +833,7 @@ function makeDeps(o: Overrides = {}): Bundle {
       await directorCall(LIST_CALL)
       return o.directorList ? o.directorList() : []
     },
+    dialAbandonMessage: async () => { throw new Error('precondition: no command in this fixture dials abandon-message') },
     dialClearLatch: async (port, persona) => {
       dialCalls.push([port, persona])
       events.push('dialClearLatch')
@@ -2250,9 +2251,9 @@ describe('b.c13 CLI child environments', () => {
     // Bind the helper's default to this fixture, so a no-argument entry call
     // also tests the real scrub without touching the runner's environment.
     const scrubFixture = (target = env, options?: Parameters<typeof scrubProcessEnv>[1]) => scrubProcessEnv(target, options)
-    new Function('scrubProcessEnv', 'process', 'CLEAR_LATCH_COMMAND', 'CLI_USAGE_LINES', prefix)(scrubFixture, {
+    new Function('scrubProcessEnv', 'process', 'CLEAR_LATCH_COMMAND', 'ABANDON_MESSAGE_COMMAND', 'CLI_USAGE_LINES', prefix)(scrubFixture, {
       env, argv: [process.execPath, CLI_SOURCE, subcommand], exit: (code: number) => { throw new ExitError(code) },
-    }, CLEAR_LATCH_COMMAND, CLI_USAGE_LINES)
+    }, CLEAR_LATCH_COMMAND, 'abandon-message', CLI_USAGE_LINES)
     return env
   }
 
@@ -2263,7 +2264,7 @@ describe('b.c13 CLI child environments', () => {
     await runTrustedDaemon(env)
   }))
 
-  test.each(['stop', 'clean_restart', 'credentials', CLEAR_LATCH_COMMAND])('%s entry removes the marker before director operations', subcommand => leakChecked(async () => {
+  test.each(['stop', 'clean_restart', 'credentials', CLEAR_LATCH_COMMAND, 'abandon-message'])('%s entry removes the marker before director operations', subcommand => leakChecked(async () => {
     const env = await entryEnvironment(subcommand)
     expect(Object.keys(env)).not.toContain('SLACK_BOT_TOKEN')
     expect(env._CLI_DAEMON_CHILD).toBeUndefined()
@@ -6506,6 +6507,12 @@ function runCli(args: string[], home = root) {
 }
 
 describe('unknown subcommand', () => {
+  test('b.6cg usage advertises the operator abandonment command exactly once', () => {
+    expect(CLI_USAGE_LINES[0]).toContain('|abandon-message>')
+    expect(CLI_USAGE_LINES.filter(line => /^\s+abandon-message\b/.test(line))).toEqual([
+      '  abandon-message <persona name or key> <ts>: abandon one undelivered head message; its text is kept',
+    ])
+  })
   test('`trail` hits the usage error (non-zero exit; no "trail", retired reconcile flag, token variable or reload wording in usage)', () => {
     const result = runCli(['trail'])
     expect(result.status).not.toBe(0)
@@ -6519,7 +6526,7 @@ describe('unknown subcommand', () => {
     expect(reloadTermsIn(output)).toEqual([])
   })
 
-  test('no arguments exits non-zero with usage listing exactly start, stop, clean_restart, credentials and clear-latch (with line), and only --stop-bots under stop and --server under clean_restart, with no reload wording', () => {
+  test('no arguments exits non-zero with usage listing exactly start, stop, clean_restart, credentials, clear-latch and abandon-message (with line), and only --stop-bots under stop and --server under clean_restart, with no reload wording', () => {
     const result = runCli([])
 
     expect(result.status).not.toBe(0)
@@ -6527,8 +6534,8 @@ describe('unknown subcommand', () => {
     expect(result.stderr).toBe(CLI_USAGE_LINES.map((line) => `${line}\n`).join(''))
     expect(result.stdout).toBe('')
     const usage = usageEntries(result.output)
-    expect(usage.synopsis.sort()).toEqual(['clean_restart', 'clear-latch', 'credentials', 'start', 'stop'])
-    expect(usage.listed.sort()).toEqual(['clean_restart', 'clear-latch', 'credentials', 'start', 'stop'])
+    expect(usage.synopsis.sort()).toEqual(['abandon-message', 'clean_restart', 'clear-latch', 'credentials', 'start', 'stop'])
+    expect(usage.listed.sort()).toEqual(['abandon-message', 'clean_restart', 'clear-latch', 'credentials', 'start', 'stop'])
     expect(usage.flags).toEqual({ stop: ['--stop-bots'], clean_restart: [CLEAN_RESTART_SERVER_FLAG] })
     expect(usage.unexpected).toEqual([])
     // The second --server is the warning line's.

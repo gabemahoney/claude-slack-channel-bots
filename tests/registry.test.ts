@@ -4452,6 +4452,9 @@ describe('tool list and instructions', () => {
 
     expect(tools.length).toBeGreaterThan(0)
     expect(typeof instructions).toBe('string')
+    // b.6cg: the second operator-only command is absent from complete tool
+    // schemas and runtime instructions too, including camel/snake spellings.
+    expect(JSON.stringify({ tools, instructions })).not.toMatch(/abandon[-_ ]?message/i)
     expect({
       tools: Object.fromEntries(tools.map((t) => [t.name, clearLatchTermsIn(JSON.stringify(t))])),
       instructions: clearLatchTermsIn(instructions ?? ''),

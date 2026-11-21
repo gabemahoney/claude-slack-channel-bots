@@ -37,6 +37,14 @@ Reconnect records input intent before text. Partial or uncertain input resumes w
 
 Memory Holds are passed while unresolved; a release makes the original sequence position eligible, after any already in-flight item finishes. Post Holds block their own position and everything behind it. The `ResolveMemoryHold` action records either transition `ResolveMemoryHold` (Memory Hold release or withdrawal) or `ResolvePostHold` (Post Hold release, withdrawal or parking into the Memory Hold set). These map to `memory-holds.ts` / `post-holds.ts` and the queue’s `resolveHolds`; resolution cannot overtake a pending send append or compaction rename. Start and same-run bring-up release unresolved unparked Post Holds; parked ones retain Memory Hold behavior.
 
+### Operator abandonment outside the model
+
+Explicit operator abandonment is an out-of-model action. The runtime retains the item's text and history with an `abandoned` record and excludes it from the durable facts projected into delivery policy; it never fabricates a receipt.
+
+`NoDrop` and eventual-delivery properties apply to non-abandoned work, under their existing bounds and fairness assumptions. They do not prove the abandonment transition or delivery of an abandoned item.
+
+The TLA+ model and pure delivery policy remain unchanged; queue/engine/route/reporting tests cover this operator action. See [the runtime contract](../../docs/architecture.md#operator-abandonment).
+
 ### Outcome-only probes
 
 Three runtime paths use AD pane-read success/error outcomes: CLI teardown in `src/cli.ts`, the shared own-pane probe for prompt-row recovery/server teardown in `src/session-manager.ts`, and the latch probe in `src/session-manager.ts`. They discard the payload. Success does not prove idle or authorize keys; typed errors retain their lifecycle/latch/outage handling. No pane content or pane hash enters delivery policy or diagnostics. Startup/trust dialogs are handled by AD pre-trust or a human.
@@ -45,7 +53,7 @@ Three runtime paths use AD pane-read success/error outcomes: CLI teardown in `sr
 
 The safety checks include `TypeOK`, `NoDrop`, `InOrder`, `OneInFlight`, `DurableAccept`, `ReceiptBacked`, `TranscriptFIFO`, `NoRetypeWhileWorking`, `GateExclusive`, `NoDuplicateKey` and `TypingGuards`. Typing guards require AD waiting and the existing non-screen requirements. Exact `HeadTakenIn`, eventual delivery and reconnect/gate progress depend on the model's explicit environment assumptions and seven fairness obligations.
 
-At-most-once is not a guarantee: the expected duplicate witness must fail `AtMostOnce`. `NoDuplicateKey` prevents duplicate durable acceptance, but an unconfirmed item can be delivered again. FIFO advances only after an exact own-message take-in and a durable delivered record.
+At-most-once is not a guarantee: the expected duplicate witness must fail `AtMostOnce`. `NoDuplicateKey` prevents duplicate durable acceptance, but an unconfirmed item can be delivered again. Within the modeled delivery path, FIFO advances only after an exact own-message take-in and a durable delivered record; explicit abandonment is outside that path.
 
 `NoHeldDelivery` prevents Memory Holds and withdrawn holds from being sent or delivered; `PostHoldIsHead` additionally prevents fixing/sending an unresolved Post Hold or any later item. `NoDrop` includes acknowledged storage whose outcome is withdrawal. `InOrder` and `TranscriptFIFO` exempt the exact earlier/later pairs retained in `st.h.bypassed` when an unresolved Memory Hold is passed, preserving original-position delivery after release and the item already in flight. No withdrawn hold is delivered.
 

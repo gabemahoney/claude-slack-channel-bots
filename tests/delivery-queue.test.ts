@@ -26,6 +26,149 @@ afterEach(async () => { await Promise.all(queues.map(q => q.stop())); _resetAckT
 async function open(options: Parameters<typeof makeQueue>[1] = {}) { const q = await makeQueue(dir, options); queues.push(q); return q }
 const accepted = (): AcceptedRecord => ({ ...slackInput(), v: 1, kind: 'accepted', seq: 1, received_at: 1000, ts: '1700000000.000001' })
 const kinds: QueueRecord[] = [accepted(), fixedRecord(1, ['exact bytes\n🙂']), sentRecord(), deliveredRecord(), refusedRecord(1, 1, 1000), noticedRecord(1, 1000), { v: 1, kind: 'reply-reminder', seq: 1, at: 1000, state: 'observed', delivery_attempts: [1] }]
+
+describe('b.6cg operator abandonment', () => {
+  const abandoned = (seq = 1, at = 2000) => ({ v: 1 as const, kind: 'abandoned' as const, seq, at })
+
+  test('abandoned is a distinct durable outcome, with strict version, sequence and time validation', () => {
+    const record = abandoned()
+    expect(parseQueueRecord(JSON.stringify(record))).toEqual(record)
+    for (const bad of [{ v: 2 }, { seq: 0 }, { seq: 1.5 }, { at: undefined }, { at: '2000' }, { at: null }]) {
+      expect(isQueueRecord({ ...record, ...bad })).toBe(false)
+    }
+  })
+
+  test('abandon closes only the head without forging a receipt or changing another persona', async () => {
+    const q = await open()
+    await q.accept('alpha', slackInput())
+    await q.accept('alpha', injectedInput({ text: 'later' }))
+    await q.accept('beta', injectedInput({ text: 'sibling' }))
+    await expect(q.append('alpha', deliveredRecord())).rejects.toThrow()
+    expect(q.isWritable?.('alpha')).toBe(true)
+    expect(await q.abandon('alpha', 1, 2000)).toBe('abandoned')
+    const item = q.item('alpha', 1)!
+    expect(item.abandoned).toEqual(abandoned())
+    expect(item.delivered).toBe(false)
+    expect(isQueueItemClosed(item)).toBe(true)
+    expect(isOpenItem(item)).toBe(false)
+    expect(q.items('alpha').filter(isOpenItem).map(i => i.accepted.seq)).toEqual([2])
+    expect(q.openCount('alpha')).toBe(1)
+    expect(q.openCount('beta')).toBe(1)
+    expect(item.records.filter(r => r.kind === 'delivered')).toEqual([])
+    expect(q.replyReminderItems('alpha')).toEqual([])
+  })
+
+  test('refusals and competing abandon calls observe earlier writes in the same serialized writer order', async () => {
+    const gate = holdFirstSync(path => path === queuePath(dir), { armed: false })
+    const q = await open({ fs: gate.io.fs })
+    await q.accept('alpha', injectedInput())
+    await q.accept('alpha', injectedInput({ text: 'second' }))
+    await q.accept('alpha', injectedInput({ text: 'third' }))
+    await q.append('alpha', fixedRecord())
+    // A receipt already in the writer must win, although the public snapshot
+    // still says undelivered. Even unknown/not-head refusals must wait their turn.
+    expect(typeof q.abandon).toBe('function')
+    gate.state.armed = true
+    const receipt = q.append('alpha', deliveredRecord())
+    await gate.reached()
+    const answers: string[] = []
+    const requests = [q.abandon('alpha', 1, 2000), q.abandon('alpha', 999, 2000),
+      q.abandon('alpha', 3, 2000), q.abandon('alpha', 2, 2000), q.abandon('alpha', 2, 2001)]
+      .map(p => p.then((answer: string) => { answers.push(answer); return answer }))
+    try {
+      await Promise.resolve(); await Promise.resolve()
+      expect(answers).toEqual([])
+      expect(q.item('alpha', 1)!.delivered).toBe(false)
+    } finally { gate.gate.release() }
+    await receipt
+    expect(await Promise.all(requests)).toEqual(['delivered', 'unknown', 'not-head', 'abandoned', 'already-abandoned'])
+    expect(q.openCount('alpha')).toBe(1)
+    expect(readQueue(dir).filter(r => r.kind === 'abandoned')).toEqual([abandoned(2)])
+  })
+
+  test('unknown, delivered, not-head and already-abandoned refusals leave journal bytes unchanged', async () => {
+    const q = await open()
+    for (const text of ['done', 'head', 'later']) await q.accept('alpha', injectedInput({ text }))
+    await q.append('alpha', fixedRecord())
+    await q.append('alpha', deliveredRecord())
+    const before = fs.readFileSync(queuePath(dir))
+    for (const [seq, answer] of [[999, 'unknown'], [1, 'delivered'], [3, 'not-head']] as const) {
+      expect(await q.abandon('alpha', seq, 2000)).toBe(answer)
+      expect(fs.readFileSync(queuePath(dir))).toEqual(before)
+    }
+    expect(await q.abandon('alpha', 2, 2000)).toBe('abandoned')
+    const after = fs.readFileSync(queuePath(dir))
+    expect(await q.abandon('alpha', 2, 3000)).toBe('already-abandoned')
+    expect(fs.readFileSync(queuePath(dir))).toEqual(after)
+  })
+
+  test('publication and success wait for fsync, and a failed fsync never publishes abandonment', async () => {
+    const gate = holdFirstSync(path => path === queuePath(dir), { armed: false })
+    const q = await open({ fs: gate.io.fs })
+    await q.accept('alpha', injectedInput())
+    expect(typeof q.abandon).toBe('function')
+    gate.state.armed = true
+    let settled = false
+    const pending = q.abandon('alpha', 1, 2000).finally(() => { settled = true })
+    // Observe now without a matcher: Bun may wait inside a promise matcher,
+    // before this test can release the fsync that settles the promise.
+    const failure = pending.then(() => null, error => error)
+    await gate.reached()
+    try {
+      expect(settled).toBe(false)
+      expect(q.openCount('alpha')).toBe(1)
+      expect(q.item('alpha', 1)!.abandoned).toBeUndefined()
+    } finally { gate.gate.fail(new Error('injected abandon fsync')) }
+    expect(await failure).toEqual(new Error('injected abandon fsync'))
+    expect(q.item('alpha', 1)!.abandoned).toBeUndefined()
+    expect(q.openCount('alpha')).toBe(1)
+    expect(q.isWritable?.('alpha')).toBe(false)
+  })
+
+  test('restart and compaction retain accepted text, fixed bytes, abandonment and permanent Slack dedupe', async () => {
+    let q = await open({ now: () => 1000 })
+    const input = slackInput({ text: 'original\n <unescaped> \u200e🙂', queued_ack_reaction: 'eyes' })
+    await q.accept('alpha', input)
+    await q.append('alpha', fixedRecord(1, ['first', 'legacy \u200e second', 'third']))
+    await q.append('alpha', sentRecord())
+    await q.append('alpha', deliveredRecord(1, 1000))
+    await q.accept('alpha', injectedInput({ text: 'later' }))
+    expect(await q.abandon('alpha', 1, 2000)).toBe('abandoned')
+    const preserved = q.item('alpha', 1)!.records
+    for (const compact of [false, true, true]) {
+      if (compact) await q.compact('alpha')
+      await q.stop()
+      q = await open({ now: () => QUEUE_KEY_KEEP_MS * 10 })
+      expect(q.item('alpha', 1)!.records).toEqual(preserved)
+      expect(q.item('alpha', 1)!.accepted.text).toBe(input.text)
+      expect(q.item('alpha', 1)!.fixed!.parts).toEqual(['first', 'legacy \u200e second', 'third'])
+      expect(q.item('alpha', 1)!.abandoned).toEqual(abandoned())
+      expect(q.item('alpha', 1)!.delivered).toBe(false)
+      expect(q.lookupSlackKey('alpha', input.key!)).toMatchObject({ status: 'duplicate', seq: 1 })
+      expect((await q.accept('alpha', input)).status).toBe('duplicate')
+      expect(q.items('alpha').filter(isOpenItem).map(i => i.accepted.seq)).toEqual([2])
+      expect(q.openCount('alpha')).toBe(1)
+    }
+  })
+
+  test('a torn abandonment is quarantined and never closes the accepted head', async () => {
+    const record = abandoned()
+    // Positive schema control makes this a regression even before replay knows
+    // the new kind; the malformed tail itself must never become a receipt.
+    expect(isQueueRecord(record)).toBe(true)
+    const torn = JSON.stringify(record).slice(0, -2)
+    seedQueue(dir, [accepted(), fixedRecord(), torn])
+    const q = await open()
+    expect(q.item('alpha', 1)!.abandoned).toBeUndefined()
+    expect(q.openCount('alpha')).toBe(1)
+    const finding = q.startupFindings().find(e => e.type === 'record-unreadable')
+    expect(finding).toMatchObject({ type: 'record-unreadable', key: 'alpha', line: 3 })
+    if (finding?.type !== 'record-unreadable') throw new Error('missing quarantine finding')
+    expect(fs.readFileSync(finding.quarantinePath, 'utf8')).toContain(torn)
+    await q.compact('alpha')
+    expect(q.item('alpha', 1)!.delivered).toBe(false)
+  })
+})
 function recordSyncs() {
   const synced: string[] = []
   let failing: ((path: string) => boolean) | undefined

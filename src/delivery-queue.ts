@@ -156,22 +156,26 @@ export interface ReplyReminderRecord extends BaseRecord {
 }
 export interface ReplyCallTarget { seq: number; attempts?: number[] }
 export interface NoticedRecord extends BaseRecord { kind: 'noticed'; at: number }
+/** Operator resolution without delivery; every item record remains retained. */
+export interface AbandonedRecord extends BaseRecord { kind: 'abandoned'; at: number }
+export type AbandonResult = 'abandoned' | 'unknown' | 'delivered' | 'not-head' | 'already-abandoned'
 /** A hold resolution's record kind. A withdrawn hold's is `hold-withdrawn`, apart from a Reaction Item's `withdrawn`. */
 export type HoldResolutionKind = 'released' | 'hold-withdrawn' | 'parked'
 const HOLD_RESOLUTION_KINDS: Readonly<Record<HoldOutcome, HoldResolutionKind>> = { released: 'released', withdrawn: 'hold-withdrawn', parked: 'parked' }
 const HOLD_OUTCOMES: readonly HoldOutcome[] = ['released', 'withdrawn', 'parked']
 export interface HoldResolutionRecord extends BaseRecord { kind: HoldResolutionKind; at: number }
-export type QueueRecord = AcceptedRecord | QueueKeyRecord | QueueAllocationRecord | QueueReactionKeyRecord | FixedRecord | WithdrawnRecord | SentRecord | UnknownSentRecord | SubmittedRecord | SubmissionBlockedRecord | DeliveredRecord | RefusedRecord | NoticedRecord | ReplyReminderRecord | HoldResolutionRecord
-export type ItemRecord = AcceptedRecord | FixedRecord | WithdrawnRecord | SentRecord | UnknownSentRecord | SubmittedRecord | SubmissionBlockedRecord | DeliveredRecord | RefusedRecord | NoticedRecord | HoldResolutionRecord
+export type QueueRecord = AcceptedRecord | QueueKeyRecord | QueueAllocationRecord | QueueReactionKeyRecord | FixedRecord | WithdrawnRecord | SentRecord | UnknownSentRecord | SubmittedRecord | SubmissionBlockedRecord | DeliveredRecord | RefusedRecord | NoticedRecord | ReplyReminderRecord | HoldResolutionRecord | AbandonedRecord
+export type ItemRecord = AcceptedRecord | FixedRecord | WithdrawnRecord | SentRecord | UnknownSentRecord | SubmittedRecord | SubmissionBlockedRecord | DeliveredRecord | RefusedRecord | NoticedRecord | HoldResolutionRecord | AbandonedRecord
 export interface QueueItem {
   accepted: AcceptedRecord; fixed?: FixedRecord; records: ItemRecord[]; delivered: boolean
   /** A withdrawn item stays `delivered: false`; see isQueueItemClosed. */
   withdrawn?: WithdrawnRecord
+  abandoned?: AbandonedRecord
   unknownSend: boolean; retypeCount: number; nextAttempt: number
   hold?: HoldSummary
 }
-/** Delivered or withdrawn: no longer FIFO work. */
-export function isQueueItemClosed(item: Pick<QueueItem, 'delivered' | 'withdrawn'>): boolean { return item.delivered || item.withdrawn !== undefined }
+/** Delivered, withdrawn or abandoned: no longer FIFO work. */
+export function isQueueItemClosed(item: Pick<QueueItem, 'delivered' | 'withdrawn' | 'abandoned'>): boolean { return item.delivered || item.withdrawn !== undefined || item.abandoned !== undefined }
 /** The item's fixed or withdrawn outcome is already durable. The journal stays writable. */
 export class QueueOutcomeFinal extends Error {}
 /** Only Reaction Items have a withdrawn outcome. Not a storage failure: the journal stays writable. */
@@ -213,6 +217,8 @@ export interface DeliveryQueue {
    * any later decision. */
   acceptDecided<T>(key: string, slackKey: SlackKey | undefined, decide: (facts: { keyChecked: boolean }) => QueueAcceptDecision<T>): Promise<QueueDecidedResult<T>>
   append(key: string, record: QueueRecord): Promise<void>
+  /** Check and close exactly the open head in one serialized durable turn. */
+  abandon(key: string, seq: number, at: number): Promise<AbandonResult>
   /** One durable caller identity per state directory; lazy, before covered sends. */
   callerUuid?(): string
   /** Adopt pre-two-stage accepted work before its first queued Slack mutation. */
@@ -379,6 +385,7 @@ export function isQueueRecord(value: unknown): value is QueueRecord {
     case 'refused': return positive(r.attempt) && number(r.at)
     case 'reply-reminder': return number(r.at) && (r.delivered_at === undefined || number(r.delivered_at)) && str(r.state) && ['observed', 'replied', 'nudged', 'cancelled'].includes(r.state) && (r.row_state === undefined || str(r.row_state)) && (r.session_id === undefined || str(r.session_id)) && (r.launch_started_at === undefined || r.launch_started_at === null || str(r.launch_started_at)) && (r.reply_attempts === undefined || (r.state === 'replied' && Array.isArray(r.reply_attempts) && r.reply_attempts.length > 0 && r.reply_attempts.every(positive))) && (r.delivery_attempts === undefined || (Array.isArray(r.delivery_attempts) && r.delivery_attempts.length > 0 && r.delivery_attempts.every(positive)))
     case 'noticed': return number(r.at)
+    case 'abandoned': return positive(r.seq) && number(r.at) && onlyKeys(r, ['v', 'kind', 'seq', 'at'])
     case 'released': case 'hold-withdrawn': case 'parked':
       return number(r.at) && Object.keys(r).every(k => ['v', 'kind', 'seq', 'at'].includes(k))
     default: return false
@@ -517,6 +524,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     for (const r of records) {
       if (r.kind === 'fixed' && !item.withdrawn) item.fixed ??= r
       else if (r.kind === 'withdrawn' && !item.fixed && !item.withdrawn && accepted.source === 'reaction') item.withdrawn = r
+      else if (r.kind === 'abandoned') item.abandoned ??= r
     }
     const refused = new Set(records.flatMap(r => r.kind === 'refused' ? [r.attempt] : []))
     for (const r of records) if (r.kind === 'refused' || r.kind === 'submitted' || r.kind === 'submission-blocked') item.nextAttempt = Math.max(item.nextAttempt, r.attempt + 1)
@@ -657,7 +665,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
           if (raw.kind === 'submitted') update(j, { v: 1, kind: 'submission-blocked', seq, attempt, at: item.accepted.received_at, reason: 'damaged-submission: pair unknown; automatic resend forbidden' })
           else update(j, { v: 1, kind: 'sent', seq, attempt, unknown_outcome: true, at: item.accepted.received_at, quarantine: { path: quarantinePath, line: l.line } })
         }
-        event({ type: 'record-unreadable', key, line: l.line, quarantinePath, alert: l.line !== lines.length && !(integer(seq) && accepted.has(seq)) && (raw?.kind === 'accepted' || !oneOf(['fixed', 'withdrawn', 'sent', 'delivered', 'refused', 'noticed', 'released', 'hold-withdrawn', 'parked'], raw?.kind)) })
+        event({ type: 'record-unreadable', key, line: l.line, quarantinePath, alert: l.line !== lines.length && !(integer(seq) && accepted.has(seq)) && (raw?.kind === 'accepted' || !oneOf(['fixed', 'withdrawn', 'abandoned', 'sent', 'delivered', 'refused', 'noticed', 'released', 'hold-withdrawn', 'parked'], raw?.kind)) })
       }
       // Retry this exact replay, without appending the quarantined bytes again.
       // Rewriting also persists unknown-send markers atomically with removal of
@@ -729,7 +737,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
   function replyTargets(j: Journal): ReplyCallTarget[] {
     const targets = new Map(replyCandidates(j).map(record => [record.seq, { seq: record.seq } as ReplyCallTarget]))
     for (const item of materialize(j)) {
-      if (item.accepted.source !== 'slack') continue
+      if (item.accepted.source !== 'slack' || item.abandoned) continue
       const attempts = unrefusedAttempts(item)
       const previous = j.reminders.get(item.accepted.seq)
       if (attempts.length && (!previous || previous.state === 'replied')) {
@@ -755,7 +763,10 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
       const queuedReminders = new Set(materialize(j).flatMap(item => item.accepted.reminder_for === undefined ? [] : [item.accepted.reminder_for]))
       for (const r of j.records) if (r.kind === 'accepted' && 'compact' in r && (r.compact === 'key' || r.compact === 'reaction-key') && at - r.received_at < QUEUE_KEY_KEEP_MS) retained.push(r)
       for (const item of materialize(j)) {
-        if (item.hold?.state === 'withdrawn') {
+        if (item.abandoned) {
+          // Operator resolution never discards text, attempts, receipts or dedupe.
+          retained.push(...item.records)
+        } else if (item.hold?.state === 'withdrawn') {
           if (item.accepted.key && at - item.accepted.received_at < QUEUE_KEY_KEEP_MS) retained.push({ v: 1, kind: 'accepted', seq: item.accepted.seq, compact: 'key', key: item.accepted.key, received_at: item.accepted.received_at, delivered_at: item.hold.at! })
         } else if (isQueueItemClosed(item)) {
           // Closed content goes; only a fresh key fact stays, unless Thread Memory
@@ -1090,6 +1101,29 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
         settle: outcome => resolve('error' in outcome ? storeFailed(key, input, outcome.error) : outcome.result as QueueDecidedResult<T>),
       }))
     },
+    async abandon(key, seq, at) {
+      const path = pathFor(key)
+      return serial(key, async () => {
+        if (!started || stopped) throw new Error('Queue is not writable')
+        const storageFailed = (error: unknown): never => {
+          appendBlocked.add(key)
+          event({ type: 'append-failed', key, path, seq, error })
+          throw error
+        }
+        try { await load(key) } catch (error) { storageFailed(error) }
+        const j = journal(key), item = j.items.get(seq)
+        if (!item) return 'unknown'
+        if (item.delivered) return 'delivered'
+        if (item.abandoned) return 'already-abandoned'
+        if (materialize(j).find(isOpenItem)?.accepted.seq !== seq) return 'not-head'
+        const record: AbandonedRecord = { v: 1, kind: 'abandoned', seq, at }
+        if (!isQueueRecord(record)) throw new Error('Invalid abandonment record')
+        try { await durableAppend(path, Buffer.from(JSON.stringify(record) + '\n'), j) } catch (error) { storageFailed(error) }
+        update(j, record)
+        if (appendBlocked.delete(key)) event({ type: 'writable', key })
+        return 'abandoned'
+      })
+    },
     async append(key, record) {
       if (!started || stopped) throw new Error('Queue is not writable')
       record = structuredClone(record)
@@ -1104,12 +1138,13 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
         const turnStarted = record.kind === 'fixed' ? turnStart() : undefined
         try { await load(key) } catch (error) { storageFailed(error) }
         const j = journal(key)
-        if (!isQueueRecord(record) || record.kind === 'accepted' || record.kind === 'reply-reminder' || isHoldResolution(record)) throw new Error('Invalid append record')
+        if (!isQueueRecord(record) || record.kind === 'accepted' || record.kind === 'reply-reminder' || record.kind === 'abandoned' || isHoldResolution(record)) throw new Error('Invalid append record')
         const item = j.items.get(record.seq)
         if (!item) {
           if ((record.kind === 'fixed' || record.kind === 'withdrawn') && compactedClosed(j, record.seq)) throw new QueueOutcomeFinal('Closed item was compacted')
           throw new Error('Append has no accepted item')
         }
+        if (item.abandoned) throw new QueueOutcomeFinal('Abandoned item is closed')
         // A durable fixed or withdrawn outcome is never decided again, and a
         // withdrawn item takes no attempt, receipt or notice.
         if (record.kind === 'withdrawn') {

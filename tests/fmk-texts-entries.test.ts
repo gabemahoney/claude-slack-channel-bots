@@ -59,6 +59,7 @@ import { join } from 'node:path'
 import ts from 'typescript'
 
 import * as adDescriptionPhrases from '../src/ad-description-phrases.ts'
+import * as abandonMessage from '../src/abandon-message.ts'
 import * as adConfigFile from '../src/ad-config-file.ts'
 import * as adErrorClass from '../src/ad-error-class.ts'
 import * as agentDirectorTemplate from '../src/agent-director-template.ts'
@@ -236,6 +237,7 @@ describe('test-29 Channel Stamp printer', () => {
 
 /** The `src/` modules the printer reads, by the file name it passes. */
 const MODULES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
+  'abandon-message.ts': abandonMessage,
   'install-check.ts': installCheck,
   'install-skill-pointer.ts': installSkillPointer,
   'ad-description-phrases.ts': adDescriptionPhrases,

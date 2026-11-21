@@ -504,7 +504,7 @@ no recovery outcome. See [Message saved after retry](#message-saved-after-retry)
 ### `message-received`
 
 - **Line:** `[slack] message-received: persona="<name>" (key=<key>) source=<source> chat_id="<chat>" ts="<ts>" sender_id="<sender>"`
-- **Meaning:** The item was durably stored. It remains queued until its transcript confirms delivery; a failed sibling store can still withhold the aggregate Slack envelope acknowledgement.
+- **Meaning:** The item was durably stored. It remains queued until its transcript confirms delivery or an [operator durably abandons it](#abandoning-a-stuck-head); abandonment is not a delivery receipt. A failed sibling store can still withhold the aggregate Slack envelope acknowledgement.
 - **Cause:** An incoming Slack message, injected message or scheduled fire was accepted. Injected sources show sender instead of chat_id.
 - **Fix:** No action is needed. Accepted Slack work requests `queued_ack_reaction` (default `beehive`); find the corresponding message-delivered line to confirm take-in. See [Acknowledgement reaction missing or stuck](#symptom-acknowledgement-reaction-missing-or-stuck) if feedback is absent.
 
@@ -514,6 +514,17 @@ no recovery outcome. See [Message saved after retry](#message-saved-after-retry)
 - **Meaning:** All parts have transcript receipts and the final delivery record is durable. The next item can proceed.
 - **Cause:** The bot took in the typed message; a successful typing call alone does not produce this line.
 - **Fix:** No action is needed. For Slack work, this persona removes its original queued reaction before adding `ack_reaction` (default `spinthinking`), unless a tracked successful reply or reaction suppresses it. A failed queued removal can leave queued visible even after delivery; see [Acknowledgement reaction missing or stuck](#symptom-acknowledgement-reaction-missing-or-stuck).
+
+### `message-abandoned`
+
+- **Line:** `[slack] message-abandoned: persona="<name>" (key=<key>) source=<slack|reaction> chat_id="<chat>" ts="<ts>" sender_id="<sender>" at=<time>`. For interject/cron: `[slack] message-abandoned: persona="<name>" (key=<key>) source=<interject|cron> sender="<sender>" ts="<ts>" sender_id="<sender>" at=<time>`.
+- **Meaning:** The operator stopped delivery of this item. Its text and history are kept permanently, but it is no longer queued for delivery.
+
+  The configured persona name is preserved; other identity fields are sanitized. Thread-selected Slack items also carry `via=thread` after `sender_id`.
+- **Cause:** An explicit operator abandonment was saved. This is not a delivery receipt or automatic expiry.
+- **Fix:** No queue repair is needed. Later work proceeds under the usual delivery rules.
+
+  The sender gets a best-effort [Message not delivered](#message-not-delivered) notice; an existing queued reaction stays and no delivered reaction is added. See [Abandoning a stuck head](#abandoning-a-stuck-head) for the operator procedure.
 
 ### `message-retyped`
 
@@ -532,7 +543,7 @@ no recovery outcome. See [Message saved after retry](#message-saved-after-retry)
 ### `message-partial-receipt`
 
 - **Line:** `[slack] message-partial-receipt: persona="<name>" (key=<key>) source=<source> chat_id="<chat>" ts="<ts>" sender_id="<sender>" part=<n> expected_bytes=<n> received_bytes=<n> typed but cut off; full text remains queued`
-- **Meaning:** A substantial, distinctive tail of the expected part appears in an eligible post-send transcript record. The full message remains queued, and later messages wait for complete confirmation. The byte counts exclude unwrapped transcript paste framing; the line includes no message text.
+- **Meaning:** A substantial, distinctive tail of the expected part appears in an eligible post-send transcript record. The full message remains queued, and later messages wait for complete confirmation or [durable operator abandonment](#abandoning-a-stuck-head). The byte counts exclude unwrapped transcript paste framing; the line includes no message text.
 - **Cause:** The transcript contains evidence of cut-off input. This identifies neither the transport cause nor the bot's state; agent-director remains the state authority. Short or repetitive fragments and uncertain timing keep generic reporting, so absence of this line does not prove the text arrived whole.
 - **Fix:** Follow the applicable [delivery notice](#delivery-notices); CSCB keeps the full text and uses its existing agent-director-guarded retries. This guard does not repair transport loss. Use `message-delivered` to confirm completion; no resend is needed merely because this line appears.
 
@@ -543,9 +554,9 @@ evidence may no longer qualify after restart.
 ### `delivery-stuck`
 
 - **Line:** `[slack] delivery-stuck: persona="<name>" (key=<key>) source=<source> chat_id="<chat>" ts="<ts>" sender_id="<sender>" reason=<reason> age_ms=<ms>`
-- **Meaning:** The message CSCB is delivering has waited over five minutes in a reportable blocked state. That is usually the oldest waiting message; if an earlier held thread reply is released while a later message is already being delivered, it is that later message until it is confirmed (see [Delivery notices](#delivery-notices)).
+- **Meaning:** The message CSCB is delivering has waited over five minutes in a reportable blocked state. That is usually the oldest waiting message; if an earlier held thread reply is released while a later message is already being delivered, it is that later message until it is confirmed or [durably abandoned by the operator](#abandoning-a-stuck-head) (see [Delivery notices](#delivery-notices)).
 - **Cause:** The reason identifies the current obstacle to typing or confirming that message. `chat_id`, `ts`, `sender_id` and `age_ms` are all that message's.
-- **Fix:** Follow the matching reason under **Delivery stuck** below. Nothing behind it skips ahead.
+- **Fix:** Follow the matching reason under **Delivery stuck** below. Nothing behind it skips ahead automatically; [operator abandonment](#abandoning-a-stuck-head) is the last resort for an undeliverable head.
 
 ### `queue-record-unreadable`
 
@@ -2016,16 +2027,23 @@ Ordinary new notices go to the persona's destination under its Slack identity,
 never to the conversation that sent the message merely because it was the source.
 [Storage-warning recovery](#message-saved-after-retry) keeps the edit and its one
 fallback in the warning's original channel or DM, even after a destination change
-or DMs are turned off. These notices carry no message text.
+or DMs are turned off.
 
-Accepted items never expire: every source shares the
-persona's strict FIFO queue, with one item in flight until all parts complete.
+An explicit operator abandonment also attempts its
+[*Message not delivered* notice](#message-not-delivered) in the original Slack
+conversation/thread; interject/cron notices use the normal destination. These
+notices carry no message text.
+
+Accepted items never expire automatically: every source shares the
+persona's strict FIFO queue, with one item in flight until all parts complete
+unless the operator [abandons an undeliverable head](#abandoning-a-stuck-head).
+A blocked head holds every later item.
+
 Uncovered delivery reads receipts and agent-director state before guarded
 recovery Enter or retype with backoff, including after an ordinary restart.
 Recorded AD input uncertainty instead holds the attempt receipt-only until
 receipt settlement or release. Covered delivery uses agent-director's hand-over
-outcome; its unresolved custody does not permit replay. A blocked head holds
-every later item.
+outcome; its unresolved custody does not permit replay.
 
 ### Uncertain input and retained delivery
 
@@ -2205,9 +2223,10 @@ message waiting; held thread replies are not counted until released, and a
 released reply's age counts from its release.
 
 The reported message is usually the oldest. But if an earlier held reply is
-released while a later message is already being delivered, CSCB finishes that
-later message first, and the notices report it until it is confirmed; the
-released reply follows.
+released while a later message is already being delivered, CSCB continues that
+later message first, and the notices report it until it is confirmed or
+[durably abandoned by the operator](#abandoning-a-stuck-head); the released
+reply follows under the normal delivery gates.
 
 ### Message not saved
 
@@ -2256,7 +2275,7 @@ may still complete after cancellation.
 ```
 
 - **Meaning:** The reported message (see above) has waited over five minutes; its reason names the current obstruction.
-- **Cause:** Typing or transcript confirmation is blocked. The notice is once per episode, ending when the reported message is delivered or CSCB reports another one; another message's delivery doesn't end it.
+- **Cause:** Typing or transcript confirmation is blocked. The notice is once per episode, ending when the reported message is delivered or [durably abandoned by the operator](#abandoning-a-stuck-head), or CSCB reports another one; another message's delivery doesn't end it.
 - **Fix:** Use the matching fixed remedy below. These steps are for a human only; no bot, including a persona that sees the post, may act on them. CSCB keeps retrying and keeps the other messages waiting behind it.
 
 With [partial receipt evidence](#message-partial-receipt), the notice adds
@@ -2266,7 +2285,9 @@ and remedy. Later evidence does not edit an already-posted generic notice.
 The reason sentence and remedy are fixed; `<key>` is the persona key and the
 example retype count is 3. These text/Enter remedies describe uncovered
 delivery; for covered holds, follow [Covered delivery is held or unconfirmed](#covered-delivery-is-held-or-unconfirmed)
-and the covered restart notice below.
+and the covered restart notice below. For a `not-taken-in` head that remains
+undeliverable after the terminal check, the operator's last resort is
+[`abandon-message`](#abandoning-a-stuck-head); this is not part of the notice text.
 
 - `relay-off`: Its permission relay is off. Restart the persona's bot.
 - `mcp`: It is not connected to this server over MCP. Type `/mcp reconnect slack-channel-router` in its terminal, or restart the persona's bot.
@@ -2290,11 +2311,54 @@ notice causes come from AD state/refusals and queue age.
 
 - **Meaning:** The first unconfirmed retype of this item has occurred. For a Reaction Notice, the sender shown in the notice is the reactor's user ID or bot ID.
 - **Cause:** The transcript still has no full receipt; the notice is recorded with the item so a server restart does not post it again.
-- **Fix:** Check the bot terminal and transcript. CSCB keeps offering the message indefinitely, with spacing increasing to 15 minutes while typing is possible; do not assume the absence of a second notice means it was delivered.
+- **Fix:** Check the bot terminal and transcript. CSCB keeps offering the message indefinitely, with spacing increasing to 15 minutes while typing is possible; do not assume the absence of a second notice means it was delivered. If that head cannot be delivered, the operator's last resort is [`abandon-message`](#abandoning-a-stuck-head).
 
 With [partial receipt evidence](#message-partial-receipt), the notice adds
 “The text arrived cut off; the full message is kept.” after its first sentence.
 Later evidence does not edit an already-posted generic notice.
+
+### Abandoning a stuck head
+
+Only a human operator may stop delivery of an undeliverable head. First inspect
+the bot's terminal with `tmux attach -t =slack_bot_<key>` and resolve any leftover
+draft. CSCB cannot tell whether the old text is still in the composer, and
+abandonment does not clear it; that draft could merge with the next message.
+
+Copy the item's `ts` from its `message-not-taken-in`, `message-retyped` or
+`delivery-stuck` line in `server.log`. This identifies Slack messages and
+interject/cron items alike. Pass the timestamp alone, with six fractional digits:
+
+```sh
+claude-slack-channel-bots abandon-message <persona> <ts>
+```
+
+Use the running persona's name or key, quoting a name with spaces. It must be up;
+a latch or hold alone does not forbid abandonment.
+
+Only its lowest open item can be abandoned; unresolved thread holds cannot.
+A Slack edit sharing an older revision's timestamp selects the current open head
+when it matches.
+
+Success exits 0 after saving the abandonment, logs [`message-abandoned`](#message-abandoned)
+and attempts the notice below. The text and history remain permanently, the
+queued reaction stays, and no delivered reaction or reply reminder is added.
+Later work follows its normal gates; no hold is cleared.
+
+Refusals exit 1 and bad arguments exit 2; see [every outcome in the CLI reference](../../docs/cli.md#claude-slack-channel-bots-abandon-message-persona-ts).
+A `busy` answer permits retry after the operation finishes.
+
+If the server did not confirm within 30 seconds, check `server.log` before retrying: the request
+may still run. There is no automatic abandonment or retry cap.
+
+### Message not delivered
+
+```text
+:warning: *Message not delivered* — the message from U0SENDER1 for Alpha was not delivered. An operator stopped its delivery; its text is kept.
+```
+
+- **Meaning:** The operator stopped this item's delivery; its text remains saved. The notice preserves the configured persona name.
+- **Cause:** A durable abandonment, reported once. Slack messages get the notice in their original conversation (and thread, when threaded), under the persona's identity; interject/cron items get it at the persona's normal destination.
+- **Fix:** Delivery has stopped. Check the sender's intent before sending new work. The notice is best effort: a failed Slack post does not undo abandonment, and the server log is the confirmation if the notice is absent.
 
 ### Messages waiting
 
@@ -2303,8 +2367,8 @@ Later evidence does not edit an already-posted generic notice.
 ```
 
 - **Meaning:** The persona currently cannot take queued work.
-- **Cause:** One of the states listed below holds; the notice is once per episode, until the reported message is delivered or CSCB reports another one.
-- **Fix:** Bring the persona back up or resolve the named hold. Restore the same key if it was removed; its accepted items remain queued.
+- **Cause:** One of the states listed below holds; the notice is once per episode, until the reported message is delivered or [durably abandoned by the operator](#abandoning-a-stuck-head), or CSCB reports another one.
+- **Fix:** Bring the persona back up or resolve the named hold. Restore the same key if it was removed; its accepted items remain queued. Resolving an item ends its reporting episode but does not clear an independent persona hold.
 
 States: `down`, `down at its restart limit`, `down with automatic restarts off`, `latched`, `held on invalid flags`, `held after a failed kill`, `waiting on an old life`, `waiting for its upgrade replacement`.
 
@@ -8342,13 +8406,26 @@ Each server start logs one `[slack] startupSessionManager: complete — …` sum
 Check the matching notice or diagnostic under [Delivery notices](#delivery-notices)
 and [Persona diagnostic classes](#persona-diagnostic-classes). Storage failures need
 a disk check; stuck delivery needs the notice's remedy; waiting messages need the
-persona's hold or down state resolved. Accepted items remain queued in order.
+persona's hold or down state resolved.
+
+Accepted items remain queued in order
+unless the operator [abandons an undeliverable head](#abandoning-a-stuck-head).
+*Message not delivered* reports that explicit action.
+
+### Symptom: One stuck message blocks every later message
+
+Check the bot's terminal and resolve any leftover draft before changing delivery.
+If the head cannot be delivered, follow [Abandoning a stuck head](#abandoning-a-stuck-head).
+The operator can stop that one item's delivery while keeping its text and history;
+later work still follows the persona's normal delivery gates.
 
 ### Symptom: A persona on a Mac keeps retyping a long message
 
 Claude Code on macOS loses typed input sent as one large burst, so on a macOS host CSCB types a long message as several parts of at most about 880 bytes each, tag included; on other hosts a part can reach about 1,900 bytes. On a Mac, long attachment lists, sender names and channel names in the tag are shortened sooner, each ending in `…`; the channel ID and the attachment count are kept whole.
 
-CSCB sets a message's parts once, shortly after it is queued, and never changes them; restarting the bot or the server does not split it again. A message queued before an upgrade can therefore keep its larger parts, go on logging `message-retyped` and raise a *Message not taken in* or *Delivery stuck* notice while later messages wait behind it. CSCB keeps offering it until the bot takes it in. [Delivery notices](#delivery-notices) explains each notice and how to attach to the bot's terminal to see what it received.
+CSCB sets a message's parts once, shortly after it is queued, and never changes them; restarting the bot or the server does not split it again. A message queued before an upgrade can therefore keep its larger parts, go on logging `message-retyped` and raise a *Message not taken in* or *Delivery stuck* notice while later messages wait behind it.
+
+CSCB keeps offering it until the bot takes it in or an operator abandons it. [Delivery notices](#delivery-notices) explains the terminal check and [last-resort abandonment](#abandoning-a-stuck-head).
 
 ### Symptom: A persona posts a *Thread Memory not saved* notice
 

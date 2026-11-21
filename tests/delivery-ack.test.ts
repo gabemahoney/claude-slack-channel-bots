@@ -5,12 +5,13 @@ import { join } from 'node:path'
 import { _resetAckTracker, addDeliveryAck, consumeAck, createQueuedAckCallback, createDeliveryAckCallback, forgetPersonaAcks } from '../src/ack-tracker.ts'
 import type { AcceptedInput, ReplyReminderQueue } from '../src/delivery-queue.ts'
 import { buildDeliveryDiagnostic, buildDeliveryDispatchLine, createDeliveryReporting, deliveryIdentity, MESSAGE_DELIVERED, MESSAGE_RECEIVED } from '../src/delivery-notices.ts'
+import { createOriginalConversationPoster } from '../src/notice-correction.ts'
 import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
 import { makeDeliveryNoticeHarness, type DeliveryNoticeHarness } from './test-helpers/delivery-notices.ts'
 import { reactionInput, deliveredRecord, queuePath, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
 import { makeQueuedAckHarness, type QueuedAckHarness } from './test-helpers/queued-ack.ts'
-import { makeStubSlack } from './test-helpers/slack-stub.ts'
+import { asWebClient, makeStubSlack } from './test-helpers/slack-stub.ts'
 import type { GetResult } from 'agent-director'
 import { createReplyReminders, REPLY_TOOL_PREALLOWED_LABEL, type ReplyReminders } from '../src/reply-reminder.ts'
 import { cannedGetResult } from './test-helpers/agent-director-stub.ts'
@@ -24,6 +25,7 @@ async function setup() {
   const e = await makeEngineHarness({ onEvent: event => reporting?.engineEvent(event) }); engines.push(e)
   const n = await makeDeliveryNoticeHarness({ queue: e.queue }); notices.push(n)
   reporting = createDeliveryReporting({ queue: e.queue, episodes: n.rig.episodes, persona: key => n.config.personas.find(p => p.key === key), state: () => ({ up: true }),
+    postOriginalNotice: createOriginalConversationPoster({ clientFor: key => asWebClient(n.h.stub(key).web) }),
     log: line => n.logs.push(line), notify: (key, text) => n.h.notifier.notify(key, text),
     delivered: createDeliveryAckCallback({ getReaction: () => 'white_check_mark', clientFor: key => n.h.stub(key).web }),
   })

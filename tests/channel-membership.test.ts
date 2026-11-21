@@ -1247,6 +1247,7 @@ test('actual socket gap recovers missed leave/join while idle and restores queue
   for (const key of ['alpha', 'beta']) stub(f, key).script.inventory.push(membershipPage([C.primary]))
   await f.start(); await f.scan()
   const { createDeliveryReporting } = await import('../src/delivery-notices.ts')
+  const { createOriginalConversationPoster } = await import('../src/notice-correction.ts')
   const { createPersonaEpisodes } = await import('../src/persona-episodes.ts')
   const { createQueuedAckCallback, createDeliveryAckCallback } = await import('../src/ack-tracker.ts')
   const { composePersonaStatusListeners } = await import('../src/persona-start.ts')
@@ -1257,6 +1258,7 @@ test('actual socket gap recovers missed leave/join while idle and restores queue
   const queued = createQueuedAckCallback({ queue: managed.queue, clientFor: f.h.clientFor, getReaction: () => f.h.config!.queued_ack_reaction })
   const delivered = createDeliveryAckCallback({ queue: managed.queue, clientFor: f.h.clientFor, getReaction: () => 'eyes' })
   const reporting = createDeliveryReporting({ queue: managed.queue, episodes, persona: f.h.getPersona,
+    postOriginalNotice: createOriginalConversationPoster({ clientFor: f.h.clientFor }),
     state: key => ({ up: f.bringUps.isUp(key) }), log: line => f.lines.push(line), notify: () => {},
     queued: (key, item) => { const result = queued(key, item); pending.push(result); return result },
     delivered: (key, item) => { const result = delivered(key, item); pending.push(result); return result },

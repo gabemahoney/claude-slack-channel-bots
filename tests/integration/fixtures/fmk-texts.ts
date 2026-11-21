@@ -523,6 +523,9 @@
  *                                                src/persona-diagnostics.ts: its cause
  *   PERSONA_CHANNEL_DELIVERY_SET                 src/persona-diagnostics.ts, the class label
  *   MESSAGE_RECEIVED, MESSAGE_DELIVERED          src/persona-diagnostics.ts, delivery evidence labels
+ *   MESSAGE_NOT_TAKEN_IN, MESSAGE_RETYPED, MESSAGE_ABANDONED   test-69 delivery evidence labels
+ *   buildMessageAbandonedNotice <persona-ref> <sender>       test-69 notice body
+ *   abandonMessageReport <status> <json-body>                test-69 exact CLI result line
  *   THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MIN_MS, THREAD_MEMORY_RETRY_MAX_MS
  *                                                src/delivery-constants.ts: one metadata
  *                                                attempt's deadline and the local retry
@@ -5942,6 +5945,19 @@ const reactionMessageUnknownLine: Entry = {
 
 /** The printer's entries, by the name a script passes. Later scenarios add entries here. */
 const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
+  abandonMessageReport: {
+    synopsis: '<status> <json-body>',
+    async print(args, context) {
+      const entry = 'abandonMessageReport'
+      expectArguments(entry, args, ['status', 'json-body'])
+      const build = await packageFunction<typeof import('../../../src/abandon-message.ts').abandonMessageReport>(context, 'abandon-message.ts', entry)
+      return builtString(entry, build({ status: Number(integerArgument(entry, 'status', args[0])), body: args[1] }).line)
+    },
+  },
+  buildMessageAbandonedNotice: builderEntry('delivery-notices.ts', 'buildMessageAbandonedNotice', ['persona-ref', 'sender']),
+  MESSAGE_NOT_TAKEN_IN: constantEntry('persona-diagnostics.ts', 'MESSAGE_NOT_TAKEN_IN'),
+  MESSAGE_RETYPED: constantEntry('persona-diagnostics.ts', 'MESSAGE_RETYPED'),
+  MESSAGE_ABANDONED: constantEntry('persona-diagnostics.ts', 'MESSAGE_ABANDONED'),
   buildSharedStateUnresolvedNotice,
   buildSharedStateUnresolvedLine,
   buildSharedStateRecoveredNotice,

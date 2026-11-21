@@ -12,6 +12,7 @@ import { buildTagParts, NAME_LOOKUP_TIMEOUT_MS, TAG_MAX_BYTES, TAG_MAX_BYTES_MAC
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import type { AcceptedRecord, PostHoldField, QueueEvent } from '../src/delivery-queue.ts'
 import { createDeliveryReporting, MESSAGE_NOT_SAVED, buildMessageNotSavedNotice } from '../src/delivery-notices.ts'
+import { createOriginalConversationPoster } from '../src/notice-correction.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import { formatPersonaNotice } from '../src/persona-notifier.ts'
 import { buildThreadMemoryChangedWhileStoppedNotice } from '../src/thread-memory-reports.ts'
@@ -21,7 +22,7 @@ import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { durableIo } from './test-helpers/durable-io.ts'
 import { outputDuringAsync } from './test-helpers/slack-logger-probes.ts'
 import { makeRestartDeps, makeRoutingHarness, observedMembership, resetRoutingState, NEVER_FIRE_RESTART_DELAY_S, type RoutingHarness, type RoutingHarnessOptions } from './test-helpers/persona-routing-harness.ts'
-import { broadcastText, makeAppMention, makeChannelMessage, makeDm, makeGroupDmMessage, makeBotMessage, makeOwnFileShare, makeReaction, makeWebhookPost, makeStubSlack, makeDeferredWebApiCall, makeMembershipEvent, mentionText, ENVELOPE_FLAG_FORMS, type EnvelopeOverrides, type OwnFileShareOptions, type SlackEvent } from './test-helpers/slack-stub.ts'
+import { asWebClient, broadcastText, makeAppMention, makeChannelMessage, makeDm, makeGroupDmMessage, makeBotMessage, makeOwnFileShare, makeReaction, makeWebhookPost, makeStubSlack, makeDeferredWebApiCall, makeMembershipEvent, mentionText, ENVELOPE_FLAG_FORMS, type EnvelopeOverrides, type OwnFileShareOptions, type SlackEvent } from './test-helpers/slack-stub.ts'
 import type { ChannelMode, Persona } from '../src/config.ts'
 import type { MembershipReading } from '../src/channel-membership.ts'
 import type { PersonaEventProvenance } from '../src/persona-connections.ts'
@@ -101,6 +102,7 @@ async function holdRoutingHarness(mode: ChannelMode, options: Parameters<typeof 
   harnesses.push(h)
   const queued = createQueuedAckCallback({ queue: h.queue, getReaction: () => h.config!.queued_ack_reaction, clientFor: key => h.p(key).stub.web })
   reporting = createDeliveryReporting({ queue: h.queue, episodes: h.episodes, persona: key => h.p(key).persona,
+    postOriginalNotice: createOriginalConversationPoster({ clientFor: key => asWebClient(h.p(key).stub.web) }),
     state: key => ({ up: h.upOutcomes.isUp(key) }), now: () => THREAD_TIME,
     log: line => h.logs.push(line), notify: () => {}, queued: (key, item) => { feedback.push(queued(key, item)) },
   })
@@ -697,6 +699,7 @@ describe.each(['strict', 'open'] as const)('%s serial hybrid joins', mode => {
     let reporting: ReturnType<typeof createDeliveryReporting> | undefined
     const h = await joined({ queueOptions: { fs: io.fs, onEvent: event => { events.push(event); reporting?.queueEvent(event) } }, onReceived: key => { reports.push(key) } })
     reporting = createDeliveryReporting({ queue: h.queue, episodes: h.episodes, persona: key => h.p(key).persona,
+      postOriginalNotice: createOriginalConversationPoster({ clientFor: key => asWebClient(h.p(key).stub.web) }),
       state: () => ({ up: true }), log: line => h.logs.push(line), notify: () => {} })
     io.fail('writeSync', 'beta', { match: path => path === queuePath(dir, 'beta') })
     const event = makeChannelMessage({ channel: CA, ts: THREAD_ROOTS.primary, text: ['alpha', 'beta'].map(k => mentionText(h.p(k).stub.identity.botUserId)).join(' ') })

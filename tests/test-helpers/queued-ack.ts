@@ -4,6 +4,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import { _resetAckTracker, createQueuedAckCallback, createDeliveryAckCallback, consumeAck } from '../../src/ack-tracker.ts'
 import { DEFAULT_ACK_REACTION, DEFAULT_QUEUED_ACK_REACTION, DEFAULT_REPLY_CHUNK_LIMIT, DEFAULT_REPLY_CHUNK_MODE } from '../../src/config.ts'
 import { createDeliveryReporting, type DeliveryReportingDeps } from '../../src/delivery-notices.ts'
+import { createOriginalConversationPoster } from '../../src/notice-correction.ts'
 import { createDeliveryPreparation } from '../../src/delivery-intake.ts'
 import type { QueueItem } from '../../src/delivery-queue.ts'
 import { createPersonaEventRouter } from '../../src/persona-event-router.ts'
@@ -97,6 +98,7 @@ export async function makeQueuedAckHarness(options: { onReplyCall?: (key: string
     queue: e.queue, episodes: n.rig.episodes,
     persona: key => n.config.personas.find(p => p.key === key), state: () => ({ up: true }),
     log: line => n.logs.push(line), notify: (key, text) => n.h.notifier.notify(key, text),
+    postOriginalNotice: createOriginalConversationPoster({ clientFor: key => asWebClient(clientFor(key)) }),
     queued: watch(queued), delivered: watch(delivered), now: e.clock.now,
   }
   reporting = createDeliveryReporting(deps)

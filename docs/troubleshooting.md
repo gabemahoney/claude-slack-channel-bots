@@ -79,10 +79,15 @@ A human resolves the input through agent-director, then releases only the review
 Each start logs one `[slack] startupSessionManager: complete — …` line counting its personas by outcome. `latched`, `retrying`, `waiting on a live-row sequence`, `held on invalid flags` and `fresh as retired keys` are not failures. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-reading-the-start-summary).
 
 **Delivery notices or delivery diagnostic lines**
-For *Message not saved*, check the server disk; for a [`queue-unwritable`](../skills/debug-slack-channel-bots/SKILL.md#queue-unwritable) line, fix the disk and the queued work resumes without a resend. For *Delivery stuck* or *Message not taken in*, follow the notice's remedy; for *Messages waiting*, resolve the persona's state; for *Queue record unreadable*, preserve its file and ask the senders to resend. Accepted messages stay queued in order, including when [`message-partial-receipt`](../skills/debug-slack-channel-bots/SKILL.md#message-partial-receipt) reports cut-off text. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-delivery-notices-or-delivery-diagnostic-lines).
+For *Message not saved* or [`queue-unwritable`](../skills/debug-slack-channel-bots/SKILL.md#queue-unwritable), fix storage; for *Delivery stuck* or *Message not taken in*, follow the notice's remedy; for *Messages waiting*, resolve the persona's state; for *Queue record unreadable*, preserve its file and ask the senders to resend. Accepted messages stay queued in order unless an operator abandons the head; *Message not delivered* reports that action. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-delivery-notices-or-delivery-diagnostic-lines).
+
+**One stuck message blocks every later message**
+A human checks the bot's terminal and resolves any leftover draft first; if the head cannot be delivered, the operator can stop its delivery while retaining its text and notifying the sender. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-one-stuck-message-blocks-every-later-message).
 
 **A persona on a Mac keeps retyping a long message**
-On a macOS host CSCB types a long message in parts of at most about 880 bytes each. A message queued before an upgrade can keep larger parts, and a restart does not split it again: CSCB keeps offering it until the bot takes it in, while later messages wait. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-on-a-mac-keeps-retyping-a-long-message).
+On a macOS host CSCB types a long message in parts of at most about 880 bytes each. A message queued before an upgrade can keep larger parts; a restart does not split it again.
+
+Later messages wait until the bot takes it in or an operator abandons it. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-on-a-mac-keeps-retyping-a-long-message).
 
 **A persona posts a *Thread Memory not saved* notice**
 Check the named path's disk, mount and permissions; saving retries on its own and nothing needs resending. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-thread-memory-not-saved-notice).

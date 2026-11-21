@@ -375,6 +375,14 @@ describe('b.c13 source environment audit', () => {
 /** The repository root (the parent of tests/). */
 const ROOT = resolve(import.meta.dir, '..')
 
+test('b.6cg operator abandonment module exists but is never offered in bot tools or instruction source', () => {
+  expect(existsSync(join(ROOT, 'src/abandon-message.ts'))).toBe(true)
+  // Runtime whole-tool definitions and delivered instructions are also checked
+  // by registry.test.ts. This catches imports/hints before session creation.
+  const registry = stripComments(readFileSync(join(ROOT, 'src/registry.ts'), 'utf8'))
+  expect(registry).not.toMatch(/abandon[-_ ]?message/i)
+})
+
 /** The credentials helper, repo-relative: the one home of the sentinel's value and of `assertNoLeak`. */
 const CREDENTIALS_HELPER = 'tests/test-helpers/credentials.ts'
 
@@ -434,7 +442,7 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/invalid-flags-hold\.ts$/, "the ErrInvalidFlags hold, which posts its operator alert and logs the agent-director versions a re-check reported (a version that is not a short version string is logged as unreadable) and its reactions' failures (described, redacted)"],
   [/^src\/pending-row\.ts$/, "the pending-row rule, whose round, gate and failure lines quote the lap's and the bypassing run's agent-director outcomes (described, redacted) and whose lap Enter outcomes keep the thrown agent-director error raw"],
   [/^src\/persona-routing\.ts$/, "the persona routing, which receives a persona's Slack events, archives through its client and logs Slack failure text and its lost-message row read's agent-director failure text (described, redacted)"],
-  [/^src\/clear-latch\.ts$/, "the clear-latch route and the server.port record, whose clear-failed line carries a clear by hand's rejection (described, redacted), which can be agent-director failure text"],
+  [/^src\/(?:clear-latch|abandon-message)\.ts$/, 'operator routes and HTTP clients: untrusted arguments and clear/append failures must never leak'],
   // the state directory move walks the directory that holds the credentials files and the config, and logs paths and errors.
   [/^src\/state-dir-migration\.ts$/, "the state directory move, which compares and moves the files of the state directory (the credentials files among them) and logs only their names and errors"],
   // the stored-choice file holds the credentials file's path, never its content.

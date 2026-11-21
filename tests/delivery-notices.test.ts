@@ -4,9 +4,9 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import * as fs from 'node:fs'
 import { join } from 'node:path'
 import { CONFLICT_NOTICE_HUMAN_ONLY_LINE } from '../src/conflict-latch.ts'
-import { DELIVERY_STUCK_AFTER_MS, DELIVERY_ROW_POLL_MS, ENTER_DELAY_MS, THREAD_REPLY_HOLD_MS } from '../src/delivery-constants.ts'
+import { DELIVERY_STUCK_AFTER_MS, DELIVERY_ROW_POLL_MS, ENTER_DELAY_MS, THREAD_REPLY_HOLD_MS, RETYPE_BACKOFF_MS } from '../src/delivery-constants.ts'
 import { NOTICE_CORRECTION_TIMEOUT_MS, type NoticeCorrectionOutcome } from '../src/notice-correction.ts'
-import type { AcceptedInput, QueueItem, ReactionAcceptedInput, SlackKey } from '../src/delivery-queue.ts'
+import type { AcceptedInput, QueueItem, ReactionAcceptedInput, ReplyReminderQueue, SlackKey } from '../src/delivery-queue.ts'
 import { createDeliveryPreparation, type DeliveryPreparation } from '../src/delivery-intake.ts'
 import type { DeliveryReason, DeliveryStatus } from '../src/delivery-engine.ts'
 import { buildDeliveryDiagnostic, buildDeliveryStuckNotice, buildMessageNotSavedNotice, buildMessageSavedAfterRetryNotice, buildStorageNoticeRecoveryLine, buildMessageNotTakenInNotice, buildMessagesWaitingNotice, buildQueueRecordUnreadableNotice, deliveryIdentity, deliveryStuckRemedy, MESSAGE_DELIVERED, MESSAGE_NOT_SAVED, MESSAGE_NOT_TAKEN_IN, MESSAGE_RECEIVED, MESSAGE_RETYPED, QUEUE_KEPT, QUEUE_UNWRITABLE, type DeliveryReportState, type DeliveryStuckReason } from '../src/delivery-notices.ts'
@@ -26,12 +26,247 @@ import { appendTranscript, pastedText, promptEntry, replyEntry } from './test-he
 import { heldSlackInput, HOLD_FIELDS, memoryHold, postHold, slackInput } from './test-helpers/delivery-queue.ts'
 import type { HoldField } from '../src/delivery-queue.ts'
 import { THREAD_ROOTS } from './test-helpers/thread-memory.ts'
+import * as abandonmentNotices from '../src/delivery-notices.ts'
+import * as abandonmentDiagnostics from '../src/persona-diagnostics.ts'
+import { buildTagParts } from '../src/tag-wrapper.ts'
+import { makeQueuedAckHarness } from './test-helpers/queued-ack.ts'
+import { handleInterject } from '../src/interject.ts'
+import { createPersonaUpPredicate } from '../src/persona-start.ts'
 const runs: DeliveryNoticeHarness[] = []
 async function run(options: Parameters<typeof makeDeliveryNoticeHarness>[0] = {}) { const h = await makeDeliveryNoticeHarness(options); runs.push(h); return h }
 afterEach(async () => { for (const r of runs.splice(0)) { try {
   const path = join(r.root, 'queue')
   assertNoLeak({ logs: r.logs, posts: r.h.allPosts(), lines: r.rig.lines, queue: existsSync(path) ? writtenFile(path) : undefined })
 } finally { await r.cleanup() } } })
+
+describe('b.6cg abandonment reporting', () => {
+  async function abandon(r: DeliveryNoticeHarness, item: QueueItem) {
+    expect(await r.queue.abandon(r.alpha, item.accepted.seq, r.h.clock.now())).toBe('abandoned')
+    r.reporting.engineEvent({ type: 'item-abandoned', key: r.alpha, seq: item.accepted.seq, at: r.h.clock.now() })
+    await r.flush()
+  }
+
+  test('a source-channel notice joins its new root; a racing reply is held then released and later replies deliver via thread', async () => {
+    const r = await makeStorageNoticeHarness({ threads: true }), ids = STORAGE_NOTICE_IDS
+    try {
+      await r.receive()
+      const post = r.hold('post')
+      await abandon(r, r.queue.items(r.alpha)[0]!)
+      for (let turn = 0; turn < 50 && r.h.totalPosts() === 0; turn++) { await r.flush(); await r.threads!.clock.flush() }
+      expect(r.h.posts(r.alpha)).toEqual([{ channel: ids.source,
+        text: abandonmentNotices.buildMessageAbandonedNotice(r.ref(), ids.sender), metadata: SERVER_POST_METADATA }])
+      expect(r.h.posts(r.beta)).toEqual([])
+      const reply = (ts: string) => ({ channel: ids.source, thread_ts: ids.correctionTs, ts, text: r.body })
+      await r.receive(reply(ids.replyTs))
+      expect(r.queue.items(r.alpha).map(item => [item.accepted.ts, item.hold?.kind, item.hold?.state])).toEqual([
+        [ids.ts, undefined, undefined], [ids.replyTs, 'post', 'unresolved'],
+      ])
+      expect(r.threads!.memory.view(r.alpha, ids.source, ids.correctionTs)).toBe('not-joined')
+      post.settle({ kind: 'ok', result: { ts: ids.correctionTs } })
+      for (let turn = 0; turn < 50 && r.queue.items(r.alpha)[1]!.hold?.state !== 'released'; turn++) { await r.flush(); await r.threads!.clock.flush() }
+      expect(r.queue.items(r.alpha)[1]!.hold?.state).toBe('released')
+      expect(r.queue.items(r.alpha)[1]!.accepted.via).toBe('thread')
+      expect(r.threads!.memory.view(r.alpha, ids.source, ids.correctionTs)).toBe('joined')
+      await r.receive(reply(ids.laterReplyTs))
+      expect(r.queue.items(r.alpha)).toHaveLength(3)
+      expect(r.queue.items(r.alpha)[2]!.accepted.via).toBe('thread')
+      expect(r.queue.items(r.alpha)[2]!.hold).toBeUndefined()
+      expect(r.h.totalPosts()).toBe(1)
+    } finally { await r.cleanup() }
+  })
+
+  test.each(['timeout', 'forget', 'close'] as const)('a pending source post ends its reporting wait on %s, but records a late Slack answer once', async ending => {
+    const recording = makeRecordingOwnPostObserver()
+    const r = await makeStorageNoticeHarness({ ownPosts: recording.observer }), ids = STORAGE_NOTICE_IDS
+    try {
+      const item = await r.accept({ channel: ids.source, thread_ts: ids.root }), post = r.hold('post')
+      await abandon(r, item)
+      expect(recording.calls).toEqual([expect.objectContaining({ kind: 'start', key: r.alpha, surface: 'notice',
+        target: { channel: ids.source, parent: ids.root } })])
+      expect(r.h.clock.pending().map(t => t.delayMs)).toEqual([NOTICE_CORRECTION_TIMEOUT_MS])
+      if (ending === 'timeout') await r.h.clock.advance(NOTICE_CORRECTION_TIMEOUT_MS)
+      else if (ending === 'forget') r.reporting.forget(r.alpha)
+      else r.rig.episodes.close()
+      await r.flush()
+      expect(r.h.clock.pending()).toEqual([])
+      expect(recording.calls).toHaveLength(1)
+      post.settle({ kind: 'ok', result: { ts: ids.correctionTs, message: { thread_ts: ids.root } } })
+      await r.flush()
+      expect(recording.calls).toHaveLength(2)
+      expect(recording.calls[1]).toMatchObject({ kind: 'end', answer: { kind: 'confirmed', channel: ids.source, ts: ids.correctionTs, threadTs: ids.root } })
+      expect(r.h.posts(r.alpha)).toHaveLength(1)
+      expect(r.h.stub(r.alpha).calls.postMessage[0]!.thread_ts).toBe(ids.root)
+      expect(r.h.posts(r.alpha)[0]!.metadata).toEqual(SERVER_POST_METADATA)
+      expect(r.h.posts(r.beta)).toEqual([])
+      expect(r.logs.filter(line => line.startsWith('[slack] message-abandoned:'))).toHaveLength(1)
+      expect(r.h.clock.pending()).toEqual([])
+    } finally { await r.cleanup() }
+  })
+
+  test.each(['timeout', 'forget', 'close'] as const)('a source post waiting for its intent is cancelled by %s before any Slack call', async ending => {
+    const intent = holdOwnPostReady(), recording = makeRecordingOwnPostObserver([{ ready: intent.ready }])
+    const r = await run({ ownPosts: recording.observer })
+    try {
+      await abandon(r, await r.accept())
+      expect(recording.calls).toHaveLength(1)
+      expect(r.h.totalPosts()).toBe(0)
+      if (ending === 'timeout') await r.h.clock.advance(NOTICE_CORRECTION_TIMEOUT_MS)
+      else if (ending === 'forget') r.reporting.forget(r.alpha)
+      else r.rig.episodes.close()
+      await r.flush()
+      expect(r.h.clock.pending()).toEqual([])
+      intent.resolve(); await r.flush()
+      expect(r.h.totalPosts()).toBe(0)
+      expect(recording.calls).toHaveLength(2)
+      expect(recording.calls[1]).toMatchObject({ kind: 'end', answer: { kind: 'failed', code: OWN_POST_CANCELLED } })
+    } finally { intent.resolve() }
+  })
+
+  test('message-abandoned has one metadata-only literal line and a kept/not-delivered notice', async () => {
+    const r = await run(), item = await r.accept({ text: 'PRIVATE abandoned text', thread_ts: '1699999999.000001' })
+    const line = abandonmentDiagnostics.buildMessageAbandonedLine(r.ref(), item.accepted, 2000)
+    expect(line).toBe('[slack] message-abandoned: persona="alpha" (key=alpha) source=slack chat_id="C0TEST001" ts="1700000000.000001" sender_id="U0TEST001" at=2000')
+    expect(abandonmentDiagnostics.DELIVERY_DIAGNOSTIC_CLASSES).toContain('message-abandoned')
+    const notice = abandonmentNotices.buildMessageAbandonedNotice(r.ref(), 'U0TEST001')
+    expect(notice).toBe(':warning: *Message not delivered* — the message from U0TEST001 for "alpha" (key=alpha) was not delivered. An operator stopped its delivery; its text is kept.')
+    expect(JSON.stringify({ line, notice })).not.toContain(item.accepted.text)
+    expect(notice).not.toMatch(/abandon[-_ ]?message/i)
+    assertNoLeak({ line, notice })
+  })
+
+  test.each([
+    ['slack', undefined], ['slack', '1699999999.000001'], ['interject', undefined], ['cron', undefined],
+  ] as const)('%s with thread %s posts once to the right destination using only its persona client', async (source, thread_ts) => {
+    const r = await run({ recordQueued: true })
+    const item = await r.accept({ source, sender: source === 'slack' ? undefined : 'job-scheduler', text: 'PRIVATE abandoned text',
+      channel: source === 'slack' ? 'C0BETA001' : undefined, thread_ts,
+      key: source === 'slack' ? { chat_id: 'C0BETA001', ts: '1700000000.000001' } : undefined })
+    expect(await r.queue.abandon(r.alpha, item.accepted.seq, r.h.clock.now())).toBe('abandoned')
+    const event = { type: 'item-abandoned' as const, key: r.alpha, seq: item.accepted.seq, at: r.h.clock.now() }
+    r.reporting.engineEvent(event); r.reporting.engineEvent(event)
+    await r.flush()
+    const posts = r.h.stub(r.alpha).calls.postMessage
+    expect(posts).toHaveLength(1)
+    expect(posts[0]).toMatchObject({ channel: source === 'slack' ? 'C0BETA001' : 'C0ALPHA01' })
+    expect(posts[0]!.thread_ts).toBe(thread_ts)
+    expect(r.h.posts(r.alpha)[0]!.text).toContain('was not delivered')
+    expect(r.h.posts(r.alpha)[0]!.text).toContain('text is kept')
+    expect(r.h.posts(r.beta)).toEqual([])
+    expect(r.logs.filter(l => l.startsWith('[slack] message-abandoned:'))).toHaveLength(1)
+    expect(JSON.stringify({ logs: r.logs, posts })).not.toContain('PRIVATE abandoned text')
+    expect(r.delivered).toEqual([])
+    r.reporting.received(r.alpha, r.queue.item(r.alpha, item.accepted.seq)!, 'recovered')
+    r.reporting.reconcileQueued(r.alpha)
+    expect(r.queued).toEqual([])
+  })
+
+  test('ends stuck/waiting episodes and starts a fresh episode for the next head', async () => {
+    const r = await run({ holds: true }), a = await r.accept(), b = await r.accept({ ts: '1700000000.000002', key: { chat_id: 'C0TEST001', ts: '1700000000.000002' } })
+    await r.h.clock.advance(DELIVERY_STUCK_AFTER_MS + 1)
+    r.waiting(a, 'backoff', { retypeCount: 2 }); r.waiting(a, 'state', { row: 'ended' })
+    expect(r.rig.episodes.isOpen(r.alpha, 'delivery-stuck')).toBe(true)
+    expect(r.rig.episodes.isOpen(r.alpha, 'messages-waiting')).toBe(true)
+    expect(await r.queue.abandon(r.alpha, a.accepted.seq, r.h.clock.now())).toBe('abandoned')
+    r.reporting.engineEvent({ type: 'item-abandoned', key: r.alpha, seq: a.accepted.seq, at: r.h.clock.now() })
+    expect(r.rig.episodes.isOpen(r.alpha, 'delivery-stuck')).toBe(false)
+    expect(r.rig.episodes.isOpen(r.alpha, 'messages-waiting')).toBe(false)
+    r.waiting(b, 'backoff', { retypeCount: 1 })
+    expect(r.logs.filter(l => l.startsWith('[slack] delivery-stuck:')).map(l => l.match(/ts="([^"]+)"/)?.[1])).toEqual([a.accepted.ts, b.accepted.ts])
+  })
+
+  test('live interject shape: receipted part 1, permanently unmatchable fixed part 2/3, then abandonment by logged ts unblocks B', async () => {
+    let r: DeliveryNoticeHarness | undefined
+    const e = await makeEngineHarness({ onEvent: event => r?.reporting.engineEvent(event) })
+    r = await run({ queue: e.queue })
+    try {
+      const receivedAt = 1795214457546
+      await e.clock.advanceTo(receivedAt)
+      const text = 'a'.repeat(500) + '\u200e' + 'b'.repeat(500)
+      const response = await handleInterject(new Request('http://127.0.0.1/interject', { method: 'POST',
+        body: JSON.stringify({ persona: 'alpha', sender: 'job-scheduler', message: text }) }), '127.0.0.1', {
+        getPersonaConfig: () => r!.config, accept: e.queue.accept, now: e.clock.now, log: line => r!.logs.push(line),
+      })
+      expect(response.status).toBe(200)
+      const a = e.queue.items(r.alpha)[0]!
+      expect(a.accepted.ts).toBe('1795214457.546000')
+      const parts = buildTagParts({ user: 'job-scheduler', ts: a.accepted.ts, text }, 600)
+      expect(parts).toHaveLength(3)
+      expect(parts[1]).toContain('&#8206;')
+      // A journal made before b.88t: the old formatter left this character
+      // raw. The synthetic native transcript drops it, so exact receipt fails.
+      parts[1] = parts[1]!.replace('&#8206;', '\u200e')
+      await e.queue.append(r.alpha, { v: 1, kind: 'fixed', seq: a.accepted.seq, parts })
+      const b = await e.accept('later queued item')
+      e.p().autoReceipt = false
+      e.p().keyHook = params => {
+        if (params.key === 'Enter' && e.p().box) appendTranscript(e.p().path, [promptEntry(e.p().box.replace(/\u200e/g, '')), replyEntry()])
+        return undefined
+      }
+      await e.tick()
+      await e.until(() => e.textCalls().filter(c => c.params.text === parts[1]).length >= 2)
+      await e.advance(DELIVERY_STUCK_AFTER_MS + 1)
+      await e.until(() => e.engine.snapshot(r!.alpha)?.e.phase === 'receipt')
+      const receipts = e.queue.item(r.alpha, a.accepted.seq)!.records.filter(x => x.kind === 'delivered')
+      expect(receipts.map(x => x.part)).toEqual([1])
+      expect(e.textCalls().some(c => c.params.text === parts[2] || c.params.text === 'later queued item')).toBe(false)
+      for (const kind of ['message-not-taken-in', 'message-retyped', 'delivery-stuck']) {
+        const lines = r.logs.filter(l => l.startsWith(`[slack] ${kind}:`))
+        expect(lines.length).toBeGreaterThan(0)
+        expect(lines.every(l => l.includes(`ts="${a.accepted.ts}"`))).toBe(true)
+      }
+      const loggedTs = r.logs.find(l => l.startsWith('[slack] message-not-taken-in:'))!.match(/ts="([^"]+)"/)![1]!
+      const selected = e.queue.items(r.alpha).find(i => i.accepted.ts === loggedTs)!
+      const before = e.textCalls().length
+      const { handleAbandonMessage, ABANDON_MESSAGE_ROUTE } = await import('../src/abandon-message.ts')
+      const isUp = createPersonaUpPredicate({ status: () => ({ state: 'up', identity: { botUserId: 'U0BOT001', botId: 'B0BOT001' } }) }, {
+        isApplied: key => e.p(key).applied, isUp: key => e.p(key).up,
+      })
+      const abandoned = await handleAbandonMessage(new Request(`http://127.0.0.1${ABANDON_MESSAGE_ROUTE}`, { method: 'POST',
+        body: JSON.stringify({ persona: 'alpha', ts: loggedTs }) }), '127.0.0.1', {
+        getPersonaConfig: () => r!.config, isUp, queue: e.queue,
+        abandonHead: (key: string, seq: number) => e.engine.abandonHead(key, seq), log: (line: string) => r!.logs.push(line),
+      })
+      expect(abandoned.status).toBe(200)
+      expect(await abandoned.json()).toEqual({ ok: true, persona: 'alpha', seq: selected.accepted.seq })
+      await e.until(() => e.queue.item(r!.alpha, b.accepted.seq)!.delivered)
+      await e.advance(RETYPE_BACKOFF_MS.at(-1)!); await r.flush()
+      expect(e.textCalls().slice(before).map(c => c.params.text)).toEqual(['later queued item'])
+      expect(e.queue.item(r.alpha, a.accepted.seq)!.fixed!.parts).toEqual(parts)
+      expect(e.queue.item(r.alpha, a.accepted.seq)!.records.filter(x => x.kind === 'delivered').map(x => x.part)).toEqual([1])
+      expect(r.logs.filter(l => l.startsWith('[slack] message-abandoned:'))).toHaveLength(1)
+      const notices = r.h.posts(r.alpha).filter(p => p.text?.includes('*Message not delivered*'))
+      expect(notices).toHaveLength(1)
+      expect(notices[0]!.channel).toBe('C0ALPHA01')
+      expect(r.h.posts(r.beta)).toEqual([])
+      assertNoLeak({ logs: r.logs, posts: r.h.allPosts(), errors: e.errors })
+    } finally { await e.cleanup() }
+  })
+
+  test('queued reaction stays, with no delivered reaction, reminder or re-add through intake/recovery/reconcile', async () => {
+    const h = await makeQueuedAckHarness()
+    try {
+      await h.receive()
+      const item = h.item()
+      expect(h.visible()).toEqual([h.settings.queued_ack_reaction])
+      const before = [...h.stub().callLog]
+      expect(await h.e.engine.abandonHead('alpha', item.accepted.seq)).toBe('abandoned')
+      await h.e.clock.flush()
+      expect(h.visible()).toEqual([h.settings.queued_ack_reaction])
+      expect((h.e.realQueue as ReplyReminderQueue).replyReminderItems('alpha')).toEqual([])
+      await h.receive(); await h.recover()
+      h.reporting.reconcileQueued('alpha')
+      await h.restartServer(); await h.e.clock.flush()
+      const extra = h.stub().callLog.slice(before.length).filter(c => c.method.startsWith('reactions.'))
+      expect(extra).toEqual([])
+      expect(h.visible()).toEqual([h.settings.queued_ack_reaction])
+      expect(h.e.queue.items('alpha')).toHaveLength(1)
+      expect(h.e.queue.openCount('alpha')).toBe(0)
+      expect(h.e.keyCalls()).toEqual([])
+      expect((h.e.realQueue as ReplyReminderQueue).replyReminderItems('alpha')).toEqual([])
+      expect(h.stub('beta').callLog).toEqual([])
+    } finally { await h.cleanup() }
+  })
+})
 
 async function noticeHold(r: DeliveryNoticeHarness, ts: string = THREAD_ROOTS.secondary, field: (at: number) => HoldField = memoryHold) {
   const input = heldSlackInput(field(r.h.clock.now()), { ts, key: { chat_id: 'C0TEST001', ts }, text: 'private held reply' })

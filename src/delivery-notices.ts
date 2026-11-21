@@ -1,7 +1,8 @@
 /** Delivery reporting consumes durable facts and never authorizes keys. */
 import { isOpenItem, slackKeyString, type SlackKey, type QueueEvent, type QueueItem, type DeliveryQueue, type AcceptedRecord } from './delivery-queue.ts'
 import type { PostedPersonaNotice } from './persona-notifier.ts'
-import { correctPostedNotice, type NoticeCorrectionOutcome } from './notice-correction.ts'
+import { buildMessageAbandonedLine } from './persona-diagnostics.ts'
+import { correctPostedNotice, type OriginalConversationPoster, type NoticeCorrectionOutcome } from './notice-correction.ts'
 import type { DeliveryEngineEvent, DeliveryReason, DeliveryStatus } from './delivery-engine.ts'
 import type { PersonaEpisodes } from './persona-episodes.ts'
 import { CONFLICT_NOTICE_HUMAN_ONLY_LINE } from './conflict-latch.ts'
@@ -27,6 +28,9 @@ export function buildMessageNotSavedNotice(persona: string, sender: string): str
 }
 export function buildMessageSavedAfterRetryNotice(persona: string, sender: string): string {
   return `:white_check_mark: *Message saved after retry* — the message from ${slack(sender)} for ${slack(persona)} was saved after a retry. No resend is needed.`
+}
+export function buildMessageAbandonedNotice(persona: string, sender: string): string {
+  return `:warning: *Message not delivered* — the message from ${slack(sender)} for ${escapeSlackControlCharacters(persona)} was not delivered. An operator stopped its delivery; its text is kept.`
 }
 export function buildStorageNoticeRecoveryLine(persona: string, identity: SlackKey, operation: 'edit' | 'correction', result: NoticeCorrectionOutcome): string {
   return buildDeliveryDiagnostic(MESSAGE_NOT_SAVED, persona,
@@ -82,6 +86,7 @@ function stuckReason(reason: DeliveryReason, status: DeliveryStatus): DeliverySt
 }
 export interface DeliveryReportingDeps {
   queue: DeliveryQueue; episodes: PersonaEpisodes
+  postOriginalNotice: OriginalConversationPoster
   persona(key: string): { name: string; key: string } | undefined
   state(key: string): DeliveryReportState
   log(line: string): void
@@ -97,11 +102,13 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
   let findingFlushPending = false
   const received = new Set<string>(), completed = new Set<string>(), failures = new Map<string, number>(), unwritable = new Set<string>(), heads = new Map<string, number>()
   const recoveredQueued = new Set<string>()
+  const abandoned = new Set<string>()
   interface StorageWarning {
     slackKey: SlackKey; posting: boolean; ready: boolean; correcting: boolean
     post?: PostedPersonaNotice; abort: AbortController; dispose(): void; correct(): void
   }
   const storageWarnings = new Map<string, Set<StorageWarning>>()
+  const originalPosts = new Map<string, Set<() => void>>()
   const ref = (key: string) => { const p = deps.persona(key); return p ? renderPersonaRef(p.name, key) : `key=${key}` }
   const protect = (run: () => unknown) => { try { const result = run(); if (result && typeof (result as Promise<unknown>).catch === 'function') void (result as Promise<unknown>).catch(() => {}) } catch { /* reporting cannot interrupt durability */ } }
   function log(kind: DeliveryDiagnosticClass, key: string, identity: string, detail = '') { protect(() => deps.log(buildDeliveryDiagnostic(kind, ref(key), identity, detail))) }
@@ -111,6 +118,7 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
     deps.episodes.end(key, 'delivery-stuck'); deps.episodes.end(key, 'messages-waiting')
   }
   function receivedItem(key: string, item: QueueItem, mode: 'live' | 'recovered' = 'live'): void {
+    if (item.abandoned || deps.queue.item(key, item.accepted.seq)?.abandoned) return
     // Reaction intake logs its own reaction-received line once, at a new
     // store; a Reaction Item gets no message-received line and no queued
     // acknowledgement reaction, from preparation, recovery or final delivery.
@@ -239,6 +247,22 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
     for (const e of events) if (e.type === 'record-unreadable' && e.alert) { const g = groups.get(e.key) ?? { count: 0, path: e.quarantinePath }; g.count++; groups.set(e.key, g) }
     for (const [key, g] of groups) if (!alertedAtStartup.has(key)) { alertedAtStartup.add(key); protect(() => deps.notify(key, buildQueueRecordUnreadableNotice(ref(key), g.count, g.path))) }
   }
+  function postAbandoned(key: string, accepted: AcceptedRecord, text: string): void {
+    const abort = new AbortController(), posts = originalPosts.get(key) ?? new Set<() => void>()
+    const active = () => !abort.signal.aborted && deps.episodes.teardownWindowState(key) === 'none'
+    let unregister = () => {}
+    const dispose = () => {
+      abort.abort(); unregister(); posts.delete(dispose)
+      if (posts.size === 0 && originalPosts.get(key) === posts) originalPosts.delete(key)
+    }
+    originalPosts.set(key, posts); posts.add(dispose)
+    unregister = deps.episodes.whenForgotten(key, dispose)
+    if (!active()) { dispose(); return }
+    try {
+      void deps.postOriginalNotice(key, { channel: accepted.channel!, ...(accepted.thread_ts ? { parent: accepted.thread_ts } : {}) }, text,
+        { clock: deps.episodes.clock, signal: abort.signal, isActive: active }).finally(dispose).catch(() => {})
+    } catch { dispose() /* reporting cannot interrupt durability */ }
+  }
   function engineEvent(event: DeliveryEngineEvent): void {
     const key = event.key
     if (event.type === 'launch-observed' || event.type === 'launch-first-waiting') {
@@ -253,6 +277,18 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
     const item = deps.queue.item(key, event.seq)
     if (!item) return
     const identity = deliveryIdentity(item.accepted), id = `${key}:${event.seq}`
+    if (event.type === 'item-abandoned') {
+      if (!item.abandoned || abandoned.has(id)) return
+      abandoned.add(id); recoveredQueued.delete(id)
+      protect(() => deps.log(buildMessageAbandonedLine(ref(key), item.accepted, event.at)))
+      const head = heads.get(key), reported = head === undefined ? undefined : deps.queue.item(key, head)
+      if (!reported || !isOpenItem(reported)) move(key)
+      const a = item.accepted, text = buildMessageAbandonedNotice(ref(key), a.user ?? a.bot_id ?? a.sender ?? 'unknown')
+      if (a.source === 'slack') protect(() => postAbandoned(key, a, text))
+      else protect(() => deps.notify(key, text))
+      return
+    }
+    if (item.abandoned) return
     if (event.type === 'item-delivered') {
       if (!item.delivered || completed.has(id)) return
       completed.add(id)
@@ -293,6 +329,7 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
   }
   return { received: (key: string, item: QueueItem, mode: 'live' | 'recovered' = 'live') => protect(() => receivedItem(key, item, mode)), holdStored: (key: string) => protect(() => holdStored(key)), reconcileQueued: (key: string) => protect(() => reconcileQueued(key)), queueEvent: (event: QueueEvent) => protect(() => queueEvent(event)), engineEvent: (event: DeliveryEngineEvent) => protect(() => engineEvent(event)), startupFindings, forget(key: string) {
     for (const warning of storageWarnings.get(key) ?? []) warning.dispose()
+    for (const dispose of originalPosts.get(key) ?? []) dispose()
     failures.delete(key); unwritable.delete(key); heads.delete(key)
   } }
 }

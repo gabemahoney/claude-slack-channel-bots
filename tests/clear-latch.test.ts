@@ -1001,6 +1001,7 @@ async function runClearLatch(args: readonly string[], o: CliRunOptions = {}): Pr
     directorList: unused('directorList'),
     appendServerLogLine: unused('appendServerLogLine'),
     recordStartupErrorEntry: unused('recordStartupErrorEntry'),
+    dialAbandonMessage: unused('dialAbandonMessage'),
     dialClearLatch: async (port, persona) => {
       dials.push([port, persona])
       return dial(port, persona)

@@ -153,6 +153,9 @@ import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, sta
 import { spawn, spawnSync } from 'child_process'
 import { childEnv, scrubProcessEnv } from './child-env.ts'
 import { isProcessRunning } from './pid.ts'
+import { ABANDON_MESSAGE_COMMAND, ABANDON_MESSAGE_USAGE, ABANDON_MESSAGE_USAGE_ENTRY, ABANDON_MESSAGE_WAIT_MS,
+  dialAbandonMessage, isAbandonTimestamp, abandonMessageNoServerLine, abandonMessageNotAnsweredLine,
+  abandonMessageNotConfirmedLine, abandonMessageReport, abandonMessageFailedLine } from './abandon-message.ts'
 import {
   CLEAR_LATCH_COMMAND,
   dialClearLatch,
@@ -328,13 +331,14 @@ export const CLEAR_LATCH_USAGE_ENTRY =
  * calling bot down, and nothing else (no reload gesture is advertised).
  */
 export const CLI_USAGE_LINES: readonly string[] = Object.freeze([
-  `Usage: cli.ts <start|stop|clean_restart|credentials|${CLEAR_LATCH_COMMAND}> [flags]`,
+  `Usage: cli.ts <start|stop|clean_restart|credentials|${CLEAR_LATCH_COMMAND}|${ABANDON_MESSAGE_COMMAND}> [flags]`,
   '',
   '  start          Validate prerequisites and start the server in the background',
   '  stop           Send SIGTERM to a running server',
   '  clean_restart  <bot name or key> [<bot name or key>…]: restart only the named bots; the running server relaunches them',
   "  credentials    <persona name or key>: write that persona's credentials file from this terminal",
   CLEAR_LATCH_USAGE_ENTRY,
+  ABANDON_MESSAGE_USAGE_ENTRY,
   '',
   'stop flags:',
   '  --stop-bots    Gracefully exit all managed bots before stopping the server',
@@ -602,6 +606,7 @@ export interface CliDeps {
    * on `now` and `sleep`. Logs nothing.
    */
   dialClearLatch: (port: number, persona: string) => Promise<ClearLatchDialAnswer>
+  dialAbandonMessage: (port: number, persona: string, ts: string) => Promise<ClearLatchDialAnswer>
 }
 
 // ---------------------------------------------------------------------------
@@ -795,6 +800,7 @@ export interface CliHandlers {
   credentials: (args: readonly string[]) => Promise<void>
   /** `clear-latch <persona>`, given the arguments after the subcommand. */
   clearLatch: (args: readonly string[]) => Promise<void>
+  abandonMessage: (args: readonly string[]) => Promise<void>
 }
 
 /** How `clear-latch`'s request ended: an answer, a failed dial, or no answer within CLEAR_LATCH_WAIT_MS. */
@@ -2016,7 +2022,7 @@ export function createCli(deps: CliDeps): CliHandlers {
       console.error(clearLatchCliNotAnsweredLine(record.cause))
       return deps.exit(1)
     }
-    const { line, exitCode } = clearLatchReportOf(await clearLatchRequest(record.record.port, args[0]))
+    const { line, exitCode } = clearLatchReportOf(await operatorRequest(() => deps.dialClearLatch(record.record.port, args[0]!), CLEAR_LATCH_WAIT_MS))
     console.error(line)
     return deps.exit(exitCode)
   }
@@ -2030,18 +2036,18 @@ export function createCli(deps: CliDeps): CliHandlers {
    * and the route still runs a clear it has received. Never rejects for the
    * request; a throw from `now` or `sleep` propagates.
    */
-  async function clearLatchRequest(port: number, target: string): Promise<ClearLatchOutcome> {
+  async function operatorRequest(dial: () => Promise<ClearLatchDialAnswer>, waitMs: number): Promise<ClearLatchOutcome> {
     let settled = false
     const dialed = (async (): Promise<ClearLatchOutcome> => {
       try {
-        return { kind: 'answered', answer: await deps.dialClearLatch(port, target) }
+        return { kind: 'answered', answer: await dial() }
       } catch (error) {
         return { kind: 'failed', error }
       }
     })()
     const waited = (async (): Promise<ClearLatchOutcome> => {
-      const deadline = deps.now() + CLEAR_LATCH_WAIT_MS
-      for (let left = CLEAR_LATCH_WAIT_MS; left > 0 && !settled; left = deadline - deps.now()) {
+      const deadline = deps.now() + waitMs
+      for (let left = waitMs; left > 0 && !settled; left = deadline - deps.now()) {
         await deps.sleep(left)
       }
       return { kind: 'timed-out' }
@@ -2055,7 +2061,23 @@ export function createCli(deps: CliDeps): CliHandlers {
     }
   }
 
-  return { start, stop, clean_restart, credentials, clearLatch }
+  async function abandonMessage(args: readonly string[]): Promise<void> {
+    if (args.length !== 2 || !args[0] || !isAbandonTimestamp(args[1])) {
+      console.error(ABANDON_MESSAGE_USAGE)
+      return deps.exit(2)
+    }
+    const stateDir = deps.resolveStateDir(), server = readServerPid(join(stateDir, 'server.pid'), deps)
+    if (server.kind !== SERVER_PID_RUNNING) { console.error(abandonMessageNoServerLine()); return deps.exit(1) }
+    const record = readServerPortRecord(serverPortFilePath(stateDir), server.pid, deps)
+    if (!record.ok) { console.error(abandonMessageNotAnsweredLine(record.cause)); return deps.exit(1) }
+    const outcome = await operatorRequest(() => deps.dialAbandonMessage(record.record.port, args[0]!, args[1]!), ABANDON_MESSAGE_WAIT_MS)
+    const report = outcome.kind === 'answered' ? abandonMessageReport(outcome.answer)
+      : { line: outcome.kind === 'timed-out' ? abandonMessageNotConfirmedLine() : abandonMessageNotAnsweredLine(describeThrownValue(outcome.error)), exitCode: 1 }
+    console.error(report.line)
+    return deps.exit(report.exitCode)
+  }
+
+  return { start, stop, clean_restart, credentials, clearLatch, abandonMessage }
 }
 
 // ---------------------------------------------------------------------------
@@ -2221,7 +2243,8 @@ if (import.meta.main) {
     subcommand !== 'stop' &&
     subcommand !== 'clean_restart' &&
     subcommand !== 'credentials' &&
-    subcommand !== CLEAR_LATCH_COMMAND
+    subcommand !== CLEAR_LATCH_COMMAND &&
+    subcommand !== ABANDON_MESSAGE_COMMAND
   ) {
     for (const line of CLI_USAGE_LINES) console.error(line)
     process.exit(1)
@@ -2275,6 +2298,7 @@ if (import.meta.main) {
       recordStartupError(classLabel, message, undefined, { logDir: resolveCliStateDir(), omitStderr: true }),
     // clear-latch's one request to 127.0.0.1, with no timeout of its own.
     dialClearLatch: (port, persona) => dialClearLatch(port, persona),
+    dialAbandonMessage: (port, persona, ts) => dialAbandonMessage(port, persona, ts),
   }
 
   const cli = createCli(realDeps)
@@ -2293,6 +2317,11 @@ if (import.meta.main) {
   } else if (subcommand === 'credentials') {
     cli.credentials(process.argv.slice(3)).catch((err) => {
       console.error('[slack] Fatal:', err)
+      process.exit(1)
+    })
+  } else if (subcommand === ABANDON_MESSAGE_COMMAND) {
+    cli.abandonMessage(process.argv.slice(3)).catch((err) => {
+      console.error(abandonMessageFailedLine(describeThrownValue(err)))
       process.exit(1)
     })
   } else if (subcommand === CLEAR_LATCH_COMMAND) {

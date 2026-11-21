@@ -480,6 +480,7 @@ import {
 import { errTmuxKillFailed, KILL_FAILED_DESCRIPTIONS, STUB_SURVIVOR_PIDS } from './test-helpers/agent-director-stub.ts'
 import { CLIENT_MIN_VERSION, HISTORICAL_PHASE1_CLAUDE_CODE_VERSION, MIN_CLAUDE_CODE_VERSION, OLD_AD_VERSION } from './test-helpers/agent-director-versions.ts'
 import { CLEAR_LATCH_TERMS, clearLatchTermsIn } from './test-helpers/clear-latch-terms.ts'
+import { ABANDON_MESSAGE_TERMS, abandonMessageTermsIn } from './test-helpers/abandon-message-terms.ts'
 import { humanOnlySentencesIn } from './test-helpers/conflict-cases.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import {
@@ -2744,7 +2745,7 @@ describe('the MCP instructions carry no reload wording', () => {
 // README and the debugging skill describe it, so they are not read here and the
 // command is not one of `FORBIDDEN_TERMS`; the manifest, the crontable header
 // and the CLI usage text are not read either.
-describe('the MCP instructions and the Reply Guard reminder do not name clear-latch', () => {
+describe('the MCP instructions and the Reply Guard reminder do not name operator commands', () => {
   const BOT_FACING_TEXTS: [name: string, read: () => string][] = [
     [MCP_INSTRUCTIONS_NAME, mcpInstructionsText],
     [`${REPLY_REMINDER_FILE} (reminder text)`, replyReminderText],
@@ -2754,6 +2755,16 @@ describe('the MCP instructions and the Reply Guard reminder do not name clear-la
     '%s: %s is absent',
     (_name, term, read) => {
       expect(clearLatchTermsIn(read()).filter((found) => found === term)).toEqual([])
+    },
+  )
+  test.each(BOT_FACING_TEXTS.flatMap(([name, read]) => ABANDON_MESSAGE_TERMS.map(term => [name, term, read] as const)))(
+    '%s: %s is absent', (_name, term, read) => {
+      expect(abandonMessageTermsIn(read()).filter(found => found === term)).toEqual([])
+    },
+  )
+  test.each(BOT_FACING_TEXTS.flatMap(([name, read]) => ABANDON_MESSAGE_TERMS.map(term => [name, term, read] as const)))(
+    '%s: planted %s is detected regardless of letter case', (_name, term, read) => {
+      expect(abandonMessageTermsIn(`${read()} ${term.toUpperCase()}`)).toContain(term)
     },
   )
 })

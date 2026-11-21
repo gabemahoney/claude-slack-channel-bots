@@ -165,6 +165,7 @@ export function threadStampUndecidedCause(channel: string): string {
 export const MESSAGE_NOT_SAVED = 'message-not-saved'
 export const MESSAGE_RECEIVED = 'message-received'
 export const MESSAGE_DELIVERED = 'message-delivered'
+export const MESSAGE_ABANDONED = 'message-abandoned'
 export const MESSAGE_RETYPED = 'message-retyped'
 export const MESSAGE_NOT_TAKEN_IN = 'message-not-taken-in'
 export const MESSAGE_PARTIAL_RECEIPT = 'message-partial-receipt'
@@ -174,7 +175,7 @@ export const QUEUE_RECORD_UNREADABLE = 'queue-record-unreadable'
 export const QUEUE_UNWRITABLE = 'queue-unwritable'
 export const QUEUE_KEPT = 'queue-kept'
 export const SYSTEM_PROMPT_UNWRITABLE = 'system-prompt-unwritable'
-export const DELIVERY_DIAGNOSTIC_CLASSES = [MESSAGE_NOT_SAVED, MESSAGE_RECEIVED, MESSAGE_DELIVERED, MESSAGE_RETYPED, MESSAGE_NOT_TAKEN_IN, MESSAGE_PARTIAL_RECEIPT, DELIVERY_STUCK, QUEUE_RECORD_UNREADABLE, QUEUE_UNWRITABLE, QUEUE_KEPT, SYSTEM_PROMPT_UNWRITABLE] as const
+export const DELIVERY_DIAGNOSTIC_CLASSES = [MESSAGE_NOT_SAVED, MESSAGE_RECEIVED, MESSAGE_DELIVERED, MESSAGE_ABANDONED, MESSAGE_RETYPED, MESSAGE_NOT_TAKEN_IN, MESSAGE_PARTIAL_RECEIPT, DELIVERY_STUCK, QUEUE_RECORD_UNREADABLE, QUEUE_UNWRITABLE, QUEUE_KEPT, SYSTEM_PROMPT_UNWRITABLE] as const
 export type DeliveryDiagnosticClass = typeof DELIVERY_DIAGNOSTIC_CLASSES[number]
 export const THREAD_MEMORY_NOT_SAVED = 'thread-memory-not-saved'
 export const THREAD_MEMORY_UNREADABLE = 'thread-memory-unreadable'
@@ -272,6 +273,10 @@ export function deliveryIdentity(a: Pick<AcceptedRecord, 'source' | 'channel' | 
 }
 export function buildDeliveryDiagnostic(kind: DeliveryDiagnosticClass, persona: string, identity: string, detail = ''): string {
   return `[slack] ${kind}: persona=${safe(persona)} ${safe(identity)}${detail ? ` ${safe(detail)}` : ''}`.trimEnd()
+}
+export function buildMessageAbandonedLine(persona: string, accepted: AcceptedRecord, at: number): string {
+  // The configured reference is preserved; identity fields remain untrusted.
+  return `[slack] ${MESSAGE_ABANDONED}: persona=${persona.replace(/[\r\n]/g, ' ')} ${safe(deliveryIdentity(accepted))} at=${at}`
 }
 /** Configured paths have their own field: quote them without treating a
  * token-shaped directory as a credential. All untrusted text stays redacted. */

@@ -34,6 +34,7 @@ import type { DurableAppendTimer } from '../src/durable-journal.ts'
 import type { AckTiming } from '../src/persona-routing.ts'
 import type { ThreadMemorySave } from '../src/thread-memory.ts'
 import { createDeliveryReporting, MESSAGE_RECEIVED } from '../src/delivery-notices.ts'
+import { createOriginalConversationPoster } from '../src/notice-correction.ts'
 import { createPersonaBringUpController } from '../src/persona-bringup-controller.ts'
 import { composePersonaStatusListeners, createPersonaUpFlushListener } from '../src/persona-start.ts'
 import { configInEffect } from '../src/reload.ts'
@@ -6470,6 +6471,10 @@ describe('the own-post observer shares one Thread Memory owner', () => {
     expect(insideMain(onlyCallOf(observer))).toBe(false)
     expect(objectProperties(spreadConstObject('sessionToolDeps')).get('ownPosts')).toBe('ownPosts')
     expect(onlyCallProps('createPersonaDestinations').get('ownPosts')).toBe('ownPosts')
+    expect(importSource(SERVER_CODE, 'createOriginalConversationPoster')).toBe('./notice-correction.ts')
+    expect(onlyCallProps('createOriginalConversationPoster').get('ownPosts')).toBe('ownPosts')
+    expect(onlyCallProps('createOriginalConversationPoster').get('clientFor')).toBe('clientFor')
+    expect(onlyCallProps('createDeliveryReporting').get('postOriginalNotice')).toBe('createOriginalConversationPoster({ clientFor, ownPosts })')
     declaredOnce('ownPostJoins')
     const assigned = assignmentsTo('ownPostJoins')
     expect(assigned.map(({ value }) => value)).toEqual([`${owner}({`])
@@ -8406,6 +8411,7 @@ describe('production bring-up reaction recovery', () => {
     })
     const reporting = createDeliveryReporting({
       queue: e.queue, episodes: n.rig.episodes, persona: conn.getPersona,
+      postOriginalNotice: createOriginalConversationPoster({ clientFor: conn.clientFor }),
       state: key => ({ up: controller.isUp(key) }), log: line => n.logs.push(line),
       notify: (key, text) => n.h.notifier.notify(key, text),
       queued: createQueuedAckCallback({ queue: e.queue, getReaction: () => config.queued_ack_reaction, clientFor: conn.clientFor }),

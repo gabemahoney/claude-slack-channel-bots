@@ -218,6 +218,8 @@ import { createPersonaDestinations } from './persona-destination.ts'
 import { createPersonaDestinationHold } from './persona-destination-hold.ts'
 import { createSlowRecoveryTracker } from './slow-recovery.ts'
 import { createDeliveryReporting } from './delivery-notices.ts'
+import { createOriginalConversationPoster } from './notice-correction.ts'
+import { ABANDON_MESSAGE_ROUTE, handleAbandonMessage } from './abandon-message.ts'
 import { createSharedStateReporting } from './shared-state-reports.ts'
 import { buildDeliveryDiagnostic, buildQueuedMessageRetryLine, SYSTEM_PROMPT_UNWRITABLE, queueErrorCode } from './persona-diagnostics.ts'
 import { createPersonaRouting, type AckTiming } from './persona-routing.ts'
@@ -3874,6 +3876,7 @@ export async function main(): Promise<void> {
   // delivery clients and retry ownership even with health checks disabled.
   deliveryReporting = createDeliveryReporting({
     queue: deliveryQueue!, episodes: noticeEpisodes,
+    postOriginalNotice: createOriginalConversationPoster({ clientFor, ownPosts }),
     persona: getAppliedPersona,
     state: key => ({
       up: !shuttingDown && isPersonaUp(key),
@@ -4307,6 +4310,14 @@ export async function main(): Promise<void> {
         return handleClearLatch(req, server.requestIP(req)?.address, {
           getPersonaConfig: () => personaConfig,
           clearByHand,
+        })
+      }
+
+      if (url.pathname === ABANDON_MESSAGE_ROUTE) {
+        return handleAbandonMessage(req, server.requestIP(req)?.address, {
+          getPersonaConfig: () => personaConfig, isUp: isPersonaUp, queue: deliveryQueue!,
+          abandonHead: (key, seq) => deliveryEngines!.abandonHead(key, seq),
+          log: line => console.error(line),
         })
       }
 

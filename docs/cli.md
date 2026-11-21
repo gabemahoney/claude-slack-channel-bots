@@ -1,22 +1,12 @@
 # CLI Reference
 
-The `claude-slack-channel-bots` binary exposes five subcommands.
+The `claude-slack-channel-bots` binary exposes six subcommands.
 
 ## `claude-slack-channel-bots start`
 
-Checks that the configuration file or the last-applied record exists, starts the server in the background, and waits for it to get through startup.
+Checks that `STATE_DIR/config.json` or `STATE_DIR/config.json.last-applied` exists, then starts the server in the background. If neither exists it exits 1 with `missing prerequisite: config.json not found at <path>, and no config.json.last-applied at <path>`. It reads no Slack token; the server checks the configuration and credentials.
 
-**Prerequisite check:** `STATE_DIR/config.json` or `STATE_DIR/config.json.last-applied` exists. If neither does, `start` exits 1 with:
-
-```
-missing prerequisite: config.json not found at <path>, and no config.json.last-applied at <path>
-```
-
-`start` reads no Slack token. The server checks the configuration, and each persona's credentials file, once it runs.
-
-The server first runs the agent-director startup gate: it refuses a binary below the agent-director client's own minimum or below CSCB's Phase 1 floor, and checks that `~/.config/agent-director/state.db` is owned by the current user. Failures land in `startup-errors.log` (see [Startup errors](troubleshooting.md#startup-errors)); agent-director enforces tmux availability at spawn time.
-
-The server then loads the configuration and starts listening. With a last-applied record it runs the record; without one it checks `config.json`, records it and applies it (see [Reload](reload.md#reload)). Only then does it write its PID to `STATE_DIR/server.pid`; conversation context is preserved across server restarts when possible.
+The server checks agent-director's version and store ownership ([Startup errors](troubleshooting.md#startup-errors)), then listens using the last-applied record, or validates, records and applies `config.json` when no record exists ([Reload](reload.md#reload)). Only then does it write `STATE_DIR/server.pid`; conversation context is preserved when possible.
 
 `start` waits up to 30 seconds for that PID file. The outcomes are:
 
@@ -24,13 +14,7 @@ The server then loads the configuration and starts listening. With a last-applie
 - **The server exits during startup:** `start` exits 1. It prints `[slack] Server failed to start (exit code 1). From <path>/server.log:`, followed by the last lines (at most 20) the server wrote there, which carry the server's own reason.
 - **The server is still starting after 30 seconds:** `start` exits 0 and leaves it running, printing `[slack] Server is still starting in the background (PID 12345) after 30s — its log is <path>/server.log`.
 
-At a start with no last-applied record, an invalid configuration stops the start. The server writes `[slack] Fatal: configuration error —` and the loader's message to `server.log` and exits, so `start` shows the same line and exits 1.
-
-A persona's error names the persona and the field. A configuration from before personas is named by its first pre-persona key, to be rewritten by hand as a `"personas"` array, and a removed key's message names what replaces it. Every message is in [Configuration rejections](../skills/debug-slack-channel-bots/SKILL.md#configuration-rejections).
-
-A last-applied record that can't be read or is invalid stops the start with `[slack] Fatal: last-applied record error —` and its cause. The line asks you to preserve the record and `config.json` and restore trustworthy evidence; never delete the record (see [The last-applied record can't be read or is invalid](../skills/debug-slack-channel-bots/SKILL.md#the-last-applied-record-cant-be-read-or-is-invalid)).
-
-A record that can't be written stops the start with `reload-record-write-failed` (see [Troubleshooting](troubleshooting.md#troubleshooting)). A server that is already running makes the new one exit with `[slack] Server is already running (PID <pid>). Exiting.`, so `start` exits 1.
+Startup failures exit 1: `[slack] Fatal: configuration error —` plus the loader's message ([Configuration rejections](../skills/debug-slack-channel-bots/SKILL.md#configuration-rejections)); `[slack] Fatal: last-applied record error —` plus its cause ([preserve the record and restore trustworthy evidence](../skills/debug-slack-channel-bots/SKILL.md#the-last-applied-record-cant-be-read-or-is-invalid)); `reload-record-write-failed` ([Troubleshooting](troubleshooting.md#troubleshooting)); or `[slack] Server is already running (PID <pid>). Exiting.`. Never delete the last-applied record to bypass a failure.
 
 ## `claude-slack-channel-bots stop`
 
@@ -192,8 +176,56 @@ It reaches the server at `127.0.0.1`, at the port the running server recorded in
 
 It needs no agent-director, reads no configuration file and writes or removes no file.
 
+---
+
+## `claude-slack-channel-bots abandon-message <persona> <ts>`
+
+Stops delivery of exactly one undelivered head message for an up persona, keeping its text and history permanently and letting later work proceed under the normal delivery rules. This is an operator-only last resort; there is no automatic expiry or retry limit.
+
+**Check the bot's terminal first** (`tmux attach -t =slack_bot_<key>`). Abandonment cannot tell whether old text remains in its composer and does not clear it; a leftover draft can merge with the next message.
+
+Resolve any draft before proceeding. See [stuck-head recovery](../skills/debug-slack-channel-bots/SKILL.md#abandoning-a-stuck-head).
+
+```sh
+claude-slack-channel-bots abandon-message <persona> <ts>
+```
+
+Use the persona's name or key in the running configuration (quote names with spaces). Copy `ts="<ts>"` from that item's `message-not-taken-in`, `message-retyped` or `delivery-stuck` line in `server.log`, for Slack, interject and cron items alike.
+
+The argument is the timestamp alone, with exactly six fractional digits. Edits can share a timestamp: a matching current open head takes precedence over retained older revisions.
+
+The server records the abandonment before confirming success, logs `message-abandoned`, and sends a *Message not delivered* notice saying the text is kept: in the original conversation/thread for Slack, or at the persona's normal destination for interject/cron. Notice posting is best effort.
+
+An existing queued reaction stays; abandonment adds no delivered reaction or reply reminder. A latched or held persona can be abandoned while up; the command does not clear its hold.
+
+One line goes to stderr; the persona argument is never echoed. Successful output names the configured persona returned by the server.
+
+| Line | Exit | When |
+|---|---|---|
+| `Usage: claude-slack-channel-bots abandon-message <persona name or key> <ts>` | `2` | Arguments are missing, extra, empty or have an invalid timestamp. |
+| `abandon-message: abandoned message <seq> for persona "<name>" (key=<key>); its text is kept` | `0` | Abandonment is durable. |
+| `abandon-message: no server is running` | `1` | PID file absent, unreadable, malformed or stale. |
+| `abandon-message: the server did not answer: <cause>` | `1` | Port-record, connection or response failure; causes below. |
+| `abandon-message: the server did not confirm within 30 s; the request may still run. Check the server log before trying again.` | `1` | No answer within 30 seconds; check for `message-abandoned` before retrying. |
+| `abandon-message: no persona in the running configuration has that name or key` | `1` | Unknown persona. |
+| `abandon-message: the persona is not up; nothing abandoned` | `1` | Persona is down. |
+| `abandon-message: no queued message has that ts` | `1` | No retained item matches. |
+| `abandon-message: the message was already delivered; nothing abandoned` | `1` | Matching item is delivered. |
+| `abandon-message: the message is not the head; the head has ts <head_ts>` | `1` | Another open item precedes it. |
+| `abandon-message: the message was already abandoned; nothing changed` | `1` | Matching item was abandoned. |
+| `abandon-message: a key operation is in flight; retry after it finishes` | `1` | Delivery/lifecycle work makes the operation busy. |
+| `[slack] abandon-message: the request failed: <description>` | `1` | Unexpected CLI failure; description is sanitized. |
+
+`<cause>` is `server.port is absent`, `server.port could not be read`, `server.port is malformed`, `server.port holds a PID or port out of range`, `server.port was written by another process`, a sanitized connection error such as `Error: connect ECONNREFUSED 127.0.0.1:<port>`, or `HTTP <status>` for an unexpected answer. No response body is printed.
+
+The CLI makes one direct request to `127.0.0.1` at the PID-matching recorded port, ignoring proxy settings; `bind` must be `127.0.0.1` or `0.0.0.0`. It reads no configuration file and changes no local file.
+
+---
+
 ## PID file
 
 The PID file is stored at `STATE_DIR/server.pid` (default: `~/.config/claude-slack-channel-bots/server.pid`). It is written on startup and removed on clean shutdown. A conflict check at startup prevents running two servers against the same state directory.
 
-Beside it, `STATE_DIR/server.port` records the server's process ID and the port it actually listens on. The server writes it once it is listening and removes it on shutdown. A start that finds a stale PID file removes a stale `server.port` with it, and `stop` removes it with the PID file. [`clear-latch`](#claude-slack-channel-bots-clear-latch) reads it to find the server, and uses it only when the process ID it records is the one in `server.pid`.
+Beside it, `STATE_DIR/server.port` records the server's process ID and the port it actually listens on. The server writes it once it is listening and removes it on shutdown.
+
+A start that finds a stale PID file removes a stale `server.port` with it, and `stop` removes it with the PID file. `clear-latch` and `abandon-message` read it to find the server, using it only when its process ID matches `server.pid`.

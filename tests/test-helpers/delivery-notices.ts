@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createDeliveryReporting, type DeliveryReportState } from '../../src/delivery-notices.ts'
+import { createOriginalConversationPoster } from '../../src/notice-correction.ts'
 import type { DeliveryReason, DeliveryStatus } from '../../src/delivery-engine.ts'
 import type { AcceptedInput, QueueItem, DeliveryQueue } from '../../src/delivery-queue.ts'
 import { isOpenItem, itemOpenedAt } from '../../src/delivery-queue.ts'
@@ -46,6 +47,7 @@ export async function makeDeliveryNoticeHarness(options: {
   const queue = options.queue ?? await makeQueue(root, { fs: queueIo.fs, now: h.clock.now, onEvent: event => reporting?.queueEvent(event) })
   const reporting = createDeliveryReporting({ queue, episodes: rig.episodes, persona: key => config.personas.find(p => p.key === key), state: key => states.get(key)!,
     log: line => logs.push(line), notify: (key, text) => h.notifier.notify(key, text),
+    postOriginalNotice: createOriginalConversationPoster({ clientFor: key => asWebClient(h.stub(key).web), ownPosts: options.ownPosts }),
     delivered: (key, item) => { delivered.push({ key, item }) }, now: h.clock.now,
     ...(options.holds || options.recordQueued ? { queued: (key: string, item: QueueItem) => { queued.push({ key, item }) } } : {}),
   })

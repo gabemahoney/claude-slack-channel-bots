@@ -1,7 +1,7 @@
 /** Durable one-part-at-a-time delivery executor.
  * All environment access is injected; importing this module does no I/O. */
 import type { Client, GetResult, SendKeysParams } from 'agent-director'
-import type { DeliveryQueue, QueueItem, QueueRecord, SentRecord } from './delivery-queue.ts'
+import type { AbandonResult, DeliveryQueue, QueueItem, QueueRecord, SentRecord } from './delivery-queue.ts'
 import { createQueueItemReader, isOpenItem, isQueueItemClosed, itemOpenedAt } from './delivery-queue.ts'
 import { createQueueDeliveryReceiptReader, effectiveSends, type DeliveryReceiptReader, type ReceiptObservation } from './delivery-receipt.ts'
 import { type DeliveryLifecycle, type DeliveryClock, systemDeliveryClock, NOT_NOW_RETRY_MS } from './delivery-lifecycle.ts'
@@ -36,6 +36,7 @@ export type DeliveryEngineEvent =
   | { type: 'transcript-reference'; key: string; instanceId: string; sessionId: string; path: string; at: number }
   | { type: 'delivered'; key: string; seq: number; part: number }
   | { type: 'item-delivered'; key: string; seq: number; at: number; waitMs: number }
+  | { type: 'item-abandoned'; key: string; seq: number; at: number }
   | { type: 'first-typed'; key: string; seq: number; part: number }
   | { type: 'partial-receipt'; key: string; seq: number; part: number; expectedBytes: number; receivedBytes: number }
   | { type: 'retyped'; key: string; seq: number; part: number; count: number }
@@ -78,6 +79,7 @@ export interface DeliveryEngineDeps {
   constants?: Partial<{ ENTER_DELAY_MS: number; RECEIPT_WAIT_MS: number; RETYPE_BACKOFF_MS: readonly number[]; NOT_NOW_RETRY_MS: readonly number[]; MaxRetypes: number }>
 }
 export interface DeliveryEngines {
+  abandonHead(key: string, seq: number): Promise<AbandonResult | 'busy'>
   wake(key: string): void
   tick(key: string): Promise<void>
   recoverBeforeReconnect(key: string): Promise<boolean>
@@ -142,9 +144,9 @@ function createQueueSummary(queue: DeliveryQueue, key: string) {
   // durable notices without copying a queue-sized list on every blocked wake.
   let notices: number[] = []
   function update(item: QueueItem): boolean {
-    const seq = item.accepted.seq, included = item.hold?.state !== 'withdrawn'
+    const seq = item.accepted.seq, included = item.hold?.state !== 'withdrawn' && !item.abandoned
     items.set(seq, item)
-    if (unresolvedInputBlocks(item).length) custody.add(seq); else custody.delete(seq)
+    if (included && unresolvedInputBlocks(item).length) custody.add(seq); else custody.delete(seq)
     setItemMember(open, seq, isOpenItem(item))
     setItemMember(p.accepted, seq, included)
     setItemMember(p.fixed, seq, included && !!item.fixed)
@@ -169,7 +171,7 @@ function createQueueSummary(queue: DeliveryQueue, key: string) {
     if (range.delta) for (let at = first; at < p.refused.length; at++) p.refused[at]! += range.delta
     for (let at = 0; at < refused.length; at++) p.refused.splice(first + at, 0, range.start + refused[at]!)
     replaceItemRange(p.delivered, seq, delivered, pair => pair[0])
-    replaceItemRange(holds, seq, item.hold?.state === 'unresolved' ? [{ item: seq, kind: item.hold.kind }] : [], hold => hold.item)
+    replaceItemRange(holds, seq, included && item.hold?.state === 'unresolved' ? [{ item: seq, kind: item.hold.kind }] : [], hold => hold.item)
     const noticeAt = itemPosition(notices, seq, n => n)
     if ((notices[noticeAt] === seq) !== noticed) {
       notices = [...notices]
@@ -217,6 +219,8 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     relaunch: boolean; restarted?: boolean; gone?: { row: GetResult; handedOff?: boolean }; receiptWorking: boolean; pollAfter: number; snapshot?: DeliveryPolicyKnowledge; lastRetypeEvent?: number; dialogHold: boolean; dialogMaybeOpen: boolean; recoveringReconnect?: boolean
   }
   const states = new Map<string, State>(), budgets = new Map<string, DeliveryCallBudget>()
+  const abandonTurns = new Map<string, Promise<void>>()
+  const forgetting = new Set<string>()
   // Blocked/empty executors retire without polling. Their queue-derived facts
   // and change cursor live until persona teardown; rebuilds invalidate the
   // cursor inside createQueueItemReader, including while no executor is active.
@@ -811,13 +815,67 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     } finally { if (states.get(key) === s && !stopped && !s.stopped) schedule(key, s, nextDelay) }
   }
   const api: DeliveryEngines = {
+    abandonHead(key, seq) {
+      const unsafe = (): boolean => {
+        const s = states.get(key), owner = life.owner(key)
+        return stopped || forgetting.has(key) || !!s?.stopped || !!s?.pending ||
+          !!s && ['text', 'enter', 'recovery-enter'].includes(s.e.phase) ||
+          owner !== 'free' && !(owner === 'delivery' && s?.lease && s.e.phase === 'receipt' && !s.busy)
+      }
+      // Preserve the refusal seen at arrival: a finishing key must not turn
+      // a request made during that key into an abandonment of its draft.
+      const busyAtArrival = unsafe()
+      const previous = abandonTurns.get(key) ?? Promise.resolve()
+      const result = previous.then(async (): Promise<AbandonResult | 'busy'> => {
+        await states.get(key)?.busy
+        if (busyAtArrival || unsafe()) return 'busy'
+        const s = states.get(key)
+        if (s?.timer !== undefined) { clock.clearTimeout(s.timer); s.timer = undefined }
+        // Keep an owned receipt lease through the durable decision. When
+        // free, reserve the same lease so reconnect cannot start keys meanwhile.
+        const ownedReceiptLease = s?.lease
+        const temporaryLease = ownedReceiptLease ? undefined : life.acquire(key, 'delivery')
+        if (!ownedReceiptLease && !temporaryLease && !life.inputHeld(key)) return 'busy'
+        try {
+          const at = clock.now(), outcome = await deps.queue.abandon(key, seq, at)
+          if (outcome !== 'abandoned') return outcome
+          // A released earlier Memory Hold can precede another item already
+          // in flight. Abandoning it must not reset that other item's attempt.
+          if (s && !s.stopped && (s.e.target[0] || s.lastSeq) === seq) {
+            release(s)
+            s.e.target = NO_DELIVERY_PAIR; s.e.phase = 'ready'; s.e.attempt = 0; s.e.recoveryAttempt = undefined
+            s.e.keyReading = createDeliveryReading(); delete s.e.retypes[seq]
+            s.e.noticed = s.e.noticed.filter(item => item !== seq)
+            s.deadlines = {}; s.receipt = undefined; s.receiptTarget = undefined; s.receiptAttempt = undefined
+            s.reading.records = []; s.reading.receipts = []; s.receiptWorking = false
+            s.partialReceipt = undefined; s.partialAfterAttempts.delete(seq)
+            s.lastSeq = undefined; s.lastPart = undefined; s.lastRetypeEvent = undefined
+            s.retryStep = 0; s.notNowStep = 0; s.appendRetryStep = 0
+          }
+          if (s) refreshQueue(s)
+          // The final open item has no successor to wake. Retire locally,
+          // just as an empty tick does, so lifecycle reconnect can own its timer.
+          if (s && !s.stopped && !s.pending && deps.queue.openCount(key) === 0) {
+            release(s); states.delete(key); life.engineRunning(key, false)
+          }
+          emit({ type: 'item-abandoned', key, seq, at })
+          return outcome
+        } finally { temporaryLease?.() }
+      })
+      const turn = result.then(() => {}, () => {}).finally(() => {
+        if (abandonTurns.get(key) === turn) { abandonTurns.delete(key); api.wake(key) }
+      })
+      abandonTurns.set(key, turn)
+      return result
+    },
     wake(key) {
-      if (stopped || !deps.persona(key) || deps.queue.openCount(key) === 0) return
+      if (stopped || forgetting.has(key) || abandonTurns.has(key) || !deps.persona(key) || deps.queue.openCount(key) === 0) return
       const s = states.get(key) ?? create(key)
       if (!s.busy) schedule(key, s, 1)
     },
     async tick(key) {
-      if (stopped || !deps.persona(key)) return
+      if (stopped || forgetting.has(key) || !deps.persona(key)) return
+      if (abandonTurns.has(key)) return abandonTurns.get(key)
       let s = states.get(key)
       if (!s) { if (!deps.queue.openCount(key)) return; s = create(key) }
       if (s.busy) return s.busy
@@ -826,6 +884,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       await s.busy
     },
     async recoverBeforeReconnect(key) {
+      if (stopped || forgetting.has(key) || abandonTurns.has(key)) return false
       // Recovery may expose retained work while its journal replacement is
       // still pending. Reconnect owns a retry even when there is no open head;
       // neither an empty queue nor AD waiting authorizes keys before repair.
@@ -858,12 +917,15 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       return reconciled()
     },
     async forget(key) {
+      forgetting.add(key)
       covered.forget(key)
       const s = states.get(key)
-      if (s) { s.stopped = true; if (s.timer !== undefined) clock.clearTimeout(s.timer); release(s); await s.busy; states.delete(key); life.engineRunning(key, false) }
-      summaries.delete(key); life.forget(key)
+      if (s) { s.stopped = true; if (s.timer !== undefined) clock.clearTimeout(s.timer); release(s) }
+      await Promise.allSettled([s?.busy, abandonTurns.get(key)])
+      states.delete(key); life.engineRunning(key, false)
+      summaries.delete(key); life.forget(key); forgetting.delete(key)
     },
-    async stop() { stopped = true; const stoppingLife = life.stop(); for (const [key, s] of states) { s.stopped = true; if (s.timer !== undefined) clock.clearTimeout(s.timer); release(s); life.engineRunning(key, false) }; await Promise.allSettled([...states.values()].flatMap(s => s.busy ? [s.busy] : [])); await stoppingLife; states.clear(); summaries.clear() },
+    async stop() { stopped = true; const stoppingLife = life.stop(); for (const [key, s] of states) { s.stopped = true; if (s.timer !== undefined) clock.clearTimeout(s.timer); release(s); life.engineRunning(key, false) }; await Promise.allSettled([...states.values()].flatMap(s => s.busy ? [s.busy] : []).concat([...abandonTurns.values()])); await stoppingLife; states.clear(); summaries.clear() },
     running: key => states.has(key),
     snapshot(key) {
       const s = states.get(key), k = s?.snapshot
