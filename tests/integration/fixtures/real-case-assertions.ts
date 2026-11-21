@@ -169,6 +169,47 @@ export function assertResetKeyRecovery(journal: any[], calls: KeyCall[], faults:
   return { session: initial.session_id, stages, sends: newer.map(record => ({ kind: record.send_kind, at: record.at })) }
 }
 
+const isTypedReconnect = (call: KeyCall) => call.words.includes('send-keys') && call.words.some(word => word.startsWith('/mcp reconnect'))
+/** Server-log line time in ms; NaN when the line has no parseable stamp. */
+function logLineAt(line: string): number {
+  const stamp = /^\[(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z)\] /.exec(line)?.[1]
+  return stamp === undefined ? NaN : Date.parse(stamp)
+}
+/** test-37 reconnect proof for the item whose first fixed part is `fixedText`:
+ * a typed `/mcp reconnect` in [after, the item's first text call).
+ * A gate-held case passes `holdStart`, the consumed Enter-delay fault's time
+ * (`after` is its release). It always fails for a reconnect typed inside
+ * [holdStart, after). Its only other accepted path is the native client's own
+ * MCP re-init, which CSCB rightly does not type over (b.88t decision 7, a
+ * proof change the user approved): every condition fails closed.
+ * - no CSCB "reconnecting MCP server" line in [holdStart, the text call),
+ *   including any such line without a parseable stamp;
+ * - a stamped `Session connected` line for this key in [after, the text call).
+ */
+export function assertReconnectProof(fixedText: string, calls: KeyCall[], logLines: string[], key: string, after: number, holdStart?: number) {
+  check(typeof fixedText === 'string' && fixedText.length > 0, 'reconnect target not fixed')
+  const sent = calls.find(c => c.words.includes('--text') && c.words[c.words.indexOf('--text') + 1] === fixedText)
+  check(sent && Number.isFinite(sent.at), 'delivery was not typed')
+  check(Number.isFinite(after), 'invalid reconnect mark')
+  const gated = holdStart !== undefined
+  if (gated) {
+    check(Number.isFinite(holdStart) && holdStart >= 0 && holdStart < after, 'invalid gate hold interval')
+    // NaN times count as inside the hold.
+    check(!calls.some(c => isTypedReconnect(c) && !(c.at < holdStart || c.at >= after)), 'MCP reconnect typed inside the gate hold')
+  }
+  const typed = calls.filter(c => isTypedReconnect(c) && c.at >= after && c.at < sent.at)
+  if (typed.length >= 1) return { path: 'typed' as const, at: typed[0]!.at, sent: sent.at }
+  check(gated, 'delivery preceded its reconnect or reconnect violated the hold interval')
+  check(/^[a-z0-9_]+$/.test(key), 'invalid reconnect key')
+  const lines = logLines.map(line => ({ line, at: logLineAt(line) }))
+  check(!lines.some(l => l.line.includes('reconnecting MCP server') && !(l.at < holdStart! || l.at >= sent.at)),
+    'native recovery window holds a CSCB MCP reconnect that was not typed')
+  const connected = lines.filter(l => l.line.includes('[slack] Session connected: persona ') && l.line.includes(`(key=${key})`)
+    && Number.isFinite(l.at) && l.at >= after && l.at < sent.at)
+  check(connected.length >= 1, 'gate-held delivery has neither a typed reconnect nor a native MCP session reconnect after the hold')
+  return { path: 'native' as const, at: connected[0]!.at, sent: sent.at }
+}
+
 async function main() {
 const [command, state, key, shim, root, arg = '', arg2 = '', arg3 = ''] = process.argv.slice(2)
 function journal() { return jsonLines(join(state!, 'queue', `${key}.jsonl`)) }
@@ -339,12 +380,17 @@ try {
   } else if(command==='reconnect-proof') {
     const j=cumulativeJournal(),target=workloadItem(j,Number(arg))
     const fixed=j.find(r=>r.kind==='fixed'&&r.seq===target?.seq);check(fixed,'reconnect target not fixed')
-    const c=calls(), sent=c.find(c=>c.words.includes('--text')&&c.words[c.words.indexOf('--text')+1]===fixed.parts[0]);check(sent,'delivery was not typed')
-    const reconnect=c.filter(c=>c.at>=Number(arg2)&&c.at<sent.at&&c.words.includes('send-keys')&&c.words.some(w=>w.startsWith('/mcp reconnect')))
-    check(reconnect.length>=1,'delivery preceded its reconnect or reconnect violated the hold interval')
-    console.log('recorded: MCP reconnect precedes item '+arg+' after hold '+arg2)
+    // arg3, given only by the gate-held case, is its hold start (see assertReconnectProof).
+    const hold=arg3===''?undefined:Number(arg3)
+    const proof=assertReconnectProof(fixed.parts?.[0],calls(),readFileSync(join(state!,'server.log'),'utf8').split('\n'),key!,Number(arg2),hold)
+    const inHold=hold===undefined?'':', none typed inside the hold from '+arg3
+    console.log(proof.path==='typed'?'recorded: MCP reconnect precedes item '+arg+' after hold '+arg2+inHold
+      :'recorded: native MCP session reconnect precedes item '+arg+' after hold '+arg2+inHold+'; no CSCB reconnect in the window')
   } else if(command==='reconnects') {
-    check(calls().filter(c=>c.words.includes('send-keys')&&c.words.some(w=>w.startsWith('/mcp reconnect'))).length>=4,'not all MCP reconnect variants typed')
+    // 4 typed variants; 3 only when the gate-held case proved the native path
+    // (cases 1, 2 and 5 each proved their own typed reconnect in disjoint windows).
+    const want=arg===''?4:Number(arg);check(want===4||want===3,'invalid reconnect variant count')
+    check(calls().filter(isTypedReconnect).length>=want,'not all MCP reconnect variants typed')
   } else if(command==='no-shell') {
     check(!(await entries()).some(e=>e.value?.type==='user'&&JSON.stringify(e.value.message?.content).includes('<bash-input>')), 'body entered native bash-input mode')
   } else if(command==='active-tool'||command==='busy-proof'||command==='busy-proof-wait') {
