@@ -1598,7 +1598,7 @@ contracts to satisfy a zero-match audit.
 | 17 | server-backed fmk scripts | `assert_no_server_tmux`: no bot server makes a tmux call of its own (see Closing assertions) |
 | 18 | `test-19-fmk-reuse.sh` | A persona removed and re-added comes back fresh by reuse, never resumed |
 | 19 | `test-16-fmk-conflict.sh` | Each kind of leftover session latches its persona, and each clears once it ends |
-| 20 | `test-23-fmk-latch-recheck.sh` | Every latch case is re-checked every interval (45 s here, by a test-only override; 120 s in production) with exactly its call; from AD 0.18.0 observations read the store, the note clears on the next CSCB get after its cause is removed, PN keeps a live worker with an absent recorded pane, relabelled rows may be marked by CSCB or the loop, and the no-launch-start row has no launch-start latch (other latches recorded under S8) |
+| 20 | `test-23-fmk-latch-recheck.sh` | Every latch case is re-checked every interval (45 s here, by a test-only override; 120 s in production) with exactly its call; from AD 0.18.0 observations read the store, the note clears on the next CSCB get after its cause is removed, PN keeps a live worker with an absent recorded pane, relabelled rows may be marked by CSCB or the loop (each leg's store read is taken before the legs' events, so a mark cannot race it), and the no-launch-start row has no launch-start latch (other latches recorded under S8) |
 | 21 | `test-24-fmk-stuck-launch.sh` | A launch stuck at an unrecognised prompt is aborted once at B and resumed |
 | 22 | `test-25-fmk-pre-trust.sh` | Each launch's `pre_trust` is only logged |
 | 23 | `test-20-fmk-old-binary.sh` | A `<P1>-rc.N` binary launches and development builds are refused; see Scenarios 8, 23 and 24 |

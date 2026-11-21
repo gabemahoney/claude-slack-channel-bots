@@ -1783,8 +1783,9 @@ wait_rounds() {
     fi
 }
 
-# free_snapshot <key> <rounds>: right after the clearing event (or, for the
-# persona latched to the end, right after its last round checked), with
+# free_snapshot <key> <rounds>: right after the clearing event (for the
+# relabelled legs, right before their events; for the persona latched to the
+# end, right after its last round checked), with
 # <rounds> still-latched round lines logged: the mark, the post count, the
 # MCP registration count and the harness's store read of the row (for the
 # scan's refusal, that the store holds none).
@@ -1885,9 +1886,9 @@ p2_clearing_schedule() {
 
 # p2_relabel_events: after the last clearing round above (so the loop adds no
 # find-missing to those rounds' windows), right after one more round of each
-# leg: [harness] leg 1's worker pane respawned with `sleep` (the worker ends,
-# the relabelled session stays); [harness] leg 2's relabelled session ended by
-# its id, which ends its worker (END_MARK); each leg's snapshot; then
+# leg: each leg's snapshot; [harness] leg 1's worker pane respawned with
+# `sleep` (the worker ends, the relabelled session stays); [harness] leg 2's
+# relabelled session ended by its id, which ends its worker (END_MARK); then
 # [harness] the find-missing loop started (LOOP_MARK). Its calls are the
 # harness's, never CSCB's.
 p2_relabel_events() {
@@ -1899,6 +1900,15 @@ p2_relabel_events() {
     done
     for key in "${P2_RELABEL_KEYS[@]}"; do
         wait_rounds "part 2" "${key}" "${STILL_LINE[${key}]}" "${want[${key}]}" "${want[${key}]}"
+    done
+    # Each leg's snapshot, taken after its last still-latched round and before
+    # the events: the store read cannot race a missing mark. From 0.18.0 any
+    # list (CSCB's own included) marks a row missing once its worker is gone,
+    # so a read after the events could meet leg 2's row `missing` at
+    # row_version 3 before the loop starts. The recount after the events
+    # proves no round fell between the snapshot and them.
+    for key in "${P2_RELABEL_KEYS[@]}"; do
+        free_snapshot "${key}" "${want[${key}]}"
     done
     # The agent-director shim's mark right before the events: from here to
     # each leg's MISSING_MARK, every find-missing is checked (no CSCB one; the
@@ -1913,7 +1923,6 @@ p2_relabel_events() {
     for key in "${P2_RELABEL_KEYS[@]}"; do
         n="$(count_log "${STILL_LINE[${key}]}")"
         (( n == want[${key}] )) || fail "${step}: ${key} has ${n} round lines at its event, not ${want[${key}]}"
-        free_snapshot "${key}" "${n}"
     done
     has_session_id "${SEED_SID[${R1_KEY}]}" || fail "${step}: ${R1_KEY}'s relabelled session ${SEED_SID[${R1_KEY}]} is gone after the respawn"
     echo "${TEST_NAME}: ${step}: the harness respawned ${R1_KEY}'s worker pane (pane and new pid ${out}; ${SEED_SID[${R1_KEY}]} stays) and ended ${PERSONA_NAMED[${R2_KEY}]} (${SEED_SID[${R2_KEY}]})"
