@@ -344,6 +344,22 @@ export function receiptProgress(options: AuditOptions, entries: readonly Transcr
   }
   return completed
 }
+/** How many of a part's shim text sends AD refused, so nothing was typed
+ * (b.88t). A send counts only when it lies inside one refused attempt's
+ * window: that attempt's durable `sent` text record (written before the keys)
+ * at or before the send, and its `refused` record at or after it. Each refused
+ * attempt accounts for at most one send; any other send stays typed. */
+function refusedTextSends(journal: readonly any[], seq: number, part: number, typed: readonly ShimSend[]): number {
+  const used = new Set<number>()
+  for (const sent of journal) {
+    if (sent.kind !== 'sent' || sent.seq !== seq || sent.part !== part || sent.send_kind !== 'text' || !Number.isFinite(sent.at)) continue
+    const refused = journal.find(r => r.kind === 'refused' && r.seq === seq && r.attempt === sent.attempt)
+    if (!refused || !Number.isFinite(refused.at)) continue
+    const send = typed.findIndex((s, i) => !used.has(i) && s.at >= sent.at && s.at <= refused.at)
+    if (send >= 0) used.add(send)
+  }
+  return used.size
+}
 export function auditReceipts(options: AuditOptions, entries: readonly TranscriptEntry[], adapters: ReceiptAdapters) {
   const journal = receiptJournal(options.stateDir, options.key)
   const accepted = journal.filter(r => r.kind === 'accepted' && !r.compact).sort((a, b) => a.seq - b.seq)
@@ -392,7 +408,8 @@ export function auditReceipts(options: AuditOptions, entries: readonly Transcrip
       if (!typed.length) throw new Error(`Item ${item.seq} part ${part} has no shim send`)
       if (typed.some(s => !Number.isFinite(s.at) || s.at < receivedAt)) throw new Error('Missing, invalid or negative typing measurement')
       if (typed.some(s => s.at < partDelivered)) throw new Error('Successor send preceded prior receipt/delivery log')
-      if (options.noRetype && typed.length !== 1) throw new Error('Text fidelity case retyped')
+      if (options.noRetype && typed.length - refusedTextSends(journal, item.seq, part, typed) !== 1) throw new Error('Text fidelity case retyped')
+      if (options.noRetype && matches.length !== 1) throw new Error('Text fidelity case taken in more than once')
       if (options.noRetype && journal.some(r => r.kind === 'sent' && r.seq === item.seq && r.part === part && r.send_kind === 'enter')) {
         throw new Error('Text fidelity case needed Enter-only recovery')
       }
@@ -505,6 +522,8 @@ export function deliveryFailureEvidence(options: AuditOptions, entries: readonly
     else if (/^Item \d+ first appearance is out of accept order$/.test(message)) reason = 'receipt-order'
     else if (/^Item \d+ part \d+ has no shim send$/.test(message)) reason = 'missing-shim-send'
     else if (message === 'Text fidelity case retyped') reason = 'retyped'
+    else if (message === 'Text fidelity case taken in more than once') reason = 'duplicate-take-in'
+    else if (message === 'Text fidelity case needed Enter-only recovery') reason = 'enter-only-recovery'
     else if (message === 'Durable receipt does not identify matching take-in') reason = 'durable-receipt-mismatch'
   }
   let journal: any[] = [], journalReadable = true

@@ -81,6 +81,62 @@ test('b.88t fidelity requires the original Enter path without Enter-only recover
   expect(h.audit()).toMatchObject({ items: 1 })
 })
 
+test('b.88t fidelity counts a send AD refused as untyped only inside its own attempt window, still requiring one typed send', async () => {
+  const h = await fixture(false)
+  await h.send(slackInput(), 'refused')
+  h.options.expectedCount = 1
+  const audit = () => auditReceipts({ ...h.options, noRetype: true }, h.entries(), h.adapters)
+  const evidence = () => deliveryFailureEvidence({ ...h.options, noRetype: true }, h.entries(), h.adapters)
+  const rows = jsonLines(h.journal), calls = readFileSync(h.shimLog, 'utf8').trimEnd().split('\n')
+  const sent = rows.filter(r => r.kind === 'sent'), refused = rows.find(r => r.kind === 'refused')
+  // Production order: durable text intent, the shim's call, AD's refusal; then the retry types once.
+  expect(sent.map(r => [r.attempt, r.send_kind])).toEqual([[1, 'text'], [2, 'text']])
+  expect(refused).toMatchObject({ seq: 1, attempt: 1, at: sent[0].at + 40 })
+  expect(calls.filter(line => line.includes('--text'))).toHaveLength(2)
+  expect(audit()).toMatchObject({ items: 1, duplicates: 0 })
+  const write = (journal: any[], shim = calls) => {
+    writeFileSync(h.journal, journal.map(r => JSON.stringify(r)).join('\n') + '\n')
+    writeFileSync(h.shimLog, shim.join('\n') + '\n')
+  }
+  const callAt = (line: string, at: number) => line.replace(/^call\t[^\t]+/, `call\t${at / 1000}`)
+  const rejects = (journal: any[], shim = calls) => {
+    write(journal, shim)
+    expect(audit).toThrow('Text fidelity case retyped')
+    expect(evidence()).toMatchObject({ reason: 'retyped' })
+  }
+  // No refusal: both sends typed.
+  rejects(rows.filter(r => r.kind !== 'refused'))
+  // The refusal names the other attempt's seq or a missing attempt.
+  rejects(rows.map(r => r.kind === 'refused' ? { ...r, seq: 2 } : r))
+  rejects(rows.map(r => r.kind === 'refused' ? { ...r, attempt: 3 } : r))
+  // The refused send falls outside its window: before the intent, or after the refusal.
+  rejects(rows, calls.map((line, i) => i === 0 ? callAt(line, sent[0].at - 1) : line))
+  rejects(rows.map(r => r.kind === 'refused' ? { ...r, at: sent[0].at - 1 } : r))
+  // An Enter-kind intent cannot excuse a text send.
+  rejects(rows.map(r => r.kind === 'sent' && r.attempt === 1 ? { ...r, send_kind: 'enter' } : r))
+  // One refusal excuses one send only: a second send inside the same window stays typed.
+  rejects(rows, [calls[0]!, callAt(calls[0]!, sent[0].at + 20), ...calls.slice(1)])
+  // An extra unpaired send after the typed one stays typed.
+  rejects(rows, [...calls, callAt(calls[1]!, sent[1].at + 5)])
+  // Back to production evidence: passes again; outside a fidelity run both sends were always accepted.
+  write(rows)
+  expect(audit()).toMatchObject({ items: 1 })
+  expect(h.audit()).toMatchObject({ items: 1 })
+})
+
+test('b.88t fidelity requires exactly one exact take-in per part', async () => {
+  const h = await fixture(false)
+  const item = await h.send(slackInput())
+  h.options.expectedCount = 1
+  const audit = () => auditReceipts({ ...h.options, noRetype: true }, h.entries(), h.adapters)
+  expect(audit()).toMatchObject({ items: 1, duplicates: 0 })
+  h.duplicate(item)
+  expect(audit).toThrow('Text fidelity case taken in more than once')
+  expect(deliveryFailureEvidence({ ...h.options, noRetype: true }, h.entries(), h.adapters)).toMatchObject({ reason: 'duplicate-take-in' })
+  // Outside a fidelity run a duplicate take-in is only counted.
+  expect(h.audit()).toMatchObject({ items: 1, duplicates: 1 })
+})
+
 /** Pure controls of the actual thread CLI verdict, after the independent
  * complete receipt audit. Wrappers and queue records use production builders.
  * These are synthetic evidence, never a native/performance acceptance. */
@@ -304,7 +360,9 @@ const plans = {
     [111000, 'retype'], [141500, 'enter'], [171500, 'retype']], fault: [111000, 'swallow'], waiting: 100000 },
   'reset missing retype': { stages: [[10, 'text'], [20500, 'retype'], [81000, 'retype'], [101000, 'enter'],
     [111000, 'retype'], [141500, 'enter']], fault: [111000, 'swallow'], waiting: 100000 },
-} satisfies Record<string, { stages: [number, SendKind][]; fault?: [number, string]; waiting?: number }>
+  // b.88t: AD refuses the first text send (nothing typed); the not-now retry types it.
+  refused: { stages: [[10, 'text'], [5010, 'text']], refused: [10, 40] },
+} satisfies Record<string, { stages: [number, SendKind][]; fault?: [number, string]; waiting?: number; refused?: [number, number] }>
 type Plan = keyof typeof plans
 async function fixture(seed = true, projects = false) {
   const stateDir = mkdtempSync(join(tmpdir(), 'reminder-receipts-'))
@@ -324,13 +382,14 @@ async function fixture(seed = true, projects = false) {
     const diagnostic = (kind: string) => `[${new Date(now).toISOString()}] [slack] ${kind}: persona="alpha" (key=alpha) source=${a.source} ${a.source === 'slack' ? 'chat_id' : 'sender'}=${JSON.stringify(a.channel ?? a.sender)} ts=${JSON.stringify(a.ts)} sender_id=${JSON.stringify(a.user ?? a.sender)}`
     if (a.reminder_for === undefined) lines.push(diagnostic('message-received'))
     await queue.append('alpha', { v: 1, kind: 'fixed', seq, parts: [text] })
-    const base = now, { stages, fault, waiting } = plans[plan] as { stages: [number, SendKind][]; fault?: [number, string]; waiting?: number }
+    const base = now, { stages, fault, waiting, refused } = plans[plan] as { stages: [number, SendKind][]; fault?: [number, string]; waiting?: number; refused?: [number, number] }
     for (const [attempt, [offset, send_kind]] of stages.entries()) {
       now = base + offset
       await queue.append('alpha', { v: 1, kind: 'sent', seq, part: 1, attempt: attempt + 1, send_kind, at: now, session_id: 'session', transcript_path: transcript, transcript_size: 0 })
       const words = send_kind === 'enter' ? '--key Enter'
         : `--text ${text.replace(/[^a-zA-Z0-9]/g, c => '\\' + c)} --no-enter`
       calls.push(`call\t${now / 1000}\t${seq}-${attempt}\t1\tbun\tsend-keys --instance-id cscb_alpha ${words}`)
+      if (refused?.[0] === offset) await queue.append('alpha', { v: 1, kind: 'refused', seq, attempt: attempt + 1, at: now + refused[1] })
       if (fault?.[0] === offset) {
         calls.push(`fault\t${now / 1000}\t${seq}-${attempt}\t1\tbun\tsend-keys no_enter ${fault[1]}`)
         // A swallowed text still receives its guarded delayed Enter.
