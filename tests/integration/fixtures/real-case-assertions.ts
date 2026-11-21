@@ -170,11 +170,16 @@ export function assertResetKeyRecovery(journal: any[], calls: KeyCall[], faults:
 }
 
 const isTypedReconnect = (call: KeyCall) => call.words.includes('send-keys') && call.words.some(word => word.startsWith('/mcp reconnect'))
-/** Server-log line time in ms; NaN when the line has no parseable stamp. */
+/** Start of a server-log line's stamp in ms; NaN unless the line has the
+ * logger's millisecond ISO stamp (`Date.now()`, src/logging.ts). The stamp is
+ * floored: the event lies somewhere in [start, start + 1), while shim times
+ * keep microseconds, so ordering against a shim time must use the whole
+ * interval. */
 function logLineAt(line: string): number {
-  const stamp = /^\[(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z)\] /.exec(line)?.[1]
+  const stamp = /^\[(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z)\] /.exec(line)?.[1]
   return stamp === undefined ? NaN : Date.parse(stamp)
 }
+const LOG_STAMP_MS = 1
 /** test-37 reconnect proof for the item whose first fixed part is `fixedText`:
  * a typed `/mcp reconnect` in [after, the item's first text call).
  * A gate-held case passes `holdStart`, the consumed Enter-delay fault's time
@@ -182,9 +187,11 @@ function logLineAt(line: string): number {
  * [holdStart, after). Its only other accepted path is the native client's own
  * MCP re-init, which CSCB rightly does not type over (b.88t decision 7, a
  * proof change the user approved): every condition fails closed.
- * - no CSCB "reconnecting MCP server" line in [holdStart, the text call),
- *   including any such line without a parseable stamp;
- * - a stamped `Session connected` line for this key in [after, the text call).
+ * - no CSCB "reconnecting MCP server" line whose stamp's millisecond could
+ *   fall in [holdStart, the text call), including any such line without a
+ *   parseable stamp;
+ * - a stamped `Session connected` line for this key whose whole stamp
+ *   millisecond lies in [after, the text call).
  */
 export function assertReconnectProof(fixedText: string, calls: KeyCall[], logLines: string[], key: string, after: number, holdStart?: number) {
   check(typeof fixedText === 'string' && fixedText.length > 0, 'reconnect target not fixed')
@@ -202,12 +209,44 @@ export function assertReconnectProof(fixedText: string, calls: KeyCall[], logLin
   check(gated, 'delivery preceded its reconnect or reconnect violated the hold interval')
   check(/^[a-z0-9_]+$/.test(key), 'invalid reconnect key')
   const lines = logLines.map(line => ({ line, at: logLineAt(line) }))
-  check(!lines.some(l => l.line.includes('reconnecting MCP server') && !(l.at < holdStart! || l.at >= sent.at)),
+  // A stamp's interval that overlaps [holdStart, text call) at all counts as
+  // inside (NaN counts too); a connect counts only if its whole interval lies
+  // in [after, text call).
+  check(!lines.some(l => l.line.includes('reconnecting MCP server') && !(l.at + LOG_STAMP_MS <= holdStart! || l.at >= sent.at)),
     'native recovery window holds a CSCB MCP reconnect that was not typed')
   const connected = lines.filter(l => l.line.includes('[slack] Session connected: persona ') && l.line.includes(`(key=${key})`)
-    && Number.isFinite(l.at) && l.at >= after && l.at < sent.at)
+    && Number.isFinite(l.at) && l.at >= after && l.at + LOG_STAMP_MS <= sent.at)
   check(connected.length >= 1, 'gate-held delivery has neither a typed reconnect nor a native MCP session reconnect after the hold')
   return { path: 'native' as const, at: connected[0]!.at, sent: sent.at }
+}
+
+type StubSocketRecord = { event?: unknown; label?: unknown; ticket?: unknown }
+/** The Slack stub's complete record lines (a line still being appended is
+ * left for the next read); a malformed complete line fails. */
+export function stubSocketRecords(text: string): StubSocketRecord[] {
+  return text.slice(0, text.lastIndexOf('\n') + 1).split('\n').filter(Boolean).map(line => {
+    let row: unknown
+    try { row = JSON.parse(line) } catch { row = undefined }
+    check(row !== null && typeof row === 'object' && !Array.isArray(row), 'malformed stub record')
+    return row as StubSocketRecord
+  })
+}
+const isTicket = (ticket: unknown): ticket is string => typeof ticket === 'string' && /^[A-Za-z0-9_-]+$/.test(ticket)
+/** Tickets of every socket the stub has opened for `label`: test-37's
+ * baseline, taken after the old server stopped. */
+export function socketTickets(records: StubSocketRecord[], label: string): string[] {
+  const opens = records.filter(r => r.event === 'ws-open' && r.label === label)
+  check(opens.every(r => isTicket(r.ticket)), 'stub socket record without a ticket')
+  return opens.map(r => r.ticket as string)
+}
+/** test-37's restart wait: a socket for `label` opened after the baseline
+ * and not closed. The stub's `push()` sends to the newest open socket for the
+ * label, so this is the socket the next DM reaches. */
+export function hasNewOpenSocket(records: StubSocketRecord[], label: string, before: string[]): boolean {
+  check(Array.isArray(before) && before.every(isTicket), 'invalid socket baseline')
+  const closed = new Set(records.filter(r => r.event === 'ws-close' && r.label === label).map(r => r.ticket))
+  return records.some(r => r.event === 'ws-open' && r.label === label && isTicket(r.ticket)
+    && !before.includes(r.ticket) && !closed.has(r.ticket))
 }
 
 async function main() {
@@ -391,6 +430,17 @@ try {
     // (cases 1, 2 and 5 each proved their own typed reconnect in disjoint windows).
     const want=arg===''?4:Number(arg);check(want===4||want===3,'invalid reconnect variant count')
     check(calls().filter(isTypedReconnect).length>=want,'not all MCP reconnect variants typed')
+  } else if(command==='socket-tickets'||command==='socket-reopened') {
+    // arg: the Slack stub's record file; arg2: the persona label;
+    // socket-reopened's arg3: socket-tickets' JSON output after the stop.
+    check(arg!==''&&arg2!=='','socket query needs a record file and a label')
+    const records=stubSocketRecords(readFileSync(arg,'utf8'))
+    if(command==='socket-tickets') console.log(JSON.stringify(socketTickets(records,arg2)))
+    else {
+      let before:unknown;try{before=JSON.parse(arg3)}catch{before=undefined}
+      check(Array.isArray(before),'invalid socket baseline')
+      check(hasNewOpenSocket(records,arg2,before as string[]),'restarted server has no new open Slack socket')
+    }
   } else if(command==='no-shell') {
     check(!(await entries()).some(e=>e.value?.type==='user'&&JSON.stringify(e.value.message?.content).includes('<bash-input>')), 'body entered native bash-input mode')
   } else if(command==='active-tool'||command==='busy-proof'||command==='busy-proof-wait') {

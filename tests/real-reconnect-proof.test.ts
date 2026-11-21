@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { assertReconnectProof } from './integration/fixtures/real-case-assertions.ts'
+import { assertReconnectProof, hasNewOpenSocket, socketTickets, stubSocketRecords } from './integration/fixtures/real-case-assertions.ts'
 import { runFixture } from './test-helpers/test33-receipt-boundary.ts'
 
 // test-37's reconnect proofs. Case 4 (gate held) accepts the native client's
@@ -75,6 +75,38 @@ describe('gate-held reconnect proof (case 4)', () => {
     expect(reason(() => prove(r37aCalls(), [...without, `[slack] Session connected: persona "mcp" (key=mcp) cwd="/tmp/t"`]))).toBe(none)
     expect(reason(() => prove(r37aCalls(), [...without, line('44:55.752', 'Session "x" initialized')]))).toBe(none)
   })
+  // server.log stamps are floored milliseconds (Date.now()); shim times keep
+  // microseconds. An event stamped .300 happened somewhere in [.300, .301).
+  test('fractional shim times: a connect counts only if its whole stamp millisecond is in [release, text call)', () => {
+    const none = 'gate-held delivery has neither a typed reconnect nor a native MCP session reconnect after the hold'
+    const without = r37aLog.filter(l => !l.includes('Session connected'))
+    const text = TEXT + 0.25, calls = [...earlier, call(text, ITEM)]
+    // Stamped in the text call's own millisecond: it may be .300.75, after the text.
+    expect(reason(() => prove(calls, [...without, connected('45:01.300')]))).toBe(none)
+    expect(prove(calls, [...without, connected('45:01.299')])).toEqual({ path: 'native', at: at('45:01.299'), sent: text })
+    // Release at .950.5: a connect stamped .950 may precede it, one stamped .951 cannot.
+    const release = at('44:53.950') + 0.5
+    expect(reason(() => prove(r37aCalls(), [...without, connected('44:53.950')], HOLD, release))).toBe(none)
+    expect(prove(r37aCalls(), [...without, connected('44:53.951')], HOLD, release).path).toBe('native')
+  })
+  test('fractional shim times: a CSCB reconnect whose stamp millisecond overlaps [hold start, text call) rejects', () => {
+    const rejected = 'native recovery window holds a CSCB MCP reconnect that was not typed'
+    const hold = HOLD + 0.25 // 44:48.950.25; a line stamped .950 may be .950.75, inside the hold
+    expect(reason(() => prove(r37aCalls(), [...r37aLog, cscbReconnect('44:48.950')], hold))).toBe(rejected)
+    expect(prove(r37aCalls(), [...r37aLog, cscbReconnect('44:48.949')], hold).path).toBe('native')
+    const text = TEXT + 0.25, calls = [...earlier, call(text, ITEM)] // .300 may be .300.1, before the text
+    expect(reason(() => prove(calls, [...r37aLog, cscbReconnect('45:01.300')]))).toBe(rejected)
+    expect(prove(calls, [...r37aLog, cscbReconnect('45:01.301')]).path).toBe('native')
+  })
+  test('a stamp without the logger millisecond form is unusable: no connect, and a reconnect line rejects', () => {
+    const without = r37aLog.filter(l => !l.includes('Session connected'))
+    for (const stamp of ['2026-11-21T03:44:55Z', '2026-11-21T03:44:55.75Z', '2026-11-21T03:44:55.7520Z']) {
+      expect(reason(() => prove(r37aCalls(), [...without, `[${stamp}] [slack] Session connected: persona "mcp" (key=mcp) cwd="/tmp/t"`])))
+        .toBe('gate-held delivery has neither a typed reconnect nor a native MCP session reconnect after the hold')
+      expect(reason(() => prove(r37aCalls(), [...r37aLog, `[${stamp}] [slack] reconnecting MCP server "slack-channel-router": persona=mcp`])))
+        .toBe('native recovery window holds a CSCB MCP reconnect that was not typed')
+    }
+  })
   test('a typed reconnect only after the text call does not count', () => {
     expect(reason(() => prove([...r37aCalls(), call(TEXT + 1, RECONNECT)], r37aLog.filter(l => !l.includes('Session connected')))))
       .toBe('gate-held delivery has neither a typed reconnect nor a native MCP session reconnect after the hold')
@@ -101,6 +133,42 @@ describe('ungated reconnect proofs (cases 1, 2 and 5) still require a typed reco
     const old = 'delivery preceded its reconnect or reconnect violated the hold interval'
     expect(reason(() => prove(r37aCalls(), r37aLog, null))).toBe(old)
     expect(reason(() => prove([call(RELEASE - 1, RECONNECT), call(TEXT, ITEM), call(TEXT + 1, RECONNECT)], r37aLog, null))).toBe(old)
+  })
+})
+
+// test-37's restart wait (b.88t review 8, F2): the baseline is every ticket the
+// stub opened for the label, taken after the stop; it passes only for a socket
+// opened since that is not closed, the one the stub's push() reaches.
+describe('restart socket wait', () => {
+  const LABEL = 'mcp'
+  const open = (ticket: unknown, label = LABEL) => ({ event: 'ws-open', label, ticket })
+  const close = (ticket: unknown, label = LABEL) => ({ event: 'ws-close', label, ticket })
+  const records = (...rows: object[]) => rows.map(r => JSON.stringify(r) + '\n').join('')
+  const old = [open('stubticket1'), open('stubticket2'), close('stubticket1')]
+  test('passes for a socket opened since the stop and still open; reports the baseline tickets', () => {
+    const rows = stubSocketRecords(records(...old, close('stubticket2'), open('stubticket3')))
+    expect(socketTickets(stubSocketRecords(records(...old, close('stubticket2'))), LABEL)).toEqual(['stubticket1', 'stubticket2'])
+    expect(hasNewOpenSocket(rows, LABEL, ['stubticket1', 'stubticket2'])).toBe(true)
+    // An old socket whose close is not yet recorded does not block it: push() picks the newest.
+    expect(hasNewOpenSocket(stubSocketRecords(records(...old, open('stubticket3'))), LABEL, ['stubticket1', 'stubticket2'])).toBe(true)
+  })
+  test('fails with no new socket, an already-closed new socket, or only another label\'s', () => {
+    const before = ['stubticket1', 'stubticket2']
+    // The round-8 counterexample: two opens and two closes, none left open.
+    expect(hasNewOpenSocket(stubSocketRecords(records(...old, close('stubticket2'))), LABEL, before)).toBe(false)
+    expect(hasNewOpenSocket(stubSocketRecords(records(...old, close('stubticket2'), open('stubticket3'), close('stubticket3'))), LABEL, before)).toBe(false)
+    expect(hasNewOpenSocket(stubSocketRecords(records(...old, open('stubticket3', 'other'))), LABEL, before)).toBe(false)
+    expect(hasNewOpenSocket(stubSocketRecords(records(...old, open(null), open(7))), LABEL, before)).toBe(false)
+    // An old socket still open is not new.
+    expect(hasNewOpenSocket(stubSocketRecords(records(...old)), LABEL, before)).toBe(false)
+  })
+  test('a partial last line waits for the next read; a malformed record, ticketless open or bad baseline fails', () => {
+    const partial = records(...old, close('stubticket2')) + JSON.stringify(open('stubticket3')).slice(0, 20)
+    expect(hasNewOpenSocket(stubSocketRecords(partial), LABEL, ['stubticket1', 'stubticket2'])).toBe(false)
+    expect(reason(() => stubSocketRecords('{"event":\n'))).toBe('malformed stub record')
+    expect(reason(() => stubSocketRecords('[1]\n'))).toBe('malformed stub record')
+    expect(reason(() => socketTickets(stubSocketRecords(records(open(null))), LABEL))).toBe('stub socket record without a ticket')
+    expect(reason(() => hasNewOpenSocket([], LABEL, [7 as unknown as string]))).toBe('invalid socket baseline')
   })
 })
 
@@ -146,5 +214,17 @@ describe('reconnect-proof and reconnects CLI', () => {
     expect((await cli('reconnects')).err).toEqual(['real-case-assertions: not all MCP reconnect variants typed'])
     write([...earlier, call(at('44:40.000'), RECONNECT), call(at('44:41.000'), RECONNECT), call(TEXT, ITEM)], r37aLog)
     expect((await cli('reconnects')).code).toBe(0)
+  })
+  test('socket-tickets and socket-reopened read the stub record file', async () => {
+    const record = join(home, 'record.jsonl'), row = (r: object) => JSON.stringify(r) + '\n'
+    writeFileSync(record, row({ seq: 1, event: 'ws-open', label: 'mcp', ticket: 'stubticket1' }) + row({ seq: 2, event: 'ws-close', label: 'mcp', ticket: 'stubticket1' }))
+    const tickets = await cli('socket-tickets', record, 'mcp')
+    expect(tickets.out).toEqual(['["stubticket1"]'])
+    expect((await cli('socket-reopened', record, 'mcp', '["stubticket1"]')).err).toEqual(['real-case-assertions: restarted server has no new open Slack socket'])
+    writeFileSync(record, row({ seq: 3, event: 'ws-open', label: 'mcp', ticket: 'stubticket2' }), { flag: 'a' })
+    expect((await cli('socket-reopened', record, 'mcp', '["stubticket1"]')).code).toBe(0)
+    expect((await cli('socket-reopened', record, 'mcp', '["stubticket1","stubticket2"]')).code).not.toBe(0)
+    expect((await cli('socket-reopened', record, 'mcp', 'nope')).err).toEqual(['real-case-assertions: invalid socket baseline'])
+    expect((await cli('socket-reopened', record, '', '[]')).err).toEqual(['real-case-assertions: socket query needs a record file and a label'])
   })
 })

@@ -8,11 +8,11 @@ CASE_ASSERT="${SCENARIO_FIXTURES}/real-case-assertions.ts"
 case_assert() { bun "${CASE_ASSERT}" "$1" "${SLACK_STATE_DIR}" "${REAL_KEY}" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${@:2}"; }
 # start_server returns once the PID file exists; the persona's Slack socket
 # opens after that, and the stub refuses a DM push while the label has no open
-# socket (409 no-open-socket). After a restart, wait for the stub's record of a
-# socket newer than every one opened before the stop, with all of those closed.
-socket_records() { slack_stub_record_count "$1" "label=${REAL_LABEL}"; }
-_socket_reopened() { (( $(socket_records ws-open) > $1 && $(socket_records ws-close) >= $1 )); }
-wait_socket_reopened() { wait_until 60 "restarted server opened no new Slack socket for ${REAL_LABEL}" _socket_reopened "$1"; }
+# socket (409 no-open-socket). After the stop, record every socket ticket the
+# stub has opened for the label; after the restart, wait for a socket opened
+# since with no close record. push() targets the label's newest open socket.
+socket_query() { case_assert "$1" "${SCENARIO_SLACK_RECORD:?}" "${REAL_LABEL}" "${@:2}"; }
+wait_socket_reopened() { wait_until 60 "restarted server opened no new Slack socket for ${REAL_LABEL}" socket_query socket-reopened "$1"; }
 real_prepare
 real_persona mcp
 real_write_config '{"health_check_interval":0}'
@@ -20,8 +20,8 @@ real_start_stub
 start_server --live
 real_wait_launch "${REAL_KEY}"
 # Server start reconnect with a running native bot.
-SOCKETS="$(socket_records ws-open)"
 stop_server
+SOCKETS="$(socket_query socket-tickets)"
 RESTART_MARK="$(date +%s%3N)"
 start_server --live
 wait_socket_reopened "${SOCKETS}"
@@ -54,8 +54,8 @@ RECONNECT_VARIANTS=4
 if [[ "${CASE4}" == 'recorded: native MCP session reconnect '* ]]; then RECONNECT_VARIANTS=3; fi
 # Empty queue with health checks off: AD waiting permits reconnect at restart.
 real_wait_idle "${REAL_KEY}"
-SOCKETS="$(socket_records ws-open)"
 stop_server
+SOCKETS="$(socket_query socket-tickets)"
 MARK="$(date +%s%3N)"
 start_server --live
 wait_socket_reopened "${SOCKETS}"
