@@ -85,19 +85,24 @@ case_assert subagent-proven-gone "${SCENARIO_ROOT}/deny-click.json" "${SCENARIO_
 real_dm "${REAL_LABEL}" 'message after denied subagent request'
 real_wait_delivery "${REAL_KEY}" 6
 case_assert no-stuck
-# The kill must find accepted, undelivered work. A pre-allowed sleep keeps the
-# agent inside one tool call, so message eight is accepted but cannot be taken
-# in before the kill, and no prompt is left for the resumed session to re-ask.
-real_dm "${REAL_LABEL}" 'Run exactly sleep 60 with Bash now.'
-wait_until 180 'recovery sleep never observed active' case_assert active-tool 'sleep 60' "${SCENARIO_ROOT}/recovery-tool.json"
+# The kill must find accepted, durably incomplete work. Setup only: a
+# pre-allowed sleep keeps the agent inside one tool call while message eight
+# is accepted, and leaves no prompt for the resumed session to re-ask. Native
+# Claude blocks a lone foreground sleep of 25 s or more, so GNU sleep sums
+# three 20 s arguments into one 60 s call.
+real_dm "${REAL_LABEL}" 'Run exactly sleep 20 20 20 with Bash now.'
+wait_until 180 'recovery sleep never observed active' case_assert active-tool 'sleep 20 20 20' "${SCENARIO_ROOT}/recovery-tool.json"
 real_dm "${REAL_LABEL}" 'message held across busy recovery'
 wait_until 180 'recovery-held message not accepted' case_assert accepted 8
-# Fresh evidence just before the kill: the sleep still has no result, so
-# message eight cannot have been taken in, and it is still open.
-case_assert active-tool 'sleep 60' "${SCENARIO_ROOT}/recovery-tool-at-kill.json"
+case_assert active-tool 'sleep 20 20 20' "${SCENARIO_ROOT}/recovery-tool-at-kill.json"
 case_assert open 8
 echo 'recorded: busy kill/recovery started'
 real_kill_and_reconcile "${REAL_KEY}"
+# The proof: with the agent killed and the server stopped, nothing can
+# complete message eight, so it was still open across the kill and only the
+# recovery below can deliver it. A completion before the kill fails here.
+case_assert open 8
+echo 'recorded: message eight open after kill, server stopped'
 start_server --live
 real_wait_relaunch "${REAL_KEY}"
 real_wait_delivery "${REAL_KEY}" 8

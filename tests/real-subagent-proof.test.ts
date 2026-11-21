@@ -157,18 +157,18 @@ test('test-101 sends its Deny only after the request\'s recorded second has pass
   expect(text.match(/DENY_TOKEN=/g)).toHaveLength(1)
 })
 
-test('test-101 kills while message eight is accepted and still open inside a pre-allowed sleep, and requires it after recovery', async () => {
+test('test-101 proves message eight still open after the kill with the server stopped, and requires recovery to deliver it', async () => {
   const text = await Bun.file(join(import.meta.dir, 'real-agent/test-101-fmk-real-busy.sh')).text()
   const six = text.indexOf('real_wait_delivery "${REAL_KEY}" 6')
   const at = (needle: string) => { const i = text.indexOf(needle, six); expect(i).toBeGreaterThan(six); return i }
-  const sleep = "case_assert active-tool 'sleep 60' "
+  const sleep = "case_assert active-tool 'sleep 20 20 20' "
   const order = [
     at('case_assert no-stuck'),
-    at("real_dm \"${REAL_LABEL}\" 'Run exactly sleep 60 with Bash now.'"),
+    at("real_dm \"${REAL_LABEL}\" 'Run exactly sleep 20 20 20 with Bash now.'"),
     at(`wait_until 180 'recovery sleep never observed active' ${sleep}"\${SCENARIO_ROOT}/recovery-tool.json"`),
     at("real_dm \"${REAL_LABEL}\" 'message held across busy recovery'"),
     at('case_assert accepted 8'),
-    // Fresh evidence just before the kill: the sleep has no result yet, and eight is open.
+    // Setup snapshot just before the kill: the sleep has no result yet, and eight is open.
     at(`${sleep}"\${SCENARIO_ROOT}/recovery-tool-at-kill.json"`),
     at('case_assert open 8'),
     at('real_kill_and_reconcile "${REAL_KEY}"'),
@@ -177,15 +177,39 @@ test('test-101 kills while message eight is accepted and still open inside a pre
     at('real_wait_delivery "${REAL_KEY}" 8'),
   ]
   expect(order).toEqual([...order].sort((a, b) => a - b))
-  // The pre-kill check runs once, bare (not retried in a wait), right before the kill.
+  // The pre-kill snapshot runs once, bare (not retried in a wait), right before the kill.
   expect(text[order[5]! - 1]).toBe('\n')
-  expect(text.slice(order[5]!, order[7]!).split('\n').filter(line => line && !line.startsWith('#')))
+  const lines = (from: number, to: number) => text.slice(from, to).split('\n').filter(line => line && !line.startsWith('#'))
+  expect(lines(order[5]!, order[7]!))
     .toEqual([`${sleep}"\${SCENARIO_ROOT}/recovery-tool-at-kill.json"`, 'case_assert open 8', "echo 'recorded: busy kill/recovery started'"])
+  // The proof: between the kill (agent killed, server stopped) and the restart,
+  // a bare open check must pass, so a completion before the kill fails the run.
+  expect(lines(order[7]!, order[8]!)).toEqual([
+    'real_kill_and_reconcile "${REAL_KEY}"',
+    'case_assert open 8',
+    "echo 'recorded: message eight open after kill, server stopped'",
+  ])
+  // real_kill_and_reconcile stops the server, so nothing can complete eight before the check.
+  const recovery = await Bun.file(join(import.meta.dir, 'integration/lib/real-recovery.sh')).text()
+  const helper = recovery.slice(recovery.indexOf('real_kill_and_reconcile() {'))
+  expect(helper.indexOf('_real_checked_kill "${instance}" 1')).toBeGreaterThan(0)
+  expect(helper.indexOf('stop_server')).toBeGreaterThan(helper.indexOf('_real_checked_kill "${instance}" 1'))
+  expect(helper.slice(0, helper.indexOf('\n}\n'))).not.toContain('start_server')
+  // The harness self-check proves open fails for an already completed head.
+  const assertions = await Bun.file(join(import.meta.dir, 'integration/fixtures/real-case-assertions.ts')).text()
+  expect(assertions).toContain("expectControl('open rejects a head completed before the check',()=>invokeCompact('open','5'),'expected head is already complete')")
   // Nothing new is sent after the eighth DM: recovery must deliver it itself.
   expect(text.slice(order[3]! + 1, order.at(-1)!)).not.toContain('real_dm')
   // The sleep is pre-allowed, so no prompt is left open for the resumed session.
   expect(text).toContain("real_prepare \"${REAL_AGENT_CLAUDE_VERSION:-2.1.296}\" 'Bash(sleep *)'")
   expect(text).not.toContain('permission-probe again')
+  // Native Claude blocks a lone foreground `sleep N` with N >= 25: every
+  // requested sleep is several arguments or a single one under 25 s.
+  for (const [, args] of text.matchAll(/'Run exactly sleep ([\d ]+) with Bash now\.'/g)) {
+    const seconds = args!.trim().split(/\s+/).map(Number)
+    expect(seconds.length > 1 || seconds[0]! < 25).toBe(true)
+  }
+  expect([...text.matchAll(/'Run exactly sleep ([\d ]+) with Bash now\.'/g)].map(m => m[1])).toEqual(['20', '20 20 20'])
 })
 
 test('test-101 reads the denied request, then the row, before its next DM, and the next DM is delivered without a stuck notice', async () => {

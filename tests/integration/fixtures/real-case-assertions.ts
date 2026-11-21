@@ -987,6 +987,8 @@ try {
     expectControl('raw open head survives stale archive',()=>invokeCompact('open','5'))
     await queue.append('control',{v:1,kind:'delivered',seq:5,part:1,at:42300,receipt:{path:compactTranscript,uuid:'compact-5-0'}})
     captureReceiptJournal(compactDir,'control')
+    // test-101's post-kill check: an item completed before the kill must fail open.
+    expectControl('open rejects a head completed before the check',()=>invokeCompact('open','5'),'expected head is already complete')
     await queue.stop()
     queue=createDeliveryQueue({stateDir:compactDir,now:()=>50000});await queue.start()
     try {

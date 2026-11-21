@@ -1061,7 +1061,7 @@ observer; the shared `real-case-assertions.ts` comparator is unchanged.
 
 | Script | Checks |
 |---|---|
-| `test-101-fmk-real-busy.sh` | Active pre-allowed tool, permission hold, subagent denial proven gone at SubagentStop, and kill/recovery of a message accepted during a running pre-allowed tool |
+| `test-101-fmk-real-busy.sh` | Active pre-allowed tool, permission hold, subagent denial proven gone at SubagentStop, and kill/recovery of a message accepted during a running pre-allowed tool and still open after the kill |
 | `test-102-fmk-real-replies.sh` | DM, mention and thread reply destinations; three fresh-launch first messages |
 | `test-103-fmk-real-latency100.sh` | The 100-DM latency step: reply-tool persona, one unmeasured warm-up DM, AC76 admission before each sample; p95 limits over the last 100 inputs, receipt/FIFO audit over all 101 |
 | `test-104-fmk-real-idle-compact.sh` | Uncertain AD text outcome with three ordered receipt-confirmed queued messages |
@@ -1405,12 +1405,17 @@ still-open subagent probe with its recorded second passed (polled for at most
 subagent probe, `proven_gone_how` `turn_end` with a time, no `unproven_since`,
 and a waiting row with an empty `unproven_requests`. Message six must then be
 delivered with no `delivery-stuck` line. The kill must still find queued work:
-message seven asks for the pre-allowed `sleep 60`, and once `active-tool` sees
-it running, message eight is sent and accepted. Just before the kill,
-`active-tool` runs once more (the sleep still has no result, so message eight
-cannot have been taken in) and item eight must still be open. The
-kill/recovery leg then runs as before, and recovery must deliver message eight
-with no new DM. The hold is a running pre-allowed tool rather than an open
+message seven asks for the pre-allowed `sleep 20 20 20` (one 60 s call; native
+Claude blocks a lone foreground `sleep` of 25 s or more), and once
+`active-tool` sees it running, message eight is sent and accepted. Just before the kill,
+`active-tool` runs once more and item eight must still be open; these are
+setup snapshots. The proof comes after `real_kill_and_reconcile`: with the
+agent killed and the server stopped, nothing can complete item eight, and
+`case_assert open 8` must pass, so a completion before the kill fails the run.
+After the restart and relaunch, recovery must deliver message eight with no
+new DM. The test does not claim message eight was never taken in natively
+before the kill; an item taken in but not durably completed is still
+recovery's work. The hold is a running pre-allowed tool rather than an open
 prompt, because a resumed session re-asks an unanswered prompt and would never
 reach waiting. A Codex
 subagent's request still holds until the bot ends; Test 101 has no Codex
