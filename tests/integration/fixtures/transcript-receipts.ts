@@ -352,8 +352,9 @@ export function receiptProgress(options: AuditOptions, entries: readonly Transcr
  * the send is compared at microsecond precision against the intent and at
  * millisecond precision against the refusal. An attempt with more than one
  * `sent` or `refused` record is ambiguous and excuses nothing; each refused
- * attempt excuses at most one send; any other send stays typed. */
-function refusedTextSends(journal: readonly any[], seq: number, part: number, typed: readonly ShimSend[]): Set<number> {
+ * attempt excuses at most one send; any other send stays typed. `typed` holds
+ * only shim sends of this part's exact text. The Codex recovery gate uses it too. */
+export function refusedTextSends(journal: readonly any[], seq: number, part: number, typed: readonly { at: number }[]): Set<number> {
   const used = new Set<number>()
   const attempts = journal.filter(r => r.kind === 'refused' && r.seq === seq).map(r => r.attempt)
   for (const attempt of new Set(attempts)) {

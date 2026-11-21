@@ -143,4 +143,55 @@ describe('Codex fault recovery evidence', () => {
     f.shim += call(1051, texts[0])
     expect(() => assertCodexRecovery(f.journal, 1, 'no-retype', f.shim, instance)).toThrow()
   })
+
+  /** b.88t: AD refuses item 1's first text send (nothing typed); the not-now
+   * retry (attempt 2) types it once. Production order: durable intent, the
+   * shim's call, then the refusal record. */
+  function refused(callAt = 1001) {
+    const f = sample(), first = f.journal[2] as any
+    const journal = [...f.journal.slice(0, 3), { v: 1, kind: 'refused', seq: 1, attempt: 1, at: 1003 },
+      { ...first, attempt: 2, at: 1050 }, ...f.journal.slice(3)] as any[]
+    return { ...f, journal, shim: call(callAt, texts[0]) + call(1051, texts[0]) + call(2001, texts[1]) }
+  }
+  const noRetype = (journal: any[], shim: string) => () => assertCodexRecovery(journal, 1, 'no-retype', shim, instance)
+  test('no-retype excuses a send AD refused only inside its own attempt window', () => {
+    const f = refused()
+    expect(noRetype(f.journal, f.shim)).not.toThrow()
+    const rejects = (journal: any[], shim = f.shim) => expect(noRetype(journal, shim)).toThrow('exact body was retyped')
+    const rows = f.journal
+    // No refusal, another item's or attempt's refusal.
+    rejects(rows.filter(r => r.kind !== 'refused'))
+    rejects(rows.map(r => r.kind === 'refused' ? { ...r, seq: 2 } : r))
+    rejects(rows.map(r => r.kind === 'refused' ? { ...r, attempt: 3 } : r))
+    // Outside the window: before the intent (one microsecond), or after the refusal's millisecond.
+    rejects(rows, refused(999.999).shim)
+    rejects(rows, refused(1004).shim)
+    rejects(rows.map(r => r.kind === 'refused' ? { ...r, at: 1000 } : r))
+    // An Enter-kind intent cannot excuse a text call.
+    rejects(rows.map(r => r.kind === 'sent' && r.attempt === 1 ? { ...r, send_kind: 'enter' } : r))
+    // One refusal excuses one call: a second call in the window, or an extra later call, stays typed.
+    rejects(rows, call(1001, texts[0]) + call(1002, texts[0]) + call(1051, texts[0]))
+    rejects(rows, f.shim + call(1100, texts[0]))
+    // A repeated intent or refusal for that attempt is ambiguous and excuses nothing.
+    rejects(rows.flatMap(r => r.kind === 'sent' && r.attempt === 1 ? [r, r] : [r]))
+    rejects(rows.flatMap(r => r.kind === 'refused' ? [r, r] : [r]))
+    // Recorded precision: within the refusal's millisecond and at the intent's exact time are inside.
+    expect(noRetype(rows, refused(1003.8).shim)).not.toThrow()
+    expect(noRetype(rows, refused(1000).shim)).not.toThrow()
+    // Every call refused: no typed send is left.
+    rejects(rows, call(1001, texts[0]))
+  })
+  test('Enter recovery after a refused text still needs exactly one typed text', () => {
+    const f = refused()
+    const journal = [...f.journal.slice(0, 5), { ...(f.journal[4] as any), send_kind: 'enter', attempt: 3, at: 1100 }, ...f.journal.slice(5)]
+    const shim = f.shim + call(1101, undefined, 'Enter')
+    expect(() => assertCodexRecovery(journal, 1, 'enter', shim, instance)).not.toThrow()
+    expect(() => assertCodexRecovery(journal.filter(r => r.kind !== 'refused'), 1, 'enter', shim, instance)).toThrow('durable recovery Enter missing')
+  })
+  test('a refused send plus its retry is not a retype', () => {
+    const f = refused(), journal = f.journal.map(r => r.kind === 'sent' && r.attempt === 2 ? { ...r, send_kind: 'retype' } : r)
+    // Only the refused call precedes the retype intent: nothing was lost and retyped.
+    expect(() => assertCodexRecovery(journal, 1, 'retype', f.shim, instance)).toThrow('lost text was not retyped')
+    expect(() => assertCodexRecovery(journal.filter(r => r.kind !== 'refused'), 1, 'retype', f.shim, instance)).not.toThrow()
+  })
 })

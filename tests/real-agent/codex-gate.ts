@@ -1,6 +1,6 @@
 /** Import-safe independent audit of the actual queue, shim and native rollout.
  * Delivery assertions never require assistant prose or turn completion. */
-import { completeShimLog, shimWords } from '../integration/fixtures/transcript-receipts.ts'
+import { completeShimLog, refusedTextSends, shimWords } from '../integration/fixtures/transcript-receipts.ts'
 import type { CodexRollout } from './codex-evidence.ts'
 import { requireEvidence } from './codex-ai.ts'
 
@@ -94,7 +94,16 @@ export function assertCodexRecovery(journal: any[], seq: number, kind: 'retype' 
   const fixed = journal.find(r => r.seq === seq && r.kind === 'fixed')
   const calls = codexShimCalls(shim).filter(c => c.instance === instance)
   requireEvidence(fixed && sends.length, 'recovery item missing')
-  const texts = calls.filter(c => fixed.parts.includes(c.text))
+  const sent = calls.filter(c => fixed.parts.includes(c.text))
+  // b.88t: a text send AD refused typed nothing. As in the receipt audit, a
+  // call is excused only inside its own part's refused text attempt window,
+  // one call per refusal; every count below uses the remaining typed calls.
+  const refused = new Set<number>()
+  fixed.parts.forEach((text: string, index: number) => {
+    const own = sent.flatMap((c, i) => c.text === text ? [i] : [])
+    for (const k of refusedTextSends(journal, seq, index + 1, own.map(i => sent[i]!))) refused.add(own[k]!)
+  })
+  const texts = sent.filter((_, i) => !refused.has(i))
   const delivered = journal.find(r => r.seq === seq && r.kind === 'delivered' && r.part === 1)
   requireEvidence(delivered, 'recovery delivery missing')
   if (kind === 'retype') requireEvidence(sends.some(r => r.send_kind === 'retype') && texts.length >= 2
