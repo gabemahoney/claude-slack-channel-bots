@@ -537,49 +537,120 @@ test('unrelated inaccessible or vanished proc metadata does not fail the placeme
   symlinkSync(join(root, 'vanished-process'), join(p.proc, '71')) // stale entry, metadata already gone
   expect(p.run().verdict).toBe('pass')
 })
-test('tmux, measured server and Slack stub reused identities are missing', () => {
+test.each([['tmux', 20], ['server', 50], ['slack', 12]] as const)('harness reasons: reused %s identity stays missing', (role, pid) => {
   const p = placement()
-  for (const [role, pid] of [['tmux', 20], ['server', 50], ['slack', 12]] as const) {
-    const path = join(root, `harness-${role}`), saved = readFileSync(path, 'utf8')
-    writeFileSync(path, saved.replace(`${pid}\t99`, `${pid}\t98`))
-    expect(p.run().verdict).toBe('missing')
-    writeFileSync(path, saved)
-    expect(p.run().verdict).toBe('pass')
+  const path = join(root, `harness-${role}`), saved = readFileSync(path, 'utf8')
+  writeFileSync(path, saved.replace(`${pid}\t99`, `${pid}\t98`))
+  const bad = p.run()
+  expect(bad.verdict).toBe('missing')
+  expect(bad.stats.placement_reason).toBe(`invalid-identity:${role}`)
+  writeFileSync(path, saved)
+  const good = p.run()
+  expect(good.verdict).toBe('pass')
+  expect(good.stats.placement_reason).toBe('none')
+})
+test.each((['server', 'slack'] as const).flatMap(role =>
+  (['absent', 'unreadable', 'malformed', 'zombie'] as const).map(fault => [role, fault] as const)))
+('harness reasons: %s record with %s stays missing', (role, fault) => {
+  const p = placement(), path = join(root, `harness-${role}`)
+  if (fault === 'absent' || fault === 'unreadable') rmSync(path)
+  if (fault === 'unreadable') mkdirSync(path)
+  if (fault === 'malformed') writeFileSync(path, 'not-an-identity\n')
+  if (fault === 'zombie') {
+    const stat = join(p.proc, role === 'server' ? '50/stat' : '12/stat')
+    writeFileSync(stat, readFileSync(stat, 'utf8').replace(') S ', ') Z '))
   }
+  const row = p.run()
+  expect(row.verdict).toBe('missing')
+  expect(row.stats.placement_reason).toBe(`${fault === 'malformed' ? 'malformed-record'
+    : fault === 'zombie' ? 'invalid-identity' : 'unreadable-record'}:${role}`)
+})
+test('harness reasons: an unreadable tmux socket stays missing', () => {
+  const p = placement()
+  writeFileSync(join(root, 'harness-tmux'), `20\t99\t${join(root, 'tmux/absent')}\n`)
+  const row = p.run()
+  expect(row.verdict).toBe('missing')
+  expect(row.stats.placement_reason).toBe('invalid-record:tmux')
+})
+test('harness reasons: unexpected scan exceptions use a neutral reason', () => {
+  const p = placement()
+  writeFileSync(join(p.state, 'config.json'), '{invalid-json')
+  const row = p.run()
+  expect(row.verdict).toBe('missing')
+  expect(row.stats.placement_reason).toBe('exception:scan')
 })
 
-type ScanBoundary = 'group' | 'cwd' | 'cmdline' | 'identity' | 'tmux-loop' | 'candidate-identity' | 'required-identity'
+type ScanBoundary = 'group' | 'cwd' | 'cmdline' | 'stat' | 'identity' | 'tmux-loop' | 'candidate-identity' | 'required-identity' | 'final-identity'
 type ScanMutation = 'vanished' | 'unreadable' | 'reused' | 'zombie' | 'reused-zombie' | 'reused-exit' | 'wrong-group-exit'
   | 'group-move' | 'reparented' | 'exec-changed' | 'server-parent' | 'caller-move'
   | 'fixture-config-change' | 'fixture-dir-change' | 'fixture-extra-arg'
   | 'tmux-parent'
-// Only copied CLI file reads are instrumented. No sleeps, global fs mocks or
-// collector API changes: the same read boundaries exist in the before fixture.
+  | 'exiting' | 'exiting-vanished' | 'exiting-reused' | 'exiting-reused-zombie' | 'exiting-reused-exit' | 'exiting-live'
+  | 'exiting-late-reuse-exit' | 'exiting-late-reuse-zombie'
+  | 'exiting-budget-repeat'
+// Only copied CLI file reads are instrumented. No global fs mocks or collector
+// API changes: the same read boundaries exist in the before fixture.
 function scanMutation(p: ReturnType<typeof placement>, pid: number, boundary: ScanBoundary,
   mutation: ScanMutation, groupRead = 1, wrongGroup = '/shard/server') {
   const dir = join(p.proc, String(pid)), marker = join(root, 'scan-fired')
   return (source: string) => {
     const imports = 'readFileSync, readlinkSync,'
     expect(source.split(imports)).toHaveLength(2)
+    if (boundary === 'final-identity') {
+      const anchor = '    const fixtureMcps = new Set<string>()'
+      expect(source.split(anchor)).toHaveLength(2)
+      source = source.replace(anchor, `    scanFinal=true;\n${anchor}`)
+    }
     return `import { rmSync as removeProcess, writeFileSync as traceProcess } from 'node:fs';
-let scanGroups=0, scanIdentities=0, scanCommand=false, scanFired=false, scanRemoveAfter='';
+let scanGroups=0, scanIdentities=0, scanCommand=false, scanFired=false, scanFinal=false, scanRemoveAfter='', scanExitStat='', scanExitReads=0;
 function scanRead(path, link=false) {
   path=String(path);
-  const dir=${JSON.stringify(dir)}, boundary=${JSON.stringify(boundary)};
+  const dir=${JSON.stringify(dir)}, boundary=${JSON.stringify(boundary)}, mutation=${JSON.stringify(mutation)};
+  if(scanExitStat && mutation==='exiting-budget-repeat') {
+    if(path===dir+'/stat' && ++scanExitReads===11) traceProcess(dir+'/stat',scanExitStat.replace(') S ',') Z '));
+    if(path===dir+'/cgroup' && scanGroups===1) {
+      traceProcess(dir+'/stat',scanExitStat); scanExitStat='';
+    }
+  }
+  if(scanExitStat && path===dir+'/stat' && mutation.startsWith('exiting-late-reuse')) {
+    const read=++scanExitReads;
+    traceProcess(${JSON.stringify(join(root, 'scan-polled'))},String(read));
+    if(read===1) traceProcess(dir+'/stat',scanExitStat);
+    if(read===2) {
+      let next=scanExitStat.replace(/99\\n$/,'100\\n');
+      if(mutation==='exiting-late-reuse-zombie') next=next.replace(') S ',') Z ');
+      traceProcess(dir+'/stat',next);
+    }
+    if(read===3) { removeProcess(dir,{recursive:true}); scanExitStat=''; }
+  }
+  if(scanExitStat && path===dir+'/stat' && !mutation.startsWith('exiting-late-reuse') && mutation!=='exiting-budget-repeat' && ++scanExitReads===2 && mutation!=='exiting-live') {
+    traceProcess(${JSON.stringify(join(root, 'scan-polled'))},'yes');
+    let next=mutation.includes('reused') ? scanExitStat.replace(/99\\n$/,'100\\n') : scanExitStat;
+    if(mutation==='exiting' || mutation==='exiting-reused-zombie') next=next.replace(') S ',') Z ');
+    traceProcess(dir+'/stat',next); scanExitStat='';
+    if(mutation==='exiting-vanished') removeProcess(dir,{recursive:true});
+    if(mutation==='exiting-reused-exit') scanRemoveAfter=path;
+  }
   if(path===dir+'/cgroup') scanGroups++;
   const fire=!scanFired && (
     (boundary==='group' && path===dir+'/cgroup' && scanGroups===${groupRead}) ||
     (boundary==='tmux-loop' && path===dir+'/cgroup' && scanGroups===1) ||
     (boundary==='cwd' && link && path===dir+'/cwd') ||
     (boundary==='cmdline' && path===dir+'/cmdline') ||
+    (boundary==='stat' && path===dir+'/stat') ||
     (boundary==='identity' && scanCommand && path===dir+'/stat') ||
     (boundary==='candidate-identity' && scanGroups>=3 && path===dir+'/stat') ||
-    (boundary==='required-identity' && scanCommand && path===dir+'/stat' && ++scanIdentities===2));
+    (boundary==='required-identity' && scanCommand && path===dir+'/stat' && ++scanIdentities===2) ||
+    (boundary==='final-identity' && scanFinal && path===dir+'/stat'));
   if(path===dir+'/cmdline') scanCommand=true;
   if(!fire) return;
   scanFired=true; traceProcess(${JSON.stringify(marker)},'yes');
-  const mutation=${JSON.stringify(mutation)};
   if(mutation==='vanished') removeProcess(dir,{recursive:true});
+  else if(mutation.startsWith('exiting')) {
+    scanExitStat=originalReadFileSync(dir+'/stat','utf8');
+    removeProcess(dir+'/cwd'); traceProcess(dir+'/cmdline',''); removeProcess(dir+'/cgroup');
+    if(['stat','identity','candidate-identity'].includes(boundary)) removeProcess(dir+'/stat');
+  }
   else if(mutation==='unreadable') removeProcess(path);
   else if(mutation==='group-move') traceProcess(dir+'/cgroup','0::/shard/server\\n');
   else if(mutation==='exec-changed') traceProcess(dir+'/cmdline','/bin/tool\\0/helper\\0');
@@ -615,6 +686,75 @@ function scanAfter(path,value) {
 const readFileSync=(...args)=>{scanRead(args[0]); return scanAfter(args[0],originalReadFileSync(...args))};
 const readlinkSync=(...args)=>{scanRead(args[0],true); return scanAfter(args[0],originalReadlinkSync(...args))};
 ` + source.replace(imports, 'readFileSync as originalReadFileSync, readlinkSync as originalReadlinkSync,')
+  }
+}
+test.each(([['server', 50], ['slack', 12], ['runner', 10], ['script', 11], ['tmux', 20], ['fixture-client', 70]] as const)
+  .flatMap(([role, pid]) => (['reused', 'zombie'] as const).map(mutation => [role, pid, mutation] as const)))
+('harness reasons: final %s PID %d identity with %s stays missing', (role, pid, mutation) => {
+  const p = placement(); if (pid === 70) fixtureClient(p)
+  expect(p.run().verdict).toBe('pass')
+  const child = placementCLI(p, scanMutation(p, pid, 'final-identity', mutation))()
+  expect(readFileSync(join(root, 'scan-fired'), 'utf8')).toBe('yes')
+  expect(child.error).toBeUndefined(); expect(child.status).toBe(1)
+  expect(child.stdout).toContain('limit=2 verdict=missing')
+  expect(child.stdout).toContain(`placement_reason=${mutation === 'reused' ? 'changed-start' : 'zombie'}:${role}\n`)
+})
+test.each([['unreadable', 'unreadable-stat'], ['fixture-config-change', 'fixture-argv'],
+  ['fixture-dir-change', 'fixture-directory'], ['group-move', 'invalid-placement']] as const)
+('harness reasons: final fixture %s stays missing', (mutation, reason) => {
+  const p = placement(); rmSync(join(p.proc, '40'), { recursive: true }); personaFixtureClient(p)
+  expect(p.run().verdict).toBe('pass')
+  const child = placementCLI(p, scanMutation(p, 70, 'final-identity', mutation))()
+  expect(readFileSync(join(root, 'scan-fired'), 'utf8')).toBe('yes')
+  expect(child.error).toBeUndefined(); expect(child.status).toBe(1)
+  expect(child.stdout).toContain('limit=2 verdict=missing')
+  expect(child.stdout).toContain(`placement_reason=${reason}:fixture-client\n`)
+})
+test('harness reasons: final fixture with an existing tree MCP stays missing', () => {
+  const p = placement(); personaFixtureClient(p)
+  const row = p.run()
+  expect(row.verdict).toBe('missing')
+  expect(row.stats.placement_reason).toBe('incomplete-pair:fixture-client')
+})
+test('harness reasons: final ordinary fixture argv failure stays missing', () => {
+  const p = placement(); fixtureClient(p)
+  expect(p.run().verdict).toBe('pass')
+  const child = placementCLI(p, scanMutation(p, 70, 'final-identity', 'exec-changed'))()
+  expect(readFileSync(join(root, 'scan-fired'), 'utf8')).toBe('yes')
+  expect(child.error).toBeUndefined(); expect(child.status).toBe(1)
+  expect(child.stdout).toContain('limit=2 verdict=missing')
+  expect(child.stdout).toContain('placement_reason=fixture-argv:fixture-client\n')
+})
+// Replace only the copied collector's clock and sleep. Trace calls as well as
+// sleeps so a second validation boundary must share the first PID's deadline.
+function pollClock(source: string) {
+  const start = source.indexOf('export function harnessCpuEvidence('), end = source.indexOf('\nexport ', start + 1)
+  expect(start).toBeGreaterThanOrEqual(0)
+  const collector = source.slice(start, end < 0 ? undefined : end)
+  expect(collector.split('performance.now()')).toHaveLength(4)
+  expect(collector.split('Bun.sleepSync(')).toHaveLength(2)
+  const anchor = '    stats.slack_cgroup = group(slack.pid)'
+  expect(collector.split(anchor)).toHaveLength(2)
+  const instrumented = collector.replaceAll('performance.now()', 'pollNow')
+    .replace('Bun.sleepSync(', 'pollSleep(member, ')
+    .replace('const waitForExit = (', 'const pollForExit = (')
+    .replace(anchor, `    const waitForExit = (...args) => {
+      const started = pollNow, exited = pollForExit(...args);
+      pollCalls.push({ pid: args[0], started, ended: pollNow, exited }); savePollClock();
+      return exited;
+    };
+${anchor}`)
+  return `import { writeFileSync as writePollClock } from 'node:fs';
+let pollNow=0;
+const pollSleeps=[], pollCalls=[];
+function savePollClock() { writePollClock(${JSON.stringify(join(root, 'poll-clock.json'))},JSON.stringify({now:pollNow,sleeps:pollSleeps,calls:pollCalls})); }
+function pollSleep(pid,ms) { pollSleeps.push({pid,ms}); pollNow+=ms; savePollClock(); }
+savePollClock();
+` + source.slice(0, start) + instrumented + (end < 0 ? '' : source.slice(end))
+}
+function readPollClock() {
+  return JSON.parse(readFileSync(join(root, 'poll-clock.json'), 'utf8')) as {
+    now: number; sleeps: { pid: number; ms: number }[]; calls: { pid: number; started: number; ended: number; exited: boolean }[]
   }
 }
 test.each((['identity', 'required-identity'] as const).flatMap(boundary =>
@@ -669,6 +809,149 @@ function scanPlacement(role: 'server child' | 'harness helper', boundary: ScanBo
   expect(p.run().verdict).toBe('pass')
   return { p, groupRead: inTmux ? 2 : 1 }
 }
+const exitingCases = (['server child', 'harness helper'] as const).flatMap(role =>
+  (['cwd', 'cmdline', 'group', 'identity', 'tmux-loop'] as const).flatMap(boundary =>
+    (['exiting', 'exiting-vanished'] as const).map(mutation => [role, boundary, mutation] as const)))
+test.each(exitingCases)('exit race: %s at %s waits for %s', (role, boundary, mutation) => {
+  const { p, groupRead } = scanPlacement(role, boundary)
+  const child = placementCLI(p, scanMutation(p, 60, boundary, mutation, groupRead))()
+  expect(readFileSync(join(root, 'scan-fired'), 'utf8')).toBe('yes')
+  expect(child.error).toBeUndefined()
+  expect({ status: child.status, stdout: child.stdout, stderr: child.stderr }).toMatchObject({ status: 0, stderr: '' })
+  expect(readFileSync(join(root, 'scan-polled'), 'utf8')).toBe('yes')
+  expect(child.stdout).toContain('recorded: sr8 driver-cpu ')
+  expect(child.stdout).toContain('limit=2 verdict=pass')
+  expect(child.stdout).toContain('persona_stubs=2 persona_mcps=2')
+  expect(child.stdout).toContain('placement_reason=none')
+})
+test('exit race: initially unreadable stat waits for the process directory to disappear', () => {
+  const { p } = scanPlacement('harness helper', 'stat')
+  const child = placementCLI(p, scanMutation(p, 60, 'stat', 'exiting-vanished'))()
+  expect(child.error).toBeUndefined(); expect(child.status).toBe(0)
+  expect(readFileSync(join(root, 'scan-polled'), 'utf8')).toBe('yes')
+  expect(child.stdout).toContain('persona_stubs=2 persona_mcps=2')
+  expect(child.stdout).toContain('placement_reason=none')
+})
+test.each(['exiting-late-reuse-exit', 'exiting-late-reuse-zombie'] as const)
+('exit race: initially unreadable stat with %s stays missing beside complete pairs', mutation => {
+  const { p } = scanPlacement('harness helper', 'stat')
+  const child = placementCLI(p, scanMutation(p, 60, 'stat', mutation))()
+  expect(readFileSync(join(root, 'scan-fired'), 'utf8')).toBe('yes')
+  expect(child.error).toBeUndefined()
+  expect({ status: child.status, stdout: child.stdout, stderr: child.stderr }).toMatchObject({ status: 1, stderr: '' })
+  expect(readFileSync(join(root, 'scan-polled'), 'utf8')).toBe('2')
+  expect(child.stdout).toContain('limit=2 verdict=missing')
+  expect(child.stdout).toContain('placement_reason=unreadable-stat:process-candidate')
+})
+test.each((['server child', 'harness helper'] as const).flatMap(role =>
+  (['exiting-reused', 'exiting-reused-zombie', 'exiting-reused-exit'] as const).map(mutation => [role, mutation] as const)))
+('exit race: %s with %s during polling stays missing', (role, mutation) => {
+  const { p, groupRead } = scanPlacement(role, 'cwd')
+  const child = placementCLI(p, scanMutation(p, 60, 'cwd', mutation, groupRead))()
+  expect(readFileSync(join(root, 'scan-polled'), 'utf8')).toBe('yes')
+  expect(child.error).toBeUndefined(); expect(child.status).toBe(1)
+  expect(child.stdout).toContain('limit=2 verdict=missing')
+  expect(child.stdout).toMatch(/placement_reason=(?!none\b)\S+/)
+})
+test.each([['persona stub', 30], ['persona MCP', 40]] as const)
+('exit race: the only %s exiting during collection stays missing', (_role, pid) => {
+  const p = placement(), child = placementCLI(p, scanMutation(p, pid, 'cwd', 'exiting'))()
+  expect(readFileSync(join(root, 'scan-polled'), 'utf8')).toBe('yes')
+  expect(child.error).toBeUndefined(); expect(child.status).toBe(1)
+  expect(child.stdout).toContain('limit=2 verdict=missing')
+  expect(child.stdout).toContain('placement_reason=incomplete-pair:persona')
+})
+test.each(['claude', 'stub-mcp-session.ts'] as const)
+('exit race: final %s candidate can exit when another complete pair remains', entry => {
+  const p = duplicatePlacement(entry)
+  const child = placementCLI(p, scanMutation(p, 60, 'group', 'exiting', 3))()
+  expect(readFileSync(join(root, 'scan-polled'), 'utf8')).toBe('yes')
+  expect(child.error).toBeUndefined(); expect(child.status).toBe(0)
+  expect(child.stdout).toContain('persona_stubs=2 persona_mcps=2')
+  expect(child.stdout).toContain('placement_reason=none')
+})
+test.each([['server', 50, 'unreadable-fields:server'], ['Slack', 12, 'unreadable-fields:slack'],
+  ['tmux', 20, 'unreadable-fields:tmux'], ['runner', 10, 'unreadable-fields:runner'],
+  ['script', 11, 'unreadable-fields:script'], ['fixture client', 70, 'invalid-placement:fixture-client']] as const)
+('exit race: required %s keeps its immediate unreadability failure', (_role, pid, reason) => {
+  const p = placement(); if (pid === 70) fixtureClient(p)
+  const mutate = scanMutation(p, pid, 'cwd', 'exiting')
+  const child = placementCLI(p, source => pollClock(mutate(source)))()
+  expect(readFileSync(join(root, 'scan-fired'), 'utf8')).toBe('yes')
+  expect(existsSync(join(root, 'scan-polled'))).toBe(false)
+  expect(child.error).toBeUndefined(); expect(child.status).toBe(1)
+  expect(child.stdout).toContain('limit=2 verdict=missing')
+  expect(child.stdout).toContain(`placement_reason=${reason}\n`)
+  expect(readPollClock()).toMatchObject({ now: 0, sleeps: [] })
+})
+test('exit race: a live unreadable helper polls once within the time bound and stays missing', () => {
+  const { p } = scanPlacement('harness helper', 'cwd')
+  const mutate = scanMutation(p, 60, 'cwd', 'exiting-live')
+  const child = placementCLI(p, source => pollClock(mutate(source)))()
+  expect(readFileSync(join(root, 'scan-fired'), 'utf8')).toBe('yes')
+  expect(child.error).toBeUndefined(); expect(child.status).toBe(1)
+  expect(child.stdout).toContain('placement_reason=unreadable-fields:tmux-tree')
+  expect(child.stdout).toContain('limit=2 verdict=missing')
+  expect(readPollClock()).toEqual({ now: 200, sleeps: Array.from({ length: 20 }, () => ({ pid: 60, ms: 10 })),
+    calls: [{ pid: 60, started: 0, ended: 200, exited: false }] })
+})
+test('exit race: healthy members take zero poll sleeps', () => {
+  const p = placement(); fixtureClient(p)
+  const child = placementCLI(p, pollClock)()
+  expect(child.error).toBeUndefined(); expect(child.status).toBe(0)
+  expect(child.stdout).toContain('limit=2 verdict=pass')
+  expect(child.stdout).toContain('persona_stubs=2 persona_mcps=2')
+  expect(child.stdout).toContain('placement_reason=none')
+  expect(readPollClock()).toEqual({ now: 0, sleeps: [], calls: [] })
+})
+test.each([['helper', 'unreadable-fields:process-candidate'], ['claude', 'invalid-placement:persona-candidate'],
+  ['stub-mcp-session.ts', 'invalid-placement:persona-candidate']] as const)
+('exit race: an unclassified %s has an accurate fallback role', (entry, reason) => {
+  const p = placement(); p.put(60, 1, '/shard/harness', entry)
+  rmSync(join(p.proc, '60/cwd'))
+  const child = placementCLI(p, pollClock)()
+  expect(child.error).toBeUndefined(); expect(child.status).toBe(1)
+  expect(child.stdout).toContain('limit=2 verdict=missing')
+  expect(child.stdout).toContain(`placement_reason=${reason}\n`)
+})
+test('exit race: distinct PIDs each receive their own 200 ms budget', () => {
+  const p = placement()
+  for (const pid of [60, 61]) p.put(pid, 50, '/shard/server', 'helper')
+  expect(p.run().verdict).toBe('pass')
+  // Both entries become unreadable on their own cwd read. At the last poll
+  // stat read, each exits; the second must get a fresh full budget.
+  const mutate = (source: string) => {
+    for (const pid of [60, 61]) {
+      const dir = join(p.proc, String(pid))
+      source = source.replace('  path=String(path);', `  path=String(path);
+  if(path===${JSON.stringify(dir + '/cwd')}) removeProcess(path,{force:true});
+  if(path===${JSON.stringify(dir + '/stat')} && pollSleeps.filter(s=>s.pid===${pid}).length===20) removeProcess(${JSON.stringify(dir)},{recursive:true,force:true});`)
+    }
+    return source
+  }
+  const reads = scanMutation(p, 999, 'cwd', 'exiting-live')
+  const child = placementCLI(p, source => pollClock(mutate(reads(source))))()
+  expect(child.error).toBeUndefined(); expect(child.status).toBe(0)
+  expect(child.stdout).toContain('limit=2 verdict=pass')
+  expect(child.stdout).toContain('persona_stubs=2 persona_mcps=2')
+  expect(child.stdout).toContain('placement_reason=none')
+  const clock = readPollClock(), order = clock.calls.map(call => call.pid)
+  expect([...order].sort((a, b) => a - b)).toEqual([60, 61])
+  expect(clock).toEqual({ now: 400,
+    sleeps: order.flatMap(pid => Array.from({ length: 20 }, () => ({ pid, ms: 10 }))),
+    calls: order.map((pid, index) => ({ pid, started: index * 200, ended: (index + 1) * 200, exited: true })) })
+})
+test('exit race: repeated boundaries reuse the same PID budget', () => {
+  const { p } = scanPlacement('harness helper', 'tmux-loop')
+  const mutate = scanMutation(p, 60, 'tmux-loop', 'exiting-budget-repeat')
+  const child = placementCLI(p, source => pollClock(mutate(source)))()
+  expect(readFileSync(join(root, 'scan-fired'), 'utf8')).toBe('yes')
+  expect(child.error).toBeUndefined(); expect(child.status).toBe(1)
+  expect(child.stdout).toContain('limit=2 verdict=missing')
+  expect(child.stdout).toContain('placement_reason=unreadable-fields:tmux-tree')
+  expect(readPollClock()).toEqual({ now: 200, sleeps: Array.from({ length: 20 }, () => ({ pid: 60, ms: 10 })),
+    calls: [{ pid: 60, started: 0, ended: 100, exited: true }, { pid: 60, started: 100, ended: 200, exited: false }] })
+})
 test.each(scanCases)('round18 disappearance: %s exits at %s read', (role, boundary) => {
   const { p, groupRead } = scanPlacement(role, boundary)
   const child = placementCLI(p, scanMutation(p, 60, boundary, 'vanished', groupRead))()

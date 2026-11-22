@@ -2413,70 +2413,109 @@ export function guardedCgroups(server: string | undefined, drivers: (string | un
 export function harnessCpuEvidence(root: string | undefined, state: string | undefined, record: string, expected: number,
   read: CgroupRead, proc = HARNESS_PROC_ROOT, serverPid?: number): Result {
   const stats: Result['stats'] = { harness_cgroup: '/shard/harness', harness_cpus: 'unknown', runner_cgroup: 'unknown', script_cgroup: 'unknown',
-    tmux_cgroup: 'unknown', persona_stubs: 0, persona_mcps: 0, harness_members: 0, slack_cgroup: 'unknown', server_members: 0, persona_fixture_mcps: 0 }
-  const answer = (good: boolean) => result('harness-cpu', Number(stats.harness_members), stats, SR8_SERVER_CPUS, good ? 'pass' : 'missing')
+    tmux_cgroup: 'unknown', persona_stubs: 0, persona_mcps: 0, harness_members: 0, slack_cgroup: 'unknown', server_members: 0, persona_fixture_mcps: 0,
+    placement_reason: 'none' }
+  const answer = (good: boolean, reason: string) => {
+    stats.placement_reason = good ? 'none' : reason
+    return result('harness-cpu', Number(stats.harness_members), stats, SR8_SERVER_CPUS, good ? 'pass' : 'missing')
+  }
   try {
     const cpus = cgroupChain('/shard/harness').map(path => cpuMaxCpus(read(path, 'cpu.max')))
-    if (cpus.some(n => n === undefined)) return answer(false)
+    if (cpus.some(n => n === undefined)) return answer(false, 'unreadable-quota:harness')
     const quota = Math.min(...cpus as number[]); stats.harness_cpus = Number.isFinite(quota) ? quota : 'max'
-    if (quota !== 1 || !root || !state || !Number.isSafeInteger(serverPid)) return answer(false)
+    if (quota !== 1) return answer(false, 'wrong-quota:harness')
+    if (!root || !state || !Number.isSafeInteger(serverPid)) return answer(false, 'missing-input:identity')
     const group = (pid: number) => cgroupPathOf(textFile(join(proc, String(pid), 'cgroup')))
     const info = (pid: number) => {
       const raw = textFile(join(proc, String(pid), 'stat')), fields = raw?.slice(raw.lastIndexOf(') ') + 2).trim().split(/\s+/)
       return fields && /^[A-Za-z]$/.test(fields[0]) && /^[0-9]+$/.test(fields[1]) && /^[0-9]+$/.test(fields[19])
         ? { parent: Number(fields[1]), start: fields[19], zombie: fields[0] === 'Z' } : undefined
     }
-    const recorded = (role: string, wanted?: number) => {
-      const row = textFile(join(root, `harness-${role}`))?.trim().split('\t')
-      if (!row || row.length !== 2 || !/^[1-9][0-9]*$/.test(row[0]) || !/^[0-9]+$/.test(row[1])) throw new Error('identity')
+    type RequiredRole = 'server' | 'slack' | 'runner' | 'script' | 'tmux' | 'fixture-client'
+    type RecordFailure = `${'unreadable-record' | 'malformed-record' | 'invalid-identity'}:${'server' | 'slack'}`
+    const recorded = (role: 'server' | 'slack', wanted?: number): { pid: number; start: string } | { reason: RecordFailure } => {
+      const raw = textFile(join(root, `harness-${role}`))
+      if (raw === undefined) return { reason: `unreadable-record:${role}` }
+      const row = raw.trim().split('\t')
+      if (row.length !== 2 || !/^[1-9][0-9]*$/.test(row[0]) || !/^[0-9]+$/.test(row[1])) return { reason: `malformed-record:${role}` }
       const pid = Number(row[0]), current = info(pid)
-      if ((wanted !== undefined && pid !== wanted) || !current || current.zombie || current.start !== row[1]) throw new Error('identity')
+      if ((wanted !== undefined && pid !== wanted) || !current || current.zombie || current.start !== row[1]) return { reason: `invalid-identity:${role}` }
       return { pid, start: row[1] }
     }
-    const server = recorded('server', serverPid), slack = recorded('slack')
+    const server = recorded('server', serverPid)
+    if ('reason' in server) return answer(false, server.reason)
+    const slack = recorded('slack')
+    if ('reason' in slack) return answer(false, slack.reason)
     const required = new Map([[server.pid, server.start], [slack.pid, slack.start]])
+    const roles = new Map<number, RequiredRole>([[server.pid, 'server'], [slack.pid, 'slack']])
     // An exit cannot erase an observed placement/identity contradiction.
     // A zombie proves this helper exited only with the same start identity.
     const vanished = (member: number, current?: ReturnType<typeof info>, start?: string) => !required.has(member)
       && !(current && start !== undefined && current.start !== start)
       && (!existsSync(join(proc, String(member))) || (current?.zombie === true && current.start === start))
+    // Exiting tasks can retain a live stat after their other proc fields go.
+    // Give each optional PID at most 200 ms to prove the same exit as above.
+    const exitDeadlines = new Map<number, number>()
+    const waitForExit = (member: number, current?: ReturnType<typeof info>, start?: string) => {
+      start ??= current?.start
+      if (vanished(member, current, start)) return true
+      if (required.has(member) || (current && start !== undefined && current.start !== start)) return false
+      const deadline = exitDeadlines.get(member) ?? performance.now() + 200
+      exitDeadlines.set(member, deadline)
+      for (let remaining = deadline - performance.now(); remaining > 0; remaining = deadline - performance.now()) {
+        Bun.sleepSync(Math.min(10, remaining))
+        current = info(member)
+        if (current && start !== undefined && current.start !== start) return false
+        start ??= current?.start
+        if (vanished(member, current, start)) return true
+      }
+      return false
+    }
     stats.slack_cgroup = group(slack.pid) ?? 'unknown'
-    if (group(server.pid) !== '/shard/server' || stats.slack_cgroup !== '/shard/harness') return answer(false)
+    if (group(server.pid) !== '/shard/server') return answer(false, 'wrong-group:server')
+    if (stats.slack_cgroup !== '/shard/harness') return answer(false, 'wrong-group:slack')
     const callers = textFile(`${record}.harness`), callerPids = new Set<number>()
-    if (!callers?.endsWith('\n')) return answer(false)
+    if (!callers?.endsWith('\n')) return answer(false, 'unreadable-record:caller')
     for (const line of callers.trimEnd().split('\n')) {
-      if (!/^[1-9][0-9]* [1-9][0-9]*$/.test(line)) return answer(false)
+      if (!/^[1-9][0-9]* [1-9][0-9]*$/.test(line)) return answer(false, 'malformed-record:caller')
       const [runner, script] = line.split(' ').map(Number)
       stats.runner_cgroup = group(runner) ?? 'unknown'; stats.script_cgroup = group(script) ?? 'unknown'
-      if (stats.runner_cgroup !== '/shard/harness' || stats.script_cgroup !== '/shard/harness') return answer(false)
+      if (stats.runner_cgroup !== '/shard/harness') return answer(false, 'wrong-group:runner')
+      if (stats.script_cgroup !== '/shard/harness') return answer(false, 'wrong-group:script')
       for (const member of [runner, script]) {
         const current = info(member)
-        if (!current || current.zombie) return answer(false)
+        if (!current || current.zombie) return answer(false, `invalid-identity:${member === runner ? 'runner' : 'script'}`)
         required.set(member, current.start)
+        roles.set(member, member === runner ? 'runner' : 'script')
         callerPids.add(member)
       }
     }
     const clients = new Map<number, string>(), clientFile = join(root, 'harness-clients')
     if (existsSync(clientFile)) {
       const rows = textFile(clientFile)
-      if (rows === undefined || (rows !== '' && !rows.endsWith('\n'))) return answer(false)
+      if (rows === undefined || (rows !== '' && !rows.endsWith('\n'))) return answer(false, 'unreadable-record:fixture-client')
       for (const line of rows === '' ? [] : rows.slice(0, -1).split('\n')) {
         const row = line.match(/^([1-9][0-9]*)\t([0-9]+)$/)
-        if (!row) return answer(false)
+        if (!row) return answer(false, 'malformed-record:fixture-client')
         const member = Number(row[1]), current = info(member)
         if (!Number.isSafeInteger(member) || clients.has(member) || required.has(member)
-          || !current || current.zombie || current.start !== row[2]) return answer(false)
+          || !current || current.zombie || current.start !== row[2]) return answer(false, 'invalid-identity:fixture-client')
         clients.set(member, row[2]); required.set(member, row[2])
+        roles.set(member, 'fixture-client')
       }
     }
     const identity = textFile(join(root, 'harness-tmux'))?.trim().split('\t')
     if (!identity || identity.length !== 3 || !/^[1-9][0-9]*$/.test(identity[0]) || !/^[0-9]+$/.test(identity[1])
-      || !identity[2].startsWith(join(root, 'tmux') + '/') || !statSync(identity[2]).isSocket()) return answer(false)
+      || !identity[2].startsWith(join(root, 'tmux') + '/')) return answer(false, 'invalid-record:tmux')
+    try {
+      if (!statSync(identity[2]).isSocket()) return answer(false, 'invalid-record:tmux')
+    } catch { return answer(false, 'invalid-record:tmux') }
     const config = JSON.parse(readFileSync(join(state, 'config.json'), 'utf8'))
     const dirs: string[] = config.personas.map((persona: { working_directory: string }) => persona.working_directory)
-    if (dirs.length !== expected || new Set(dirs).size !== expected) return answer(false)
+    if (dirs.length !== expected || new Set(dirs).size !== expected) return answer(false, 'invalid-directories:persona')
     const pid = Number(identity[0]), processes = new Map<number, NonNullable<ReturnType<typeof info>>>()
     required.set(pid, identity[1])
+    roles.set(pid, 'tmux')
     for (const name of readdirSync(proc).filter(name => /^[1-9][0-9]*$/.test(name))) {
       const member = Number(name), current = info(member)
       if (current?.zombie) continue
@@ -2484,11 +2523,12 @@ export function harnessCpuEvidence(root: string | undefined, state: string | und
       else {
         // Without stat we cannot prove this live PID is outside the trees.
         // A stale entry whose process has actually vanished is harmless.
-        if (!vanished(member)) return answer(false)
+        if (!waitForExit(member)) return answer(false, `unreadable-stat:${roles.get(member) ?? 'process-candidate'}`)
       }
     }
     stats.tmux_cgroup = group(pid) ?? 'unknown'
-    if (processes.get(pid)?.start !== identity[1] || stats.tmux_cgroup !== '/shard/harness') return answer(false)
+    if (processes.get(pid)?.start !== identity[1]) return answer(false, 'invalid-identity:tmux')
+    if (stats.tmux_cgroup !== '/shard/harness') return answer(false, 'wrong-group:tmux')
     const tree = (parent: number) => {
       const members = new Set([parent])
       for (let size = -1; size !== members.size;) {
@@ -2498,34 +2538,37 @@ export function harnessCpuEvidence(root: string | undefined, state: string | und
       return members
     }
     const descendants = tree(pid), serverTree = tree(server.pid)
+    const roleFor = (member: number, entry = '') => roles.get(member) ?? (descendants.has(member) ? 'tmux-tree'
+      : serverTree.has(member) ? 'server-tree' : ['claude', 'stub-mcp-session.ts'].includes(entry) ? 'persona-candidate' : 'process-candidate')
     const callerTree = new Set([...callerPids].flatMap(caller => [...tree(caller)].filter(member => member !== caller)))
     for (const [member, start] of clients) {
       if (processes.get(member)?.start !== start || !callerTree.has(member) || serverTree.has(member)
-        || group(member) !== '/shard/harness') return answer(false)
+        || group(member) !== '/shard/harness') return answer(false, 'invalid-placement:fixture-client')
     }
     // The exception must remain true at each later validation boundary.
     // Walk fresh ancestry all the way to PID 1/0, so a caller below the
     // measured server cannot authorize its descendants. No snapshot tree
     // grants authority after reparenting, exec or a cgroup move.
-    const validClient = (member: number, current: ReturnType<typeof info>, outsideTmux = false) => {
+    type ClientFailure = 'invalid-placement' | 'fixture-argv'
+    const validClient = (member: number, current: ReturnType<typeof info>, outsideTmux = false): true | ClientFailure => {
       const start = clients.get(member)
       if (start === undefined || !current || current.zombie || current.start !== start
-        || group(member) !== '/shard/harness'
-        || basename(textFile(join(proc, String(member), 'cmdline'))?.split('\0')[1] ?? '') !== 'stub-mcp-session.ts') return false
+        || group(member) !== '/shard/harness') return 'invalid-placement'
+      if (basename(textFile(join(proc, String(member), 'cmdline'))?.split('\0')[1] ?? '') !== 'stub-mcp-session.ts') return 'fixture-argv'
       const seen = new Set<number>()
       let ancestor = member, node: ReturnType<typeof info> = current, caller = false
       while (!seen.has(ancestor)) {
-        if (ancestor === server.pid || (outsideTmux && ancestor === pid) || !node || node.zombie) return false
+        if (ancestor === server.pid || (outsideTmux && ancestor === pid) || !node || node.zombie) return 'invalid-placement'
         const before = processes.get(ancestor)
-        if (before && node.start !== before.start) return false
+        if (before && node.start !== before.start) return 'invalid-placement'
         if (callerPids.has(ancestor)) {
-          if (node.start !== required.get(ancestor) || group(ancestor) !== '/shard/harness') return false
+          if (node.start !== required.get(ancestor) || group(ancestor) !== '/shard/harness') return 'invalid-placement'
           caller = true
         }
-        if (node.parent === 0 || (node.parent === 1 && !callerPids.has(1))) return caller && node.parent !== server.pid
+        if (node.parent === 0 || (node.parent === 1 && !callerPids.has(1))) return caller && node.parent !== server.pid ? true : 'invalid-placement'
         seen.add(ancestor); ancestor = node.parent; node = info(ancestor)
       }
-      return false
+      return 'invalid-placement'
     }
     // SCENARIO_HOME and SCENARIO_BIN are fixed children of SCENARIO_ROOT.
     // Compare all argv after the interpreter, preserving config's directory
@@ -2543,41 +2586,51 @@ export function harnessCpuEvidence(root: string | undefined, state: string | und
     for (const member of descendants) {
       const g = group(member), current = info(member)
       const start = processes.get(member)?.start
-      if ((g !== undefined && g !== '/shard/harness') || (current && current.start !== start)) return answer(false)
+      const role = roleFor(member)
+      if (g !== undefined && g !== '/shard/harness') return answer(false, `wrong-group:${role}`)
+      if (current && current.start !== start) return answer(false, `changed-start:${role}`)
       if (vanished(member, current, start)) continue
-      if (g === undefined || !current || current.zombie) return answer(false)
+      if (g === undefined || !current || current.zombie) {
+        if (waitForExit(member, current, start)) continue
+        return answer(false, `unreadable-fields:${role}`)
+      }
     }
     // Also reject a server-born duplicate outside the recorded tmux tree;
     // an old correctly placed worker must not hide a misplaced new launch.
     for (const [member, before] of processes) {
       const g = group(member), owned = g === '/shard/server' || g === '/shard/harness' || serverTree.has(member) || descendants.has(member)
+      let role = roleFor(member)
       if (g !== undefined && ((descendants.has(member) && g !== '/shard/harness')
-        || (serverTree.has(member) && !descendants.has(member) && g !== '/shard/server'))) return answer(false)
+        || (serverTree.has(member) && !descendants.has(member) && g !== '/shard/server'))) return answer(false, `wrong-group:${role}`)
       if (vanished(member)) continue
       let cwd: string | undefined
       try { cwd = readlinkSync(join(proc, String(member), 'cwd')) } catch { /* classify using group/tree */ }
       if (vanished(member)) continue
       const raw = textFile(join(proc, String(member), 'cmdline')), entry = basename(raw?.split('\0')[1] ?? '')
+      role = roleFor(member, entry)
       const fixtureClient = clients.has(member)
-      if (fixtureClient && (entry !== 'stub-mcp-session.ts' || g !== '/shard/harness')) return answer(false)
+      if (fixtureClient && (entry !== 'stub-mcp-session.ts' || g !== '/shard/harness')) return answer(false, 'invalid-placement:fixture-client')
       if (['claude', 'stub-mcp-session.ts'].includes(entry)
         && !fixtureClient
-        && ((cwd !== undefined && !dirs.includes(cwd)) || !descendants.has(member) || (g !== undefined && g !== '/shard/harness'))) return answer(false)
+        && ((cwd !== undefined && !dirs.includes(cwd)) || !descendants.has(member) || (g !== undefined && g !== '/shard/harness'))) return answer(false, `invalid-placement:${role}`)
       if (vanished(member)) continue
       const relevant = owned || g === undefined || dirs.includes(cwd ?? '') || ['claude', 'stub-mcp-session.ts'].includes(entry)
       if (!relevant) continue
       const after = info(member)
-      if (after && after.start !== before.start) return answer(false)
+      if (after && after.start !== before.start) return answer(false, `changed-start:${role}`)
       if (vanished(member, after, before.start)) continue
-      if (cwd === undefined || !raw || !g || !after || after.zombie) return answer(false)
+      if (cwd === undefined || !raw || !g || !after || after.zombie) {
+        if (waitForExit(member, after, before.start)) continue
+        return answer(false, `unreadable-fields:${role}`)
+      }
       const directory = fixtureClient ? fixtureDirectory(member) : undefined
-      if (fixtureClient && !validClient(member, after, directory !== undefined)) return answer(false)
+      if (fixtureClient && validClient(member, after, directory !== undefined) !== true) return answer(false, 'invalid-identity:fixture-client')
       if (descendants.has(member) || fixtureClient) {
-        if (g !== '/shard/harness') return answer(false)
+        if (g !== '/shard/harness') return answer(false, `wrong-group:${role}`)
         stats.harness_members = Number(stats.harness_members) + 1
       }
       if (serverTree.has(member) && !descendants.has(member)) {
-        if (g !== '/shard/server') return answer(false)
+        if (g !== '/shard/server') return answer(false, 'wrong-group:server-tree')
         stats.server_members = Number(stats.server_members) + 1
       }
       if (fixtureClient) {
@@ -2585,8 +2638,8 @@ export function harnessCpuEvidence(root: string | undefined, state: string | und
         continue
       }
       if (!['claude', 'stub-mcp-session.ts'].includes(entry)) continue
-      if (!dirs.includes(cwd)) return answer(false)
-      if (!descendants.has(member) || g !== '/shard/harness') return answer(false)
+      if (!dirs.includes(cwd)) return answer(false, 'wrong-directory:persona-candidate')
+      if (!descendants.has(member) || g !== '/shard/harness') return answer(false, 'invalid-placement:persona-candidate')
       candidates.set(member, { cwd, entry, start: after.start })
     }
     // A vanished optional helper is harmless, but losing the only stub/MCP
@@ -2594,31 +2647,42 @@ export function harnessCpuEvidence(root: string | undefined, state: string | und
     // cannot be hidden by another valid pair either.
     for (const [member, candidate] of candidates) {
       const g = group(member), current = info(member)
-      if ((g !== undefined && g !== '/shard/harness') || (current && current.start !== candidate.start)) return answer(false)
+      if (g !== undefined && g !== '/shard/harness') return answer(false, 'wrong-group:persona-candidate')
+      if (current && current.start !== candidate.start) return answer(false, 'changed-start:persona-candidate')
       if (vanished(member, current, candidate.start)) continue
-      if (!current || current.zombie || g === undefined) return answer(false)
+      if (!current || current.zombie || g === undefined) {
+        if (waitForExit(member, current, candidate.start)) continue
+        return answer(false, 'unreadable-fields:persona-candidate')
+      }
       ;(candidate.entry === 'claude' ? stubs : mcps).add(candidate.cwd)
     }
     stats.persona_stubs = stubs.size; stats.persona_mcps = mcps.size
     // Recheck every required identity and listed-client invariant before
     // combining the disjoint tree/fixture evidence for each configured dir.
     const fixtureMcps = new Set<string>()
+    type FinalBranch = 'unreadable-stat' | 'changed-start' | 'zombie' | 'fixture-argv' | 'fixture-directory' | 'invalid-placement' | 'incomplete-pair'
+    let failure: `${FinalBranch}:${RequiredRole}` | undefined
     const valid = [...required].every(([member, start]) => {
+      const reject = (branch: FinalBranch) => { failure = `${branch}:${roles.get(member)!}`; return false }
       const current = info(member)
-      if (current?.start !== start || current.zombie) return false
+      if (!current) return reject('unreadable-stat')
+      if (current.start !== start) return reject('changed-start')
+      if (current.zombie) return reject('zombie')
       if (!clients.has(member)) return true
       const directory = fixtureDirectory(member)
-      if (directory !== fixtureCandidates.get(member)) return false
-      if (!validClient(member, current, directory !== undefined)) return false
+      if (directory !== fixtureCandidates.get(member)) return reject(directory === undefined ? 'fixture-argv' : 'fixture-directory')
+      const placement = validClient(member, current, directory !== undefined)
+      if (placement !== true) return reject(placement)
       if (directory !== undefined) {
-        if (!stubs.has(directory) || mcps.has(directory) || fixtureMcps.has(directory)) return false
+        if (!stubs.has(directory) || mcps.has(directory) || fixtureMcps.has(directory)) return reject('incomplete-pair')
         fixtureMcps.add(directory)
       }
       return true
     })
     stats.persona_fixture_mcps = fixtureMcps.size
-    return answer(valid && stubs.size === expected && dirs.every(directory => mcps.has(directory) !== fixtureMcps.has(directory)))
-  } catch { return answer(false) }
+    return answer(valid && stubs.size === expected && dirs.every(directory => mcps.has(directory) !== fixtureMcps.has(directory)),
+      failure ?? 'incomplete-pair:persona')
+  } catch { return answer(false, 'exception:scan') }
 }
 
 /** The cgroup's cpu.stat counters: v2 usage/user/system microseconds, and the
