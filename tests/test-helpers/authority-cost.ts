@@ -282,12 +282,19 @@ export interface AuthorityWork {
  * Parsing bytes are diagnostic only: whole-file output growth is permitted.
  * Snapshot counts include the real snapshot return's retained records. */
 export async function countAuthorityWork(rig: AuthorityCostRig, op: AuthorityOperation) {
+  return countAuthorityCallback(rig, () => rig.operation(op))
+}
+/** Same observation window for a deferred real scanner continuation. */
+export async function countAuthorityCallback<T>(rig: AuthorityCostRig, operation: () => Promise<T>, observe?: {
+  parsed(value: unknown): void; serialized(value: unknown): void; visited(value: unknown): void
+}) {
   const work: AuthorityWork = { parsedAttemptRecords: 0, parsedBytes: 0, parseCalls: 0, serializedAttemptRecords: 0,
     clonedAttemptRecords: 0, wholeStateClones: 0,
     attemptKeyVisits: 0, snapshotCalls: 0, snapshotAttemptRecords: 0 }
   const parse = JSON.parse, stringify = JSON.stringify, keys = Object.keys, snapshot = rig.authority.snapshot, clone = structuredClone
   const parsing = spyOn(JSON, 'parse').mockImplementation((text, reviver) => {
     const result = parse(text, reviver)
+    observe?.parsed(result)
     work.parseCalls++; work.parsedBytes += Buffer.byteLength(text)
     work.parsedAttemptRecords += keys(result?.outcomes?.botAttempts ?? {}).length
     return result
@@ -298,7 +305,9 @@ export async function countAuthorityWork(rig: AuthorityCostRig, op: AuthorityOpe
     return result
   })
   const serializing = spyOn(JSON, 'stringify').mockImplementation((value, replacer, space) => {
+    observe?.serialized(value)
     const visit = (value: unknown) => {
+      observe?.visited(value)
       if (value && typeof value === 'object' && Object.hasOwn(value, 'identifierHash') && Object.hasOwn(value, 'startedOrder')) work.serializedAttemptRecords++
     }
     if (Array.isArray(replacer)) return stringify(value, replacer, space)
@@ -322,7 +331,7 @@ export async function countAuthorityWork(rig: AuthorityCostRig, op: AuthorityOpe
     }
     return clone(value, options)
   })
-  try { return { work, result: await rig.operation(op) } }
+  try { return { work, result: await operation() } }
   finally { cloning.mockRestore(); snapshots.mockRestore(); serializing.mockRestore(); keying.mockRestore(); parsing.mockRestore() }
 }
 

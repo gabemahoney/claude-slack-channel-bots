@@ -4,7 +4,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { CHANNEL_ID_RE, type ChannelMode } from './config.ts'
 import type { PersonaEventProvenance, PersonaSocketEventPayload } from './persona-connections.ts'
 import { slackInstallationIdentity, slackInstallationKey, type SlackInstallationIdentity } from './persona-slack-validation.ts'
-import { applySharedMembership, type SharedChannelAuthority, type SharedMembership, type SharedMembershipAbsenceConflict, type SharedMembershipHistory, type SharedPersona, type SharedMutationResult } from './shared-channels.ts'
+import { applySharedMembership, type SharedChannelAuthority, type SharedMembership, type SharedMembershipAbsenceConflict, type SharedMembershipHistory, type SharedMembershipInventory, type SharedPersona, type SharedMutationResult } from './shared-channels.ts'
 import { compareMembershipEventTimes, compareMembershipTimestamp, membershipPayloadIdentity, membershipTimestampUpperBound, orderMembershipRecovery, MEMBERSHIP_EVENT_ID_RE, MEMBERSHIP_TIMESTAMP_RE, type MembershipEvidence, type MembershipEventPayload } from './channel-membership-evidence.ts'
 
 export const MEMBERSHIP_UNRESOLVED = 'channel-membership-unresolved'
@@ -442,14 +442,17 @@ export function createChannelMembership(deps: ChannelMembershipDeps): ChannelMem
   function commitInventory(generation: MembershipGeneration, inventory: MembershipInventoryCommit): SharedMutationResult {
     if (!isCurrent(generation)) return { kind: 'stale', revision: authority.revision }
     if (!authority.readable) return { kind: 'unresolved', revision: authority.revision }
-    const life = lifeOf(authority, generation.key)!
+    // No-absence inventories never consume a persona snapshot. Preserve the
+    // detached read for conflict/recovery branches that actually inspect it.
+    let snapshot: SharedPersona | undefined
+    const life = () => snapshot ??= lifeOf(authority, generation.key)!
     const conflicts = new Map<string, SharedMembershipAbsenceConflict>()
     for (const [channel, boundary] of inventory.absent) {
-      const previous = life.membership[channel]
+      const previous = life().membership[channel]
       if (previous?.member && previous.identity === generation.identityKey && previous.boundary === boundary &&
-          newerExplicitAssignment(life, channel, inventory.observedRevision)) {
+          newerExplicitAssignment(life(), channel, inventory.observedRevision)) {
         conflicts.set(channel, { identity: generation.identityKey, boundary, observedThrough: inventory.observedThrough,
-          observedRevision: inventory.observedRevision, assignmentOrder: life.assignments[channel]!.order, recordedOrder: authority.revision })
+          observedRevision: inventory.observedRevision, assignmentOrder: life().assignments[channel]!.order, recordedOrder: authority.revision })
       }
     }
     // A complete negative result cannot tell whether a choice confirmed while
@@ -462,7 +465,7 @@ export function createChannelMembership(deps: ChannelMembershipDeps): ChannelMem
     // cannot be cleared by a negative result elsewhere in the inventory.
     for (const channel of unresolvedChannels(generation.key)) {
       if (!inventory.absent.has(channel)) return { kind: 'unresolved', revision: authority.revision }
-      const plan = recoveryPlan(generation, channel, inventory.observedThrough, life)
+      const plan = recoveryPlan(generation, channel, inventory.observedThrough, life())
       if ('fault' in plan) {
         markHeld(generation, channel, plan.fault)
         return { kind: 'unresolved', revision: authority.revision }
@@ -470,9 +473,18 @@ export function createChannelMembership(deps: ChannelMembershipDeps): ChannelMem
       plans.set(channel, plan.records)
     }
     const observations = generation.observations
+    const guard = () => isCurrent(generation) && generation.observations === observations
+    const cutoff = (previous: SharedMembershipInventory | undefined, order: number): SharedMembershipInventory =>
+      previous?.identity === generation.identityKey && compareMembershipTimestamp(previous.observedThrough, inventory.observedThrough) >= 0
+        ? { ...previous, recordedOrder: order }
+        : { incarnation: generation.incarnation, identity: generation.identityKey, observedThrough: inventory.observedThrough,
+          observedRevision: inventory.observedRevision, recordedOrder: order }
+    if (inventory.absent.size === 0 && plans.size === 0) {
+      return authority.transactMembershipInventory(generation.key, generation.incarnation, authority.revision, cutoff, guard)
+    }
     const orderSpan = 1 + inventory.absent.size + [...plans.values()].reduce((count, records) => count + records.length, 0)
     const result = authority.transactMembership(generation.key, authority.revision, (next, order) => {
-      if (!isCurrent(generation) || generation.observations !== observations) throw new Error('Superseded membership inventory.')
+      if (!guard()) throw new Error('Superseded membership inventory.')
       const current = next.personas[generation.key]!
       let position = order - orderSpan
       for (const [channel, boundary] of inventory.absent) {
@@ -499,12 +511,7 @@ export function createChannelMembership(deps: ChannelMembershipDeps): ChannelMem
           identity: generation.identityKey, boundary: previous.boundary, observedThrough: inventory.observedThrough,
         })
       }
-      const previous = current.membershipInventory
-      current.membershipInventory = previous?.identity === generation.identityKey &&
-          compareMembershipTimestamp(previous.observedThrough, inventory.observedThrough) >= 0
-        ? { ...previous, recordedOrder: order }
-        : { incarnation: generation.incarnation, identity: generation.identityKey, observedThrough: inventory.observedThrough,
-          observedRevision: inventory.observedRevision, recordedOrder: order }
+      current.membershipInventory = cutoff(current.membershipInventory, order)
     }, orderSpan)
     if (result.kind === 'applied') for (const channel of plans.keys()) {
       generation.holds.delete(channel)

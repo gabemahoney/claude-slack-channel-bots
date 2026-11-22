@@ -18,6 +18,7 @@ import { isDeepStrictEqual, types } from 'node:util'
 import { durableWriteFileSync, DurableWriteUnsyncedError } from './atomic-write.ts'
 import { cloneJournalData } from './durable-journal.ts'
 import { isSharedAttemptMap, sharedAttemptMap, withSharedAttempt, sharedAttemptEncoding, sharedAttemptBytes } from './shared-attempt-map.ts'
+import { SharedFragmentBytes } from './shared-fragment-bytes.ts'
 import { errnoSuffix } from './persona-credentials.ts'
 import { MEMBERSHIP_TIMESTAMP_RE, compareMembershipEventTimes, membershipPayloadIdentity, validateMembershipEvidence, type MembershipEvidence } from './channel-membership-evidence.ts'
 import { validateMembershipSetupRecords, type MembershipSetupRecord } from './channel-membership-readiness.ts'
@@ -206,7 +207,13 @@ const copied = new WeakSet<object>()
  * share text too; root/outcomes never cache a second copy around history. */
 const encodings = new WeakMap<object, { depth: number; text: string }>()
 const nativeEncoded = new WeakSet<object>()
-const byteEncodings = new WeakMap<object, { depth: number; bytes: Buffer }>()
+const byteFragments = new SharedFragmentBytes()
+/** Copied persona/applied ancestors keep spans, not another flattened copy of
+ * every child. Record maps retain contiguous buffers for proven splices. */
+const fragmentAncestors = new WeakSet<object>()
+const fragmentParts = new WeakMap<object, Map<number, readonly Uint8Array[]>>()
+/** Only immutable saved containers can supply a draft's splice ranges. */
+const fragmentBases = new WeakMap<object, object>()
 const sourceEncodings = new WeakMap<object, { value: string; bytes: Buffer }>()
 /** Committed states share their objects across revisions, so they are frozen
  * whole: an in-place write throws instead of reaching another revision. A
@@ -644,13 +651,17 @@ function checkPersonaHistory(life: SharedPersona, revision: number): void {
   }
 }
 /** Each applied persona's declaration, list and destination proofs against its life. */
-function checkAppliedChoices(state: SharedChannelState, config: PersonaConfig, deps: SharedChannelDeps): void {
+function checkAppliedChoices(state: SharedChannelState, config: PersonaConfig, deps: SharedChannelDeps,
+  scope?: { before: SharedChannelState; key: string }): void {
   if (config.personas.length !== Object.keys(state.personas).length) throw new Error('The shared channel authority has inconsistent persona identities.')
   for (const persona of config.personas) {
     const life = own(state.personas, persona.key)
+    // Exact config reuse plus scoped immutable sibling identity preserves the
+    // prior list proof. Declarations and destination obligations still run.
+    const keptList = scope && persona.key !== scope.key && life === own(scope.before.personas, persona.key)
     if (!life || !sameSharedDeclaration(life.declaration, persona, deps.realpath) ||
-        persona.channels.length !== Object.keys(life.assignments).length ||
-        persona.channels.some(channel => own(life.assignments, channel.id)?.delivery !== channel.delivery)) throw new Error('The shared channel authority has inconsistent applied choices.')
+        (!keptList && (persona.channels.length !== Object.keys(life.assignments).length ||
+        persona.channels.some(channel => own(life.assignments, channel.id)?.delivery !== channel.delivery)))) throw new Error('The shared channel authority has inconsistent applied choices.')
     if (Object.keys(life.removedDestinations).some(channel => channel !== persona.permission_prompts)) {
       throw new Error('The shared channel authority has inconsistent destination-removal evidence.')
     }
@@ -692,18 +703,68 @@ function encodeEnvelopeBytes(value: object, depth: number, out: Uint8Array[]): v
       out.push(bytes)
     } else if (depth === 0 && key === 'outcomes') encodeEnvelopeBytes(item, depth + 1, out)
     else {
-      const attempts = sharedAttemptBytes(item, depth + 1)
-      if (attempts) { out.push(attempts); continue }
-      let cached = byteEncodings.get(item)
-      if (!cached || cached.depth !== depth + 1) {
-        const parts: string[] = []
-        encodeSealed(item, depth + 1, parts)
-        byteEncodings.set(item, cached = { depth: depth + 1, bytes: Buffer.from(parts.join('')) })
-      }
-      out.push(cached.bytes)
+      appendFragmentBytes(item, depth + 1, out)
     }
   }
   out.push(Buffer.from(members ? '\n' + indent(depth) + '}' : '}'))
+}
+function appendFragmentBytes(value: object, depth: number, out: Uint8Array[]): void {
+  if (!fragmentAncestors.has(value)) { out.push(encodeFragmentBytes(value, depth)); return }
+  if (!sealed.has(value)) throw new Error(NOT_SEALED_DATA)
+  const kept = fragmentParts.get(value)?.get(depth)
+  if (kept) { out.push(...kept); return }
+  const list = Array.isArray(value)
+  if (types.isProxy(value) || Object.getPrototypeOf(value) !== (list ? Array.prototype : Object.prototype) ||
+      Object.hasOwn(value, 'toJSON') || types.isBoxedPrimitive(value)) throw new Error(NOT_SEALED_DATA)
+  const parts: Uint8Array[] = []
+  const keys = list ? Array.from({ length: value.length }, (_, i) => String(i)) : Object.keys(value)
+  let count = 0
+  for (const key of keys) {
+    const property = Object.getOwnPropertyDescriptor(value, key)
+    if (!property || !('value' in property)) throw new Error(NOT_SEALED_DATA)
+    const item = property.value
+    const text = typeof item === 'object' && item !== null ? undefined : JSON.stringify(item)
+    if ((typeof item !== 'object' || item === null) && text === undefined && !list) continue
+    parts.push(Buffer.from((count++ ? ',\n' : (list ? '[\n' : '{\n')) + indent(depth + 1) +
+      (list ? '' : JSON.stringify(key) + ': ')))
+    if (typeof item === 'object' && item !== null) appendFragmentBytes(item, depth + 1, parts)
+    else parts.push(Buffer.from(text ?? 'null'))
+  }
+  parts.push(Buffer.from(count ? '\n' + indent(depth) + (list ? ']' : '}') : list ? '[]' : '{}'))
+  let depths = fragmentParts.get(value)
+  if (!depths) fragmentParts.set(value, depths = new Map())
+  depths.set(depth, parts)
+  fragmentBases.delete(value)
+  out.push(...parts)
+}
+/** Copied ancestors append saved child bytes rather than flattening them to
+ * text again. Unusual data still throws into native encoding/full validation. */
+function encodeFragmentBytes(value: object, depth: number): Buffer {
+  const attempts = sharedAttemptBytes(value, depth)
+  if (attempts) return attempts
+  if (!sealed.has(value)) throw new Error(NOT_SEALED_DATA)
+  const kept = byteFragments.get(value, depth)
+  if (kept) return kept
+  if (!copied.has(value)) {
+    const parts: string[] = []
+    encodeSealed(value, depth, parts)
+    return byteFragments.keep(value, depth, Buffer.from(parts.join('')))
+  }
+  const list = Array.isArray(value)
+  if (types.isProxy(value) || Object.getPrototypeOf(value) !== (list ? Array.prototype : Object.prototype) ||
+      Object.hasOwn(value, 'toJSON') || types.isBoxedPrimitive(value)) throw new Error(NOT_SEALED_DATA)
+  const keys = list ? Array.from({ length: value.length }, (_, i) => String(i)) : Object.keys(value)
+  const base = fragmentBases.get(value)
+  fragmentBases.delete(value)
+  return byteFragments.encode(value, depth, list, keys, key => {
+    const property = Object.getOwnPropertyDescriptor(value, key)
+    if (!property || !('value' in property)) throw new Error(NOT_SEALED_DATA)
+    return property.value
+  }, (item, childDepth) => {
+    if (typeof item === 'object' && item !== null) return encodeFragmentBytes(item, childDepth)
+    const text = JSON.stringify(item)
+    return text === undefined ? undefined : Buffer.from(text)
+  }, base)
 }
 /** Full-reader results become immutable once. Narrow drafts mark only their
  * copied containers; shared branches keep their cached encoding. */
@@ -762,7 +823,13 @@ export function applySharedMemberships(
 }
 function deriveRawChannels(next: SharedChannelState, key: string): void {
   const life = own(next.personas, key)!
-  rawPersona(next, key)['channels'] = Object.entries(life.assignments).map(([id, assignment]) => ({ id, delivery: assignment.delivery }))
+  const raw = rawPersona(next, key), channels = raw['channels']
+  const assignments = Object.entries(life.assignments)
+  // A repeated observation changes evidence, not the already validated list.
+  // Never preserve a callback's new or hook-bearing replacement by equality.
+  if (Array.isArray(channels) && sealed.has(channels) && assignments.length === channels.length &&
+      assignments.every(([id, assignment], i) => channels[i]?.id === id && channels[i]?.delivery === assignment.delivery)) return
+  raw['channels'] = assignments.map(([id, assignment]) => ({ id, delivery: assignment.delivery }))
 }
 /** Every effect of one observation except the raw channel list it implies. */
 function applyMembershipRecords(
@@ -833,6 +900,9 @@ function namedMembershipEvents(life: SharedPersona): Set<string> {
 function dropSupersededScanRepeats(life: SharedPersona, saved: SharedPersona | undefined): void {
   const events = life.membershipEvents
   const kept = saved?.incarnation === life.incarnation ? saved.membershipEvents : undefined
+  // An identical immutable map contains no new history position. Metadata
+  // alone must not prune legacy repeats or change a review dependency.
+  if (events === kept) return
   const newest = new Map<string, number>()
   const repeats: string[] = []
   let wrote = false
@@ -886,19 +956,27 @@ function membershipDraft(state: SharedChannelState, key: string, revision: numbe
   const list = (state.applied['personas'] as Record<string, unknown>[]).slice()
   const index = rawPersonaIndex(list, key)
   const raw = { ...list[index]! }
+  fragmentBases.set(raw, list[index]!)
+  fragmentBases.set(list, state.applied['personas'] as object)
   list[index] = raw
   const life: SharedPersona = { ...state.personas[key]! }
+  fragmentBases.set(life, state.personas[key]!)
   const fields = life as unknown as Record<string, unknown>
   const records = new Map<string, Record<string, unknown>>()
   for (const field of MEMBERSHIP_RECORDS) {
     if (fields[field] === undefined) continue
     const copy = { ...fields[field] as Record<string, unknown> }
+    fragmentBases.set(copy, fields[field] as object)
     records.set(field, copy)
     fields[field] = copy
   }
   const personas = { ...state.personas }
+  fragmentBases.set(personas, state.personas)
   put(personas, key, life)
-  return { next: { ...state, revision, personas, applied: { ...state.applied, personas: list } }, life, raw, index, records }
+  const applied = { ...state.applied, personas: list }
+  fragmentBases.set(applied, state.applied)
+  for (const container of [raw, list, life, personas, applied]) fragmentAncestors.add(container)
+  return { next: { ...state, revision, personas, applied }, life, raw, index, records }
 }
 /** Same keys in the same order, with identical values, outside `except`. */
 function sameExcept(after: object, before: object, except: ReadonlySet<string>): boolean {
@@ -918,6 +996,24 @@ function needsNativeNormalization(value: object): boolean {
   try { checkDataContainer(value) } catch { return true }
   return 'toJSON' in value
 }
+/** Exact native-order identity equality, only for ordinary data containers.
+ * Hooks/descriptors must remain available to the native fallback. */
+function sameDataMembers(value: object, saved: object, except?: string): boolean {
+  if (types.isProxy(value) || Object.getPrototypeOf(value) !== (Array.isArray(value) ? Array.prototype : Object.prototype) ||
+      'toJSON' in value) return false
+  const old = Object.keys(saved)
+  let index = 0
+  // Inspect descriptors without allocating a second descriptor dictionary and
+  // its values array for every retained map. Non-enumerable accessors still
+  // prevent reuse, and native enumeration order is checked exactly.
+  for (const key of Object.getOwnPropertyNames(value)) {
+    const property = Object.getOwnPropertyDescriptor(value, key)!
+    if (!('value' in property)) return false
+    if (!property.enumerable) continue
+    if (key !== old[index++] || (key !== except && property.value !== (saved as Record<string, unknown>)[key])) return false
+  }
+  return index === old.length
+}
 /** A membership transaction changes its persona's membership fields and its
  * raw entry's `channels` only; everything else stays the committed objects. */
 function checkMembershipScope(before: SharedChannelState, key: string, draft: MembershipDraft): void {
@@ -932,7 +1028,7 @@ function checkMembershipScope(before: SharedChannelState, key: string, draft: Me
 }
 /** Gives each value the transaction wrote the form reading the file back would
  * give it, frozen, and answers whether every position written follows `revision`. */
-function settleMembershipDraft(saved: SharedPersona, savedRaw: Record<string, unknown>, draft: MembershipDraft, revision: number): boolean {
+function settleMembershipDraft(saved: SharedPersona, savedRaw: Record<string, unknown>, draft: MembershipDraft, revision: number, reuse: boolean): boolean {
   const fields = draft.life as unknown as Record<string, unknown>, kept = saved as unknown as Record<string, unknown>
   let fresh = true
   const written = (field: string, record: unknown) => {
@@ -946,14 +1042,20 @@ function settleMembershipDraft(saved: SharedPersona, savedRaw: Record<string, un
     const copy = draft.records.get(field)
     if (value === copy) {
       const records = kept[field] as Record<string, unknown>
+      let changed = false
       // Visits each entry once without building entry arrays; only the
       // current entry is replaced or deleted.
       for (const id in copy) {
         if (Object.hasOwn(records, id) && records[id] === copy[id]) continue
+        changed = true
         const settled = settle(copy[id])
         if (settled === undefined) delete copy[id]
         else put(copy, id, settled)
         written(field, settled)
+      }
+      if (reuse && !changed && sameDataMembers(copy!, records)) {
+        fields[field] = records
+        draft.records.delete(field)
       }
     } else if (value !== kept[field]) {
       const settled = settle(value)
@@ -974,6 +1076,7 @@ function settleMembershipDraft(saved: SharedPersona, savedRaw: Record<string, un
  * frozen: shared committed objects, or values settled above. */
 function sealMembershipDraft(draft: MembershipDraft): SharedChannelState {
   for (const value of [...draft.records.values(), draft.life, draft.raw, draft.next.applied['personas'] as object, draft.next.applied, draft.next.personas, draft.next]) {
+    if (sealed.has(value)) continue
     sealed.add(value)
     copied.add(value)
     Object.freeze(value)
@@ -984,22 +1087,25 @@ function sealMembershipDraft(draft: MembershipDraft): SharedChannelState {
  * change. Every other check reads objects it shares unchanged, bounded only
  * from above by the revision, which grew. The incarnation stays unique
  * because it is unchanged. */
-function checkMembershipDraft(before: SharedChannelState, state: SharedChannelState, key: string, fresh: boolean, path: string, deps: SharedChannelDeps, index: BotAttemptIndex): PersonaConfig {
+function checkMembershipDraft(before: SharedChannelState, state: SharedChannelState, key: string, fresh: boolean, path: string, deps: SharedChannelDeps, index: BotAttemptIndex, savedConfig: PersonaConfig): PersonaConfig {
   const life = state.personas[key]!
   checkPersonaRecords(state, key, life, new Set())
   if (!fresh) validateBotAttempts(state)
   else index.check(state, key)
   checkPersonaHistory(life, state.revision)
-  const config = sharedAppliedConfig(state, path, deps)
   const saved = before.personas[key]!, destination = rawPersona(state, key)['permission_prompts'] as string
+  const destinationChanged = own(life.removedDestinations, destination) !== own(saved.removedDestinations, destination) ||
+    own(life.leaves, destination) !== own(saved.leaves, destination)
+  const config = state.applied === before.applied && !nativeEncoded.has(before) && !destinationChanged
+    ? savedConfig : sharedAppliedConfig(state, path, deps)
   // Scope keeps both sources, declarations and destinations unchanged. Only
   // these two records can change the saved source's removedDestination answer,
   // even when a rejoin has made the applied list valid without that proof.
-  if (own(life.removedDestinations, destination) !== own(saved.removedDestinations, destination) ||
-      own(life.leaves, destination) !== own(saved.leaves, destination)) {
+  if (destinationChanged) {
     checkSourceConfigs(state, Buffer.from(state.sourceBytesBase64, 'base64'), path, deps)
   }
-  checkAppliedChoices(state, config, deps)
+  checkAppliedChoices(state, config, deps, config === savedConfig && state.applied === before.applied && !nativeEncoded.has(before)
+    ? { before, key } : undefined)
   return config
 }
 export interface ReviewedAssignment { key: string; channel: string; delivery: DeliveryMode; incarnation?: string; absenceReplacement?: string }
@@ -1236,6 +1342,13 @@ export interface SharedChannelAuthority {
    * mutating a shared record in place; anything else fails and writes nothing.
    * Committed state is shared between revisions and frozen. */
   transactMembership(key: string, expectedRevision: number, change: (next: SharedChannelState, order: number) => void, orderSpan?: number): SharedMutationResult
+  /** Cutoff-only application: the reducer owns a detached previous record,
+   * never a state draft. Guard runs under the mutation lock before the reducer.
+   * Native/review/recovery states select the general frame before either runs;
+   * an admitted reducer runs once and durability recovery never replays it. */
+  transactMembershipInventory(key: string, incarnation: string, expectedRevision: number,
+    reduce: (previous: SharedMembershipInventory | undefined, order: number) => SharedMembershipInventory,
+    guard: () => boolean): SharedMutationResult
   previewReviewed(bytes: Uint8Array, assignments?: readonly ReviewedAssignment[]): PersonaConfig
   planReviewed(bytes: Uint8Array, assignments?: readonly ReviewedAssignment[]): ReviewedChannelPlan
   /** Frozen preview for the reload owner; the ordinary API returns a copy. */
@@ -1354,17 +1467,34 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
   const threadViewListeners = new Set<(view: SharedThreadView) => void>()
   const readability = (): SharedReadability => ({ current, uncertain, readable, recoveryStaged })
   let stampFacts = readability()
-  let deliveredThreadView = threadViewSignature(readability())
+  // Capture provenance before either serialization: a hook can remove itself
+  // while computing holds/signatures, or be installed by the runtime publisher
+  // after state encoding. State encoding alone cannot prove signature reuse.
+  const reusableSignatureNow = () => !nativeEncoded.has(current) &&
+    !needsNativeNormalization(current) && !needsNativeNormalization(current.personas) &&
+    !('toJSON' in Array.prototype)
   let signatureFacts = readability()
+  let signatureReusable = reusableSignatureNow()
+  let deliveredThreadView = threadViewSignature(signatureFacts)
   let signatureHolds = JSON.stringify([current.recovery?.phase, reviewLedger(current)?.retirement?.recovery.keys])
   function deliverThreadView(always: boolean): void {
     const facts = readability()
+    const reusable = reusableSignatureNow()
     const holds = JSON.stringify([current.recovery?.phase, reviewLedger(current)?.retirement?.recovery.keys])
-    const same = !nativeEncoded.has(current) && !nativeEncoded.has(signatureFacts.current) &&
-      signatureFacts.current.personas === current.personas && signatureFacts.current.applied === current.applied &&
+    const same = signatureReusable && reusable && !nativeEncoded.has(signatureFacts.current) &&
+      signatureFacts.readable && facts.readable &&
+      !signatureFacts.recoveryStaged && !facts.recoveryStaged &&
+      signatureFacts.current.applied === current.applied &&
       signatureFacts.uncertain === facts.uncertain && signatureFacts.readable === facts.readable &&
-      signatureFacts.recoveryStaged === facts.recoveryStaged && holds === signatureHolds
+      signatureFacts.recoveryStaged === facts.recoveryStaged && holds === signatureHolds &&
+      Object.keys(current.personas).length === Object.keys(signatureFacts.current.personas).length &&
+      Object.keys(current.personas).every(key => {
+        const life = current.personas[key]!, kept = own(signatureFacts.current.personas, key)
+        return kept !== undefined && life.incarnation === kept.incarnation && life.assignments === kept.assignments &&
+          !heldByReview(current, key) && !heldByReview(signatureFacts.current, key)
+      })
     const signature = same ? deliveredThreadView : threadViewSignature(facts)
+    signatureReusable = reusable
     signatureFacts = facts
     signatureHolds = holds
     if (!always && signature === deliveredThreadView) return
@@ -2007,15 +2137,66 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
         if (draft.next.revision !== revision) throw new Error('Invalid shared application order.')
         checkMembershipScope(before, key, draft)
         dropSupersededScanRepeats(draft.life, before.personas[key])
-        const fresh = settleMembershipDraft(before.personas[key]!, rawPersona(before, key), draft, before.revision)
-        const config = checkMembershipDraft(before, draft.next, key, fresh, path, deps, attemptIndex)
+        const reuse = !nativeEncoded.has(before)
+        const fresh = settleMembershipDraft(before.personas[key]!, rawPersona(before, key), draft, before.revision, reuse)
+        // A membership-only application can retain the exact validated applied
+        // tree. Do not discard a native hook anywhere along the copied path.
+        if (reuse && sameDataMembers(draft.raw, rawPersona(before, key)) &&
+            sameDataMembers(draft.next.applied, before.applied, 'personas') &&
+            sameDataMembers(draft.next.applied['personas'] as object, before.applied['personas'] as object, String(draft.index))) {
+          draft.raw = rawPersona(before, key)
+          draft.next.applied = before.applied
+        }
+        const config = checkMembershipDraft(before, draft.next, key, fresh, path, deps, attemptIndex, currentConfig)
         // Normalization/validation may execute a callback-installed hook. It
         // cannot turn a membership write into a different protected scope.
         if (draft.next.revision !== revision) throw new Error('Invalid normalized shared application order.')
         checkMembershipScope(before, key, draft)
         const state = sealMembershipDraft(draft)
         // The same encoding of the same keys and values as a whole copy.
-        return stageBytes(state, config)
+        try { return stageBytes(state, config) }
+        finally {
+          // Native fallback may never visit some copied containers. Do not
+          // let an installed draft retain a chain of older saved containers.
+          for (const value of [...draft.records.values(), draft.life, draft.raw, draft.next.applied,
+            draft.next.applied['personas'] as object, draft.next.personas]) fragmentBases.delete(value)
+        }
+      }, key))
+    },
+    transactMembershipInventory(key, incarnation, expectedRevision, reduce, guard) {
+      if (!readable) return { kind: 'unresolved', revision: current.revision }
+      if (mutating || expectedRevision !== current.revision || own(current.personas, key)?.incarnation !== incarnation) {
+        return { kind: 'stale', revision: current.revision }
+      }
+      const update = (previous: SharedMembershipInventory | undefined, order: number): SharedMembershipInventory => {
+        if (!guard()) throw new Error('Superseded membership inventory.')
+        // Only this small detached value crosses the reducer boundary.
+        return reduce(previous === undefined ? undefined : clone(previous), order)
+      }
+      // Choose a frame before invoking user code. Native hooks and staged or
+      // held recovery keep the existing normalization/full-reader behavior.
+      if (nativeEncoded.has(current) || needsNativeNormalization(current) || 'toJSON' in Array.prototype ||
+          recoveryStaged || current.recovery !== undefined || heldByReview(current, key)) {
+        return authority.transactMembership(key, expectedRevision, (next, order) => {
+          const life = next.personas[key]!
+          life.membershipInventory = update(life.membershipInventory, order)
+        })
+      }
+      return reportOutcome(() => commit(expectedRevision, 1, undefined, revision => {
+        const before = freeze(current), saved = before.personas[key]!
+        const inventory = freeze(reparse(update(saved.membershipInventory, revision))) as SharedMembershipInventory
+        const life = { ...saved, membershipInventory: inventory }
+        const personas = { ...before.personas }
+        put(personas, key, life)
+        for (const value of [life, personas]) fragmentAncestors.add(value)
+        const draft: MembershipDraft = { next: { ...before, revision, personas }, life,
+          raw: rawPersona(before, key), index: rawPersonaIndex(before.applied['personas'] as unknown[], key), records: new Map() }
+        checkMembershipScope(before, key, draft)
+        dropSupersededScanRepeats(life, saved)
+        const config = checkMembershipDraft(before, draft.next, key,
+          object(inventory) && inventory.recordedOrder > before.revision, path, deps, attemptIndex, currentConfig)
+        checkMembershipScope(before, key, draft)
+        return stageBytes(sealMembershipDraft(draft), config)
       }, key))
     },
     observeMembership(key, incarnation, observation, expectedRevision) {
