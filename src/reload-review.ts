@@ -41,7 +41,7 @@ function only(value: object, fields: readonly string[]): boolean {
 function put<T>(record: Record<string, T>, key: string, value: T): void {
   Object.defineProperty(record, key, { value, enumerable: true, configurable: true, writable: true })
 }
-export function reviewLedger(state: SharedChannelState): ReviewLedger | undefined {
+export function reviewLedger(state: Pick<SharedChannelState, 'outcomes'>): ReviewLedger | undefined {
   return Object.hasOwn(state.outcomes, 'operatorReviews') ? state.outcomes['operatorReviews'] as ReviewLedger : undefined
 }
 export function validateReviewLedger(value: unknown, revision: number): asserts value is ReviewLedger {
@@ -154,7 +154,7 @@ export function retainReviewOutcomes(next: SharedChannelState): void {
 export function createReviewObserver() {
   let revocationDue = false
   return (authority: SharedChannelAuthority, binding: string, pending: boolean, intentGeneration: number, sourceHash: string, persist = true) => {
-    const before = reviewLedger(authority.snapshot())
+    const before = reviewLedger(authority.reviewState())
     if (before?.observed !== binding) revocationDue = true
     if (!persist) return { review: revocationDue ? undefined : before?.active }
     const observation = observeReview(authority, binding, pending, intentGeneration, sourceHash, revocationDue)
@@ -176,12 +176,12 @@ function observeReview(
   authority: SharedChannelAuthority, binding: string, pending: boolean, intentGeneration: number, sourceHash: string,
   revocationDue = false,
 ): { result?: SharedMutationResult; review?: DurableReview } {
-  const before = reviewLedger(authority.snapshot())
+  const before = reviewLedger(authority.reviewState())
   if (before?.retirement) return {}
   if (!revocationDue && before?.observed === binding && (!pending || (before.active && !before.outcomes[before.active.fingerprint]))) return { review: before.active }
   const generation = (before?.generation ?? 0) + 1
-  const review: DurableReview | undefined = pending ? { generation, binding, sourceHash, dependency: sharedReviewDependency(authority.snapshot()), intentGeneration, fingerprint: reviewFingerprint(binding, generation) } : undefined
-  const result = authority.transact(authority.revision, (next, order) => {
+  const review: DurableReview | undefined = pending ? { generation, binding, sourceHash, dependency: authority.reviewDependency(), intentGeneration, fingerprint: reviewFingerprint(binding, generation) } : undefined
+  const result = authority.transactReview(authority.revision, (next, order) => {
     const ledger: ReviewLedger = structuredClone(before ?? { generation: 0, observed: binding, outcomes: {} })
     if (ledger.active && !ledger.outcomes[ledger.active.fingerprint]) put(ledger.outcomes, ledger.active.fingerprint, {
       generation: ledger.active.generation, status: 'superseded', revision: order,
@@ -196,7 +196,7 @@ function observeReview(
   })
   return { result, review: result.kind === 'applied' ? review : undefined }
 }
-export function reviewMatches(state: SharedChannelState, review: DurableReview, attempted = false): boolean {
+export function reviewMatches(state: Pick<SharedChannelState, 'outcomes' | 'pendingIntent'>, review: DurableReview, attempted = false): boolean {
   const ledger = reviewLedger(state)
   const outcome = ledger?.outcomes[review.fingerprint]
   const intent = (state.pendingIntent['operator'] as OperatorIntent | undefined) ?? emptyOperatorIntent()
@@ -207,8 +207,8 @@ export function reviewMatches(state: SharedChannelState, review: DurableReview, 
 /** Persist the spent gesture before retirement or activation. A crash or a
  * known failure cannot turn this same file into new authorization. */
 export function beginReviewAttempt(authority: SharedChannelAuthority, review: DurableReview, recovery?: RetiredReviewRecovery): SharedMutationResult {
-  if (!reviewMatches(authority.snapshot(), review) || sharedReviewDependency(authority.snapshot()) !== review.dependency) return { kind: 'stale', revision: authority.revision }
-  return authority.transact(authority.revision, (next, order) => {
+  if (!reviewMatches(authority.reviewState(), review) || authority.reviewDependency() !== review.dependency) return { kind: 'stale', revision: authority.revision }
+  return authority.transactReview(authority.revision, (next, order) => {
     const ledger = reviewLedger(next)!
     put(ledger.outcomes, review.fingerprint, { generation: review.generation, status: 'attempted', revision: order })
     if (recovery) ledger.retirement = { fingerprint: review.fingerprint, recovery }
@@ -231,7 +231,7 @@ export function consumeReview(next: SharedChannelState, review: DurableReview, o
   }
 }
 export function rejectReviewAttempt(authority: SharedChannelAuthority, fingerprint: string): SharedMutationResult {
-  return authority.transact(authority.revision, (next, order) => {
+  return authority.transactReview(authority.revision, (next, order) => {
     const ledger = reviewLedger(next)
     const outcome = ledger?.outcomes[fingerprint]
     if (!ledger || outcome?.status !== 'attempted') throw new Error('No recoverable review attempt.')

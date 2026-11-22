@@ -30,6 +30,10 @@ Each source module has a corresponding test file under `tests/`. Every `tests/*.
 
 | Source | Test File | What It Tests |
 |--------|-----------|---------------|
+| shared-channels.ts, channel-delivery-attempt.ts, reload.ts, reload-review.ts | authority-cost.test.ts | Guard 1: deterministic assignment/writing-tick/idle-tick work at 0 and +4,000 retained attempts, no history-dependent parsing/traversal or idle whole-authority snapshots, synchronous pending/terminal writes, full-reader acceptance and reopen of every retained outcome, no external calls and empty lifecycle per tick. Intermediate writes and complete MCP results/rejections are leak-checked immediately after each operation, outside counted work, then released; setup writes are checked during setup. Runs in the ordinary suite. |
+| shared-channels.ts, reload.ts | authority-hold-measure.test.ts | Guard 2: opt-in exclusive scheduler measurement of whole-operation call, timer and fsync callback holds at both attempt populations; calibrated limits and each sample's successful writer/revision activity and empty lifecycle are checked after all 48 samples. Intermediate writes and complete MCP results/rejections are leak-checked and released immediately outside measured windows; only small labeled leak failures remain for the final verdict. Reports residual whole-file write growth per 1,000 attempts. See [Authority hold measurement](#authority-hold-measurement). |
+| shared-channels.ts, channel-delivery-attempt.ts, reload-review.ts, channel-membership-readiness.ts | authority-differential.test.ts | Scoped/full-reader acceptance and rejection, protected attempt history and restoration anchors, unchanged state/write/publication on rejection, later usability, protocol-versus-final-state controls and native/staged fallbacks, including non-enumerable method/getter malformed-history and valid-preserved-output cases; credential leak checks cover intermediate outputs. |
+| shared-attempt-map.ts | shared-attempt-map.test.ts | Persistent dictionary insertion/replacement/export, isolation of earlier revisions, mutation refusal, exact nested JSON and cached UTF-8 byte splicing at every dictionary position. |
 | tests/integration/fixtures/ended-life.ts, tests/integration/test-24-fmk-stuck-launch.sh | ended-life.test.ts | Injected probes bind the recorded socket and unique tmux session ID/pane pid, reject vacuous positive controls, require both exit orders and cover name reuse, exit deadlines and query errors. Every tmux 3.2a client stderr maps to its fixed label; only the three gone-server outcomes (no server, missing socket, server exited unexpectedly) read as absent, and every other failure names its label. Native controls run the real tmux 3.2a client on a private `-S` socket (skipping with a named reason when `tmux -V` is not 3.2a): a server that exits after its last session closes leaves a stale socket read as gone, then a removed socket; a listener that closes each connection reads as gone, and one that holds it fails closed at the 3 s bound. Literal proc-stat cases include trailing newlines and embedded comm delimiters; an isolated native child control distinguishes a live process from its unreaped zombie, skipping with a named reason only when the load-time `/proc/self` link differs from `process.pid`. Extracted shell declarations use inert tmux/pid stand-ins for socket/exact targets, session IDs, unexpected statuses and the real 3 s timeout; no native tmux or AD. |
 | test-stall-attribution.ts, post-holds.ts, fixtures/sr8-attribution.ts | stall-attribution.test.ts | Base-switch gate, injected probe/CPU/heap and unavailable cgroup counters, early hold callback/re-arm and decision times, informational deadline-window matching across personas, bounded printing and failure file retention. Synthetic evidence only. |
 | tests/integration/fixtures/transcript-receipts.ts, lib/scenario.sh, tests/real-agent/codex-gate.ts | shim-log-reader.test.ts | Synthetic append boundaries retain only complete lines in the shared readers and scenario-local selector output. Empty/newline-free logs and incomplete malformed or valid tails are ignored; complete malformed calls and bad quoting still fail, as do malformed fault/stop lines in the shell reader. Executes only extracted shell reader declarations, with no native agent. |
@@ -830,6 +834,32 @@ phase-19 chunk no-repost callback after worker stop and final snapshots.
 Split-shell controls verify real declarations and these compositions with
 negative cases; only contained runs establish runtime independence and time.
 Full filenames and helper inventory are in [Layout](../tests/README.md#layout).
+
+### Authority hold measurement
+
+`tests/authority-cost.test.ts` (Guard 1) runs in the ordinary unit suite. Its deterministic work counters prove that parsing, cloning and attempt traversal for an assignment or reload tick do not grow with retained attempt history; it also checks durable ordering, restart, empty lifecycle per tick and the idle tick's absence of whole-authority work.
+
+Run `tests/authority-hold-measure.test.ts` (Guard 2) only as an **exclusive scheduler unit job**, with `CSCB_AUTHORITY_HOLD_MEASURE=1` passed to that job and that file selected explicitly. Use the unit runner's scratch HOME/state isolation and real scratch storage. Leave the switch unset for ordinary suite runs, where this test is skipped; a local host run is indicative and supplies no acceptance verdict.
+
+The fixed fixture has two personas with 1,100 channels each, at 0 and +4,000 retained attempts. Decision 2 (2026-11-22) calibrates these limits for **each** metric: the complete awaited operation (`callMs`), an armed zero-delay timer (`timerMs`) and an armed fsync callback (`fsyncMs`):
+
+| Operation | Maximum per metric | Successful authority writes | Revision delta |
+|---|---:|---:|---:|
+| Whole bot assignment, including both durable writes | 40 ms | 2 | +2 |
+| Writing reload review tick | 25 ms | 1 | +1 |
+| Idle reload review tick | 10 ms | 0 | 0 |
+
+Keep all eight samples per operation at each population (48 total), with no warm-up, retries, dropped samples, percentile oracle or adaptive limits. Retain `AUTHORITY-HOLD-SHAPE`, every `AUTHORITY-HOLD-SAMPLE` and each `AUTHORITY-HOLD-SUMMARY`; the test prints them before evaluating the limits. Summaries report added bytes written and durable-writer milliseconds per 1,000 retained attempts: whole-file byte emission and durable writes still grow with file size.
+
+After collecting all 48 samples and printing their summaries, Guard 2 also asserts each sample's activity against the table, successful assignment results with both synchronous writes, and an empty lifecycle for every sample. Activity reads and secrecy collection run after the call, timer and fsync callback intervals close; a fast no-op cannot stand in for a writing tick.
+
+Both guards use `assertNoLeak` on setup writes during setup and on each operation's intermediate authority writes and complete MCP result or rejection immediately after that operation, outside counted and timed windows, then release them before the next operation. Timing guards must not retain large evidence across measured operations or use forced GC to compensate.
+
+Guard 2's measured recorder must not retain the production writer's buffer or other large evidence across a sample, because that inflates timed holds. It records only length/time and hard-links each durable authority write into a scan directory, then reads, length-checks, leak-scans and unlinks each link after the sample, outside the windows; a missing link or length mismatch fails the guard.
+
+Guard 2 keeps only small labeled leak-failure records, asserts that list is empty after all 48 samples and summaries, then leak-checks the small per-run captures. Logs, errors, server files and failure paths remain checked before cleanup; `makeAuthorityCostRig` stays registered in the secrecy audit's `HELPER_SURFACES`.
+
+This explicit measurement uses real call/callback elapsed time to measure an event-loop hold, never sleeps to establish behavior or replaces injected-clock tests. Ordinary timeout/retry assertions still use fake clocks; integration performance verdicts still require the contained runs below, including unchanged Tests 62 and 63 on exclusive burst shards.
 
 ### Thread Memory performance runs
 
@@ -2183,7 +2213,7 @@ The timers `LATCH_RECHECK_INTERVAL_MS`, `AD_VERSION_RECHECK_INTERVAL_MS`, `DIALO
 
 - Internal implementation details (private helper functions)
 - Exact log output (test behavior, not logging)
-- Timing-dependent behavior with real delays — inject the clock and timers (see Backoff and Retry Tests); older suites use short configurable timeouts
+- Timing-dependent behavior with real delays — inject the clock and timers (see Backoff and Retry Tests); older suites use short configurable timeouts. The opt-in exclusive [Authority hold measurement](#authority-hold-measurement) measures elapsed cost separately
 - Test infrastructure itself (factories, stubs, reset helpers) — if a fixture breaks, the real tests that use it will fail anyway
 
 ## Keeping the Suite Lean

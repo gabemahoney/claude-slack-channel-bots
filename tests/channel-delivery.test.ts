@@ -977,7 +977,7 @@ describe('membership transactions preserve durable state and publications', () =
       Object.defineProperty(next.personas['alpha']!.membership, 'toJSON', { get() { call(); return undefined }, enumerable: false, configurable: true })
     }, [1, 1, 1]],
     ['a non-enumerable toJSON method on a copied map', (next, call) => {
-      Object.defineProperty(next.personas['alpha']!.membership, 'toJSON', { value() { call(); return {} }, enumerable: false, configurable: true })
+      Object.defineProperty(next.personas['alpha']!.membership, 'toJSON', { value(this: SharedChannelState['personas'][string]['membership']) { call(); return Object.fromEntries(Object.entries(this)) }, enumerable: false, configurable: true })
     }, [1, 1, 1]],
     ['a non-enumerable toJSON method on a copied array', (next, call) => {
       Object.defineProperty(next.applied['personas'], 'toJSON', { value(this: unknown[]) { call(); return Array.from(this) }, enumerable: false, configurable: true })
@@ -999,6 +999,35 @@ describe('membership transactions preserve durable state and publications', () =
     const state = authority.snapshot()
     state.personas['alpha'] = JSON.parse(JSON.stringify(authority.inspectMembershipHistory('alpha', life => life as never)))
     expect(readFileSync(authority.path).toString()).toBe(JSON.stringify(state, null, 2) + '\n')
+  })
+
+  test('native encoding that erases retained membership is rejected without a write or publication and leaves the authority usable', () => {
+    const writes: Uint8Array[] = [], publications: string[] = []
+    const authority = makeSharedAuthority(root, input(), { write(path, bytes) { durableWriteFileSync(path, bytes); writes.push(bytes) } })
+    expect(observe(authority, 'alpha', C.primary, true, 'EvJOIN1').kind).toBe('applied')
+    authority.subscribe(() => publications.push('config'))
+    authority.subscribeChange(() => publications.push('change'))
+    authority.subscribeThreadView(() => publications.push('thread'))
+    writes.length = 0; publications.length = 0
+    const before = authority.snapshot(), bytes = readFileSync(authority.path)
+    const invalid = structuredClone(before)
+    invalid.revision++
+    invalid.personas['alpha']!.membership = {}
+    expect(() => parseSharedChannelState(Buffer.from(JSON.stringify(invalid)), authority.path)).toThrow()
+    expect(authority.transactMembership('alpha', authority.revision, next => {
+      Object.defineProperty(next.personas['alpha']!.membership, 'toJSON', {
+        value() { return {} }, enumerable: false, configurable: true,
+      })
+    })).toEqual({ kind: 'failed', revision: before.revision })
+    expect(writes).toEqual([])
+    expect(publications).toEqual([])
+    expect(authority.revision).toBe(before.revision)
+    expect(authority.snapshot()).toEqual(before)
+    expect(readFileSync(authority.path)).toEqual(bytes)
+    expect(observe(authority, 'alpha', C.secondary, true, 'EvVALID').kind).toBe('applied')
+    expect(writes).toHaveLength(1)
+    expect(publications).toEqual(['thread', 'config', 'change'])
+    expect(parseSharedChannelState(readFileSync(authority.path), authority.path)).toEqual(authority.snapshot())
   })
 })
 test('attempt identifiers preserve exact code units and cannot collide after Unicode replacement or trimming', () => {

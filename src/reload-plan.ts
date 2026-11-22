@@ -437,7 +437,7 @@ export interface ReviewedChannelView extends ReviewedChannelEffect {
   effective: string
   activatesInStrict: boolean
 }
-function reviewedChannelViews(applied: PersonaConfig, next: PersonaConfig, facts: ChangePlanFacts): ReviewedChannelView[] {
+export function reviewedChannelViews(applied: PersonaConfig, next: PersonaConfig, facts: ChangePlanFacts): ReviewedChannelView[] {
   return (facts.sharedReview?.channels ?? []).map(effect => {
     const membership: MembershipReading = effect.replacement ? { kind: 'unresolved', reason: 'current-membership-missing' } :
       facts.membership?.(effect.key, effect.channel, next.channel_mode) ?? { kind: 'unresolved', reason: 'current-membership-missing' }

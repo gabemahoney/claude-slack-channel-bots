@@ -8,6 +8,7 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ### Fixed
 
+- Bot assignments and writing reload review ticks no longer reparse, clone or revalidate retained attempts, reducing event-loop stalls; idle ticks do no whole-authority work. Synchronous byte emission and durable whole-file writes still block the event loop in proportion to retained history (b.o83).
 - An operator can now use `abandon-message` to stop delivery of one stuck head, keep its text and history, notify the sender and let later work proceed. This is a manual action with no automatic expiry or retry cap; check the bot's terminal for a leftover draft first. See the [CLI reference](docs/cli.md#claude-slack-channel-bots-abandon-message-persona-ts) and [recovery procedure](skills/debug-slack-channel-bots/SKILL.md#abandoning-a-stuck-head) (b.6cg).
 
   Once the state directory contains `abandoned` records, do not use it with a CSCB release that cannot read them: it quarantines the abandonment and re-offers the retained message. Draining or compaction does not make that downgrade safe; see [Downgrading to an earlier release](docs/migration.md#downgrading-to-an-earlier-release).

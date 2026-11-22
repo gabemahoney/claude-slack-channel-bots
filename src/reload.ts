@@ -53,7 +53,7 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto'
-import { beginReviewAttempt, createReviewObserver, rejectReviewAttempt, reviewLedger, reviewMatches, reviewOutcomeLine, reviewRecoveryLine, reviewRecoveredBringUpFailedLine, reviewRecoveredLifecycleFailedLine, reviewedMembershipFact, sharedReviewDependency, RELOAD_REVIEW_OUTCOME, RELOAD_REVIEW_RECOVERY, type DurableReview } from './reload-review.ts'
+import { beginReviewAttempt, createReviewObserver, rejectReviewAttempt, reviewLedger, reviewMatches, reviewOutcomeLine, reviewRecoveryLine, reviewRecoveredBringUpFailedLine, reviewRecoveredLifecycleFailedLine, reviewedMembershipFact, RELOAD_REVIEW_OUTCOME, RELOAD_REVIEW_RECOVERY, type DurableReview } from './reload-review.ts'
 import { parseReviewRequestBytes, REVIEW_REQUEST_SUFFIX, reviewRequestDiagnostic, REVIEW_REQUEST_INVALID, REVIEW_REQUEST_RECORDED, REVIEW_REQUEST_STORAGE } from './reload-request.ts'
 import { readSharedRecoveryRequest } from './shared-recovery.ts'
 import { runStartupRecovery, sharedRecoveryLine } from './reload-recovery.ts'
@@ -142,6 +142,7 @@ import {
   renderInvalidLogLine,
   renderPreview,
   renderPreviewLogLines,
+  reviewedChannelViews,
   type AddedPersonaCause,
   type ChangePlan,
   type ChangePlanCandidate,
@@ -1031,6 +1032,7 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
   let requestEpisode: string | undefined
   let channelEffects: ReviewedChannelEffect[] = []
   let recoveryPending = false
+  let credentialReferences: { bytes: Buffer; paths: string[] } | undefined
 
   function processRequest(): boolean {
     const authority = host.sharedChannels?.()
@@ -1044,7 +1046,7 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
     if (recovery) {
       // A request left in place after its activation applies nothing. The
       // activated record keeps only its identity, never a replacement's input.
-      const retained = authority.snapshot().recovery
+      const retained = authority.recoverySnapshot()
       if (retained?.phase === 'active' && retained.request.request_id === recovery.request_id &&
           retained.request.action === recovery.action && retained.request.evidence_sha256 === recovery.evidence_sha256) return false
       const evidence = readConfigFile(paths.lastApplied, deps.configFs)
@@ -1081,7 +1083,7 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
     try {
       const authority = host.sharedChannels?.()
       if (authority) {
-        const reviewed = authority.planReviewed(read.bytes, assignments)
+        const reviewed = authority.readReviewedPlan(read.bytes, assignments)
         channelEffects = reviewed.channels
         return { kind: 'valid', config: reviewed.config }
       }
@@ -1205,14 +1207,17 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
 
     const entries: FingerprintCredentialsEntry[] = []
     if (!dryRun && read.ok) {
-      for (const path of new Set(referencedCredentialsPaths(read.bytes, deps.home))) {
+      if (!credentialReferences || !credentialReferences.bytes.equals(read.bytes)) {
+        credentialReferences = { bytes: Buffer.from(read.bytes), paths: [...new Set(referencedCredentialsPaths(read.bytes, deps.home))] }
+      }
+      for (const path of credentialReferences.paths) {
         entries.push({ path, content: fingerprintContentOf(readCredentials(path)) })
       }
     }
 
     factFailed = false
     const facts: ChangePlanFacts = {
-      sharedReview: { generation: intent?.generation ?? 0, channels: channelEffects },
+      sharedReview: { generation: intent?.generation ?? 0, channels: configChanged || intent?.requested ? channelEffects : [] },
       membership: (key, channel, mode) => deps.membership?.()?.read(key, channel, mode) ?? { kind: 'unresolved', reason: 'current-membership-missing' },
       realPath: realPathOf,
       queueOpenCount: key => deps.queueOpenCount?.(key) ?? 0,
@@ -1241,6 +1246,13 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
     const contentFingerprint = reloadFingerprint(fingerprintContentOf(read), entries)
     const credentialsChanged = plan.valid && plan.credentials.length > 0
     const pending = configChanged || credentialsChanged || intent?.requested === true
+    // Current membership views are needed only for a preview/confirmation.
+    // Credential-only changes are known after classification; fill their views
+    // in this same turn without repeating the diff or delaying any work.
+    if (credentialsChanged && !configChanged && !intent?.requested && plan.valid && candidate.kind === 'valid') {
+      plan.sharedReview = { generation: intent?.generation ?? 0, channels: reviewedChannelViews(applied.config, candidate.config,
+        { ...facts, sharedReview: { generation: intent?.generation ?? 0, channels: channelEffects } }) }
+    }
     const membership = deps.membership?.()
     const memberFacts = applied.config.personas.map(persona => {
       const generation = membership?.generation(persona.key)
@@ -1248,7 +1260,7 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
     })
     const declarations = [...applied.config.personas, ...(candidate.kind === 'valid' ? candidate.config.personas : [])]
       .map(persona => [persona.key, persona.name, realPathOf(persona.credentials_file), realPathOf(persona.working_directory), persona.permission_prompts])
-    const binding = reloadReviewBinding(contentFingerprint, authority ? sharedReviewDependency(authority.snapshot()) : '', reviewSession,
+    const binding = reloadReviewBinding(contentFingerprint, authority ? authority.reviewDependency() : '', reviewSession,
       intent?.generation ?? 0, [memberFacts, declarations])
     const observed = authority ? observeReview(authority, binding, pending, intent?.generation ?? 0,
       reloadFingerprint(fingerprintContentOf(read), []), persist) : undefined
@@ -1459,7 +1471,7 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
     } else {
       const fingerprint = parsePendingFingerprint(confirmation.bytes.toString('utf-8'))
       const authority = host.sharedChannels?.()
-      const outcome = fingerprint && authority ? reviewLedger(authority.snapshot())?.outcomes[fingerprint] : undefined
+      const outcome = fingerprint && authority ? reviewLedger(authority.reviewState())?.outcomes[fingerprint] : undefined
       if (outcome) {
         ignoredConfirmation = removeConfirmation(false) ? undefined : identity
         deps.log(reviewOutcomeLine(outcome.status))
@@ -1650,7 +1662,7 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
   function recoverRetirement(starting = false): void {
     if (!sharedChannels || detectionStopped) return
     if (!sharedChannels.readable && sharedChannels.recoverDurability().kind !== 'applied') return
-    const interrupted = reviewLedger(sharedChannels.snapshot())?.retirement
+    const interrupted = reviewLedger(sharedChannels.reviewState())?.retirement
     if (interrupted) {
       for (const key of interrupted.recovery.keys) retirementRecoveryKeys.add(key)
       const restored = restoreReviewedRetirement(deps.retiredKeys, interrupted.recovery)
@@ -1846,7 +1858,7 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     const { plan, candidate, bytes } = state
     if (current === undefined || detectionStopped) return false
     const review = state.review
-    if (sharedChannels === undefined || !review || !reviewMatches(sharedChannels.snapshot(), review) || !state.revalidate()) return false
+    if (sharedChannels === undefined || !review || !reviewMatches(sharedChannels.reviewState(), review) || !state.revalidate()) return false
     if (!plan.valid) {
       if (beginReviewAttempt(sharedChannels, review).kind === 'applied') rejectReviewAttempt(sharedChannels, review.fingerprint)
       deps.log(renderConfirmedInvalidLogLine(plan))

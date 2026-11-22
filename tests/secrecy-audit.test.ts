@@ -471,6 +471,7 @@ const HELPER_SURFACES: Record<string, Record<string, string>> = {
   'tests/test-helpers/ad-settings.ts': { writeAgentDirectorConfig: "writes agent-director's config.toml" },
   'tests/test-helpers/channel-delivery.ts': { writeChannelDeliveryRecord: 'writes a stored-choice file holding persona declarations' },
   'tests/test-helpers/reload-harness.ts': { makeReloadHarness: 'builds the reload harness' },
+  'tests/test-helpers/authority-cost.ts': { makeAuthorityCostRig: 'builds authenticated reload and MCP composition over persona credentials and durable authority files' },
   'tests/test-helpers/thread-memory.ts': {
     populationConfig: 'builds SR-8 persona configuration through the shared channel builders',
     seedUnitPopulation: 'reads the applied shared configuration and seeds its Thread Memory journal',

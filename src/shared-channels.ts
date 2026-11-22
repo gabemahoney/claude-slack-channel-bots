@@ -5,7 +5,7 @@
 import { testSyncWorkStart, testSyncWorkEnd } from './test-stall-attribution.ts'
 import { createHash, randomUUID } from 'node:crypto'
 import {
-  botAttemptBinding, botAttemptKey, botAttemptResult, sameBotAttempt, validChannelDeliveryAttempt, validateBotAttempts,
+  BotAttemptIndex, botAttemptBinding, botAttemptKey, botAttemptResult, sameBotAttempt, validChannelDeliveryAttempt, validateBotAttempts, validateBotAttemptRecord,
   type BotAttemptAuthorization, type BotAttemptBinding, type BotAttemptResult, type ChannelDeliveryAttemptRequest, type SharedBotAttempt,
 } from './channel-delivery-attempt.ts'
 import { emptyOperatorIntent, parseReviewRequest, validateOperatorIntent, type OperatorIntent, type ReviewRequest } from './reload-request.ts'
@@ -17,6 +17,7 @@ import { dirname } from 'node:path'
 import { isDeepStrictEqual, types } from 'node:util'
 import { durableWriteFileSync, DurableWriteUnsyncedError } from './atomic-write.ts'
 import { cloneJournalData } from './durable-journal.ts'
+import { isSharedAttemptMap, sharedAttemptMap, withSharedAttempt, sharedAttemptEncoding, sharedAttemptBytes } from './shared-attempt-map.ts'
 import { errnoSuffix } from './persona-credentials.ts'
 import { MEMBERSHIP_TIMESTAMP_RE, compareMembershipEventTimes, membershipPayloadIdentity, validateMembershipEvidence, type MembershipEvidence } from './channel-membership-evidence.ts'
 import { validateMembershipSetupRecords, type MembershipSetupRecord } from './channel-membership-readiness.ts'
@@ -177,7 +178,16 @@ function object(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 /** A copy of committed or parsed state; a caller's value takes `structuredClone`. */
-function clone<T>(value: T): T { return cloneJournalData(value) }
+function clone<T>(value: T): T {
+  // Explicit exports/full fallback materialize the immutable dictionary. The
+  // normal narrow paths never call this with a whole authority.
+  if (object(value) && object(value['outcomes']) && object(value['outcomes']['botAttempts']) && isSharedAttemptMap(value['outcomes']['botAttempts'])) {
+    const outcomes = value['outcomes'], records: Record<string, SharedBotAttempt> = {}
+    for (const [id, record] of Object.entries(outcomes['botAttempts'] as Record<string, SharedBotAttempt>)) put(records, id, cloneJournalData(record))
+    return cloneJournalData({ ...value, outcomes: { ...outcomes, botAttempts: records } }) as T
+  }
+  return cloneJournalData(value)
+}
 function own<T>(record: Record<string, T>, key: string): T | undefined {
   return Object.hasOwn(record, key) ? record[key] : undefined
 }
@@ -192,15 +202,17 @@ const sealed = new WeakSet<object>()
 /** The sealed containers a membership transaction copied. Most of their
  * members are the previous revision's objects, so they are encoded by member. */
 const copied = new WeakSet<object>()
-/** The encodings kept for later revisions: only sealed objects that are not
- * copied containers. A copied container's text would repeat its members'
- * texts at each level above them, about five copies of the state in all. */
+/** Encodings of immutable canonical branches. Copied life/map containers may
+ * share text too; root/outcomes never cache a second copy around history. */
 const encodings = new WeakMap<object, { depth: number; text: string }>()
+const nativeEncoded = new WeakSet<object>()
+const byteEncodings = new WeakMap<object, { depth: number; bytes: Buffer }>()
+const sourceEncodings = new WeakMap<object, { value: string; bytes: Buffer }>()
 /** Committed states share their objects across revisions, so they are frozen
  * whole: an in-place write throws instead of reaching another revision. A
  * frozen object's descendants are already frozen. */
 function freeze<T>(value: T): T {
-  if (typeof value !== 'object' || value === null || Object.isFrozen(value)) return value
+  if (typeof value !== 'object' || value === null || isSharedAttemptMap(value) || Object.isFrozen(value)) return value
   for (const child of Object.values(value)) freeze(child)
   sealed.add(value)
   return Object.freeze(value)
@@ -215,7 +227,11 @@ const NOT_SEALED_DATA = 'Not sealed JSON data.'
  * the state's, on an object this module did not seal, and on what a
  * transaction wrote that is not JSON data. */
 function encodeSealed(value: object, depth: number, out: string[]): void {
+  const attempts = sharedAttemptEncoding(value, depth)
+  if (attempts !== undefined) { out.push(attempts); return }
   if (!sealed.has(value)) throw new Error(NOT_SEALED_DATA)
+  const kept = encodings.get(value)
+  if (kept?.depth === depth) { out.push(kept.text); return }
   if (!copied.has(value)) {
     let cached = encodings.get(value)
     if (cached === undefined || cached.depth !== depth) {
@@ -228,6 +244,7 @@ function encodeSealed(value: object, depth: number, out: string[]): void {
     return
   }
   const list = Array.isArray(value)
+  const start = out.length
   // A transaction may have left what the native encoder treats otherwise:
   // a proxy's traps, an own `toJSON` of any kind (it is read whether
   // enumerable or not), one inherited from another prototype, a member's
@@ -262,6 +279,15 @@ function encodeSealed(value: object, depth: number, out: string[]): void {
     }
   }
   out.push(!members ? (list ? '[]' : '{}') : '\n' + indent(depth) + (list ? ']' : '}'))
+  // A later sibling's assignment copies its ancestors, not these containers.
+  // Cache canonical life/map fragments too; never cache the root/outcomes
+  // around attempt history, and never reach this point for native hooks.
+  if (depth >= 2) {
+    const text = out.slice(start).join('')
+    encodings.set(value, { depth, text })
+    out.length = start
+    out.push(text)
+  }
 }
 /** The value as reading its serialized form back gives it. */
 function reparse(value: unknown): unknown {
@@ -426,14 +452,14 @@ export function sharedAppliedConfig(state: SharedChannelState, path: string, dep
 }
 /** Saved input is immutable, but its destination exception depends on the
  * current persona's removal and leave proofs. Validate both representations. */
-function checkSourceConfigs(state: SharedChannelState, sourceBytes: Uint8Array, path: string, deps: SharedChannelDeps): void {
+function checkSourceConfigs(state: SharedChannelState, sourceBytes: Uint8Array, path: string, deps: SharedChannelDeps): PersonaConfig {
   parsePersonaConfigBytes(rawBytes(state.source), path, dirname(path), {
     home: deps.home, record: true,
     removedDestination: persona => removedDestination(state, persona, deps.realpath),
   })
   // Validate both representations before comparing them, so removed settings
   // still receive the actionable schema diagnostic even in a damaged envelope.
-  parsePersonaConfigBytes(sourceBytes, path, dirname(path), {
+  return parsePersonaConfigBytes(sourceBytes, path, dirname(path), {
     home: deps.home, record: true,
     removedDestination: persona => removedDestination(state, persona, deps.realpath),
   })
@@ -448,29 +474,22 @@ export function parseSharedChannelState(bytes: Uint8Array, path: string, deps: S
   return readSharedChannelState(bytes, path, deps)?.state
 }
 /** `parseSharedChannelState` with the applied configuration it validated. */
-function readSharedChannelState(bytes: Uint8Array, path: string, deps: SharedChannelDeps): { state: SharedChannelState; config: PersonaConfig } | undefined {
+function readSharedChannelState(bytes: Uint8Array, path: string, deps: SharedChannelDeps): ValidatedSharedState | undefined {
   const value = parseConfigJsonBytes(bytes, path)
+  return validateSharedChannelValue(value, path, deps)
+}
+/** The reader's predicates, also used on normalized scoped configuration
+ * drafts. Only immutable attempt history can substitute its validated index. */
+interface ValidatedSharedState { state: SharedChannelState; config: PersonaConfig; sourceConfig: PersonaConfig }
+function validateSharedChannelValue(value: unknown, path: string, deps: SharedChannelDeps,
+  attempts: (state: SharedChannelState) => void = validateBotAttempts): ValidatedSharedState | undefined {
   if (!object(value) || value['format'] !== SHARED_CHANNEL_FORMAT) return undefined
   if (!Number.isSafeInteger(value['revision']) || (value['revision'] as number) < 1 ||
       !object(value['source']) || typeof value['sourceBytesBase64'] !== 'string' || !object(value['applied']) || !object(value['personas']) ||
       !object(value['pendingIntent']) || !object(value['outcomes']) || !object(value['retiredIdentities'])) throw new Error('The shared channel authority has an invalid envelope.')
   if (Object.hasOwn(value, 'threadMemoryCreated') && !validThreadMemoryMarker(value['threadMemoryCreated'])) throw new Error('The shared channel authority has an invalid Thread Memory marker.')
   const state = value as unknown as SharedChannelState
-  if (state.recovery !== undefined) validateSharedRecovery(state.recovery)
-  if (Object.hasOwn(state.pendingIntent, 'operator')) validateOperatorIntent(state.pendingIntent['operator'])
-  if (Object.hasOwn(state.outcomes, 'operatorReviews')) validateReviewLedger(state.outcomes['operatorReviews'], state.revision)
-  if (state.recovery?.phase === 'review' && state.recovery.cancelled) {
-    const intent = state.pendingIntent['operator'] as OperatorIntent | undefined
-    if (!intent || intent.requested || reviewLedger(state)?.active || !Object.values(intent.requests).some(record =>
-      record.generation === intent.generation && record.request.action === 'cancel')) throw new Error('Unconfirmed shared recovery cancellation.')
-  }
-  if (state.recovery?.phase === 'active') {
-    const activation = state.recovery.activation
-    const outcome = reviewLedger(state)?.outcomes[activation.fingerprint]
-    if (activation.order > state.revision || outcome?.status !== 'consumed' || outcome.revision !== activation.order) throw new Error('Unconfirmed shared recovery activation.')
-  }
-  if (state.recovery?.phase === 'review' && state.recovery.request.action === 'replace' &&
-      state.sourceBytesBase64 !== state.recovery.request.replacement_source_base64) throw new Error('Changed explicit replacement input.')
+  checkReviewMetadata(state)
   if (state.recovery?.phase === 'review' && state.recovery.request.action === 'restore') {
     const anchorBytes = Buffer.from(state.recovery.anchorBase64!, 'base64')
     // A stage may retain an applied anchor, never another unconfirmed stage.
@@ -496,15 +515,33 @@ function readSharedChannelState(bytes: Uint8Array, path: string, deps: SharedCha
         !Array.isArray(retired.channels) || retired.channels.some(channel => !object(channel) || !CHANNEL_ID_RE.test(channel.id) || !DELIVERY_MODES.includes(channel.delivery)) ||
         new Set(retired.channels.map(channel => channel.id)).size !== retired.channels.length) throw new Error('The shared channel authority has invalid retired identity evidence.')
   }
-  validateBotAttempts(state)
+  attempts(state)
   for (const life of Object.values(state.personas)) checkPersonaHistory(life, state.revision)
   // Both raw inputs obey the final schema, including removed-key rejection.
   const config = sharedAppliedConfig(state, path, deps)
-  checkSourceConfigs(state, sourceBytes, path, deps)
+  const sourceConfig = checkSourceConfigs(state, sourceBytes, path, deps)
   if (!isDeepStrictEqual(parseConfigJsonBytes(sourceBytes, path), state.source)) throw new Error('The shared channel authority has inconsistent reviewed input evidence.')
   if (!isDeepStrictEqual(reviewedFields(state.source), reviewedFields(state.applied))) throw new Error('The shared channel authority has inconsistent reviewed and applied fields.')
   checkAppliedChoices(state, config, deps)
-  return { state, config }
+  return { state, config, sourceConfig }
+}
+/** Same review/intent/recovery predicates for full and metadata-only stages. */
+function checkReviewMetadata(state: SharedChannelState): void {
+  if (state.recovery !== undefined) validateSharedRecovery(state.recovery)
+  if (Object.hasOwn(state.pendingIntent, 'operator')) validateOperatorIntent(state.pendingIntent['operator'])
+  if (Object.hasOwn(state.outcomes, 'operatorReviews')) validateReviewLedger(state.outcomes['operatorReviews'], state.revision)
+  if (state.recovery?.phase === 'review' && state.recovery.cancelled) {
+    const intent = state.pendingIntent['operator'] as OperatorIntent | undefined
+    if (!intent || intent.requested || reviewLedger(state)?.active || !Object.values(intent.requests).some(record =>
+      record.generation === intent.generation && record.request.action === 'cancel')) throw new Error('Unconfirmed shared recovery cancellation.')
+  }
+  if (state.recovery?.phase === 'active') {
+    const activation = state.recovery.activation
+    const outcome = reviewLedger(state)?.outcomes[activation.fingerprint]
+    if (activation.order > state.revision || outcome?.status !== 'consumed' || outcome.revision !== activation.order) throw new Error('Unconfirmed shared recovery activation.')
+  }
+  if (state.recovery?.phase === 'review' && state.recovery.request.action === 'replace' &&
+      state.sourceBytesBase64 !== state.recovery.request.replacement_source_base64) throw new Error('Changed explicit replacement input.')
 }
 /** One persona's own records, its incarnation unique among `incarnations`. */
 function checkPersonaRecords(state: SharedChannelState, key: string, life: SharedPersona, incarnations: Set<string>): void {
@@ -560,11 +597,7 @@ function checkPersonaRecords(state: SharedChannelState, key: string, life: Share
     }
   }
   for (const [id, assignment] of Object.entries(life.assignments)) {
-    if (!CHANNEL_ID_RE.test(id) || !object(assignment) || !DELIVERY_MODES.includes(assignment.delivery) ||
-        !Number.isSafeInteger(assignment.order) || assignment.order < 1 || assignment.order > state.revision ||
-        (assignment.delivery === 'thread_hybrid'
-          ? typeof assignment.threadHybridSince !== 'string' || !assignment.threadHybridSince
-          : Object.hasOwn(assignment, 'threadHybridSince'))) throw new Error('The shared channel authority has an invalid ordered assignment.')
+    checkAssignment(id, assignment, state.revision)
   }
   for (const [id, membership] of Object.entries(life.membership)) {
     if (!CHANNEL_ID_RE.test(id) || !object(membership) || typeof membership.member !== 'boolean' ||
@@ -588,6 +621,13 @@ function checkPersonaRecords(state: SharedChannelState, key: string, life: Share
     }
   }
   if (!key) throw new Error('The shared channel authority has an invalid persona key.')
+}
+function checkAssignment(id: string, assignment: SharedAssignment, revision: number): void {
+  if (!CHANNEL_ID_RE.test(id) || !object(assignment) || !DELIVERY_MODES.includes(assignment.delivery) ||
+      !Number.isSafeInteger(assignment.order) || assignment.order < 1 || assignment.order > revision ||
+      (assignment.delivery === 'thread_hybrid'
+        ? typeof assignment.threadHybridSince !== 'string' || !assignment.threadHybridSince
+        : Object.hasOwn(assignment, 'threadHybridSince'))) throw new Error('The shared channel authority has an invalid ordered assignment.')
 }
 /** One persona's membership history, absence evidence and removal provenance. */
 function checkPersonaHistory(life: SharedPersona, revision: number): void {
@@ -618,18 +658,66 @@ function checkAppliedChoices(state: SharedChannelState, config: PersonaConfig, d
   }
 }
 export function serializeSharedChannelState(state: SharedChannelState): Uint8Array {
-  return Buffer.from(encodeState(state, '\n'))
-}
-/** `JSON.stringify(state, null, 2)` followed by `end`. A sealed state reuses
- * the encodings of the objects it shares with earlier revisions, joined once
- * into the whole text; any other value, or anything the reuse cannot encode
- * exactly, takes the native encoder. */
-function encodeState(state: SharedChannelState, end: string): string {
   if (sealed.has(state) && !('toJSON' in Object.prototype) && !('toJSON' in Array.prototype)) {
-    const out: string[] = []
-    try { encodeSealed(state, 0, out); out.push(end); return out.join('') } catch { /* the native encoder decides */ }
+    try {
+      const out: Uint8Array[] = []
+      encodeEnvelopeBytes(state, 0, out)
+      out.push(Buffer.from('\n'))
+      return Buffer.concat(out)
+    } catch { /* unsupported hooks keep native encoding and full validation */ }
   }
-  return JSON.stringify(state, null, 2) + end
+  nativeEncoded.add(state)
+  return Buffer.from(JSON.stringify(state, null, 2) + '\n')
+}
+/** Root and outcomes are emitted by field so history is never duplicated in
+ * parent caches. Other immutable branches keep their exact UTF-8 bytes. */
+function encodeEnvelopeBytes(value: object, depth: number, out: Uint8Array[]): void {
+  if (!sealed.has(value)) throw new Error(NOT_SEALED_DATA)
+  checkDataContainer(value)
+  if (Object.hasOwn(value, 'toJSON')) throw new Error(NOT_SEALED_DATA)
+  const fields = Object.keys(value), data = value as Record<string, unknown>
+  out.push(Buffer.from('{'))
+  let members = 0
+  for (const key of fields) {
+    const item = data[key]
+    if (item === undefined) continue
+    out.push(Buffer.from((members++ ? ',\n' : '\n') + indent(depth + 1) + JSON.stringify(key) + ': '))
+    if (typeof item !== 'object' || item === null) {
+      let bytes: Buffer
+      if (depth === 0 && key === 'sourceBytesBase64' && typeof item === 'string' && object(data['source'])) {
+        let cached = sourceEncodings.get(data['source'])
+        if (!cached || cached.value !== item) sourceEncodings.set(data['source'], cached = { value: item, bytes: Buffer.from(JSON.stringify(item)) })
+        bytes = cached.bytes
+      } else bytes = Buffer.from(JSON.stringify(item))
+      out.push(bytes)
+    } else if (depth === 0 && key === 'outcomes') encodeEnvelopeBytes(item, depth + 1, out)
+    else {
+      const attempts = sharedAttemptBytes(item, depth + 1)
+      if (attempts) { out.push(attempts); continue }
+      let cached = byteEncodings.get(item)
+      if (!cached || cached.depth !== depth + 1) {
+        const parts: string[] = []
+        encodeSealed(item, depth + 1, parts)
+        byteEncodings.set(item, cached = { depth: depth + 1, bytes: Buffer.from(parts.join('')) })
+      }
+      out.push(cached.bytes)
+    }
+  }
+  out.push(Buffer.from(members ? '\n' + indent(depth) + '}' : '}'))
+}
+/** Full-reader results become immutable once. Narrow drafts mark only their
+ * copied containers; shared branches keep their cached encoding. */
+function prepareCommitted(state: SharedChannelState): SharedChannelState {
+  if (state.outcomes.botAttempts && !isSharedAttemptMap(state.outcomes.botAttempts)) {
+    state = { ...state, outcomes: { ...state.outcomes, botAttempts: sharedAttemptMap(freeze(state.outcomes.botAttempts)) } }
+  }
+  copied.add(state)
+  copied.add(state.outcomes)
+  return freeze(state)
+}
+function sealContainers<T>(value: T, containers: object[]): T {
+  for (const container of containers) copied.add(container)
+  return freeze(value)
 }
 export function initialSharedChannelState(bytes: Uint8Array, config: PersonaConfig, incarnation: () => string = randomUUID, threadHybridSince: () => string = randomUUID): SharedChannelState {
   const raw = parseConfigJsonBytes(bytes, 'prepared configuration') as Record<string, unknown>
@@ -774,11 +862,12 @@ function dropAllSupersededScanRepeats(next: SharedChannelState, before: SharedCh
 // --- Membership transactions: one persona's records, copied on write ---
 
 /** The record maps a membership transaction may change in its persona. */
-const MEMBERSHIP_RECORDS = ['assignments', 'membership', 'membershipEvents', 'leaves', 'removedDestinations', 'membershipEvidence', 'membershipAbsenceConflicts'] as const
+const MEMBERSHIP_RECORDS = ['assignments', 'membership', 'membershipEvents', 'leaves', 'removedDestinations', 'membershipEvidence', 'membershipAbsenceConflicts', 'installationReadiness'] as const
 const MEMBERSHIP_FIELDS: ReadonlySet<string> = new Set<string>([...MEMBERSHIP_RECORDS, 'membershipInventory'])
 /** The field holding the application position of a record in each map. */
 const RECORD_POSITIONS: Readonly<Record<string, string>> = {
   assignments: 'order', membershipEvents: 'order', membershipEvidence: 'recordedOrder', membershipAbsenceConflicts: 'recordedOrder',
+  installationReadiness: 'order',
 }
 const DRAFT_FIELDS: ReadonlySet<string> = new Set(['revision', 'personas', 'applied'])
 const APPLIED_LIST: ReadonlySet<string> = new Set(['personas'])
@@ -817,10 +906,24 @@ function sameExcept(after: object, before: object, except: ReadonlySet<string>):
   const keys = Object.keys(a).filter(key => !except.has(key)), kept = Object.keys(b).filter(key => !except.has(key))
   return keys.length === kept.length && keys.every((key, i) => key === kept[i] && a[key] === b[key])
 }
+/** Scope checks compare data, never user accessors or proxy traps that could
+ * produce different bytes after validation. New leaf values are normalized. */
+function checkDataContainer(value: object): void {
+  if (types.isProxy(value) || Object.getPrototypeOf(value) !== (Array.isArray(value) ? Array.prototype : Object.prototype) ||
+      Object.values(Object.getOwnPropertyDescriptors(value)).some(descriptor => !('value' in descriptor))) throw new Error('Invalid scoped data container.')
+}
+/** Spreading these containers would discard native hooks/descriptors, including
+ * non-enumerable toJSON methods/getters. Detection never invokes a getter. */
+function needsNativeNormalization(value: object): boolean {
+  try { checkDataContainer(value) } catch { return true }
+  return 'toJSON' in value
+}
 /** A membership transaction changes its persona's membership fields and its
  * raw entry's `channels` only; everything else stays the committed objects. */
 function checkMembershipScope(before: SharedChannelState, key: string, draft: MembershipDraft): void {
   const { next, life, raw, index } = draft
+  checkDataContainer(next)
+  checkDataContainer(next.outcomes)
   const list = next.applied['personas'], kept = before.applied['personas'] as unknown[]
   if (!sameExcept(next, before, DRAFT_FIELDS) || !sameExcept(next.personas, before.personas, new Set([key])) || own(next.personas, key) !== life ||
       !sameExcept(next.applied, before.applied, APPLIED_LIST) || !Array.isArray(list) || list.length !== kept.length ||
@@ -881,18 +984,11 @@ function sealMembershipDraft(draft: MembershipDraft): SharedChannelState {
  * change. Every other check reads objects it shares unchanged, bounded only
  * from above by the revision, which grew. The incarnation stays unique
  * because it is unchanged. */
-function checkMembershipDraft(before: SharedChannelState, state: SharedChannelState, key: string, fresh: boolean, path: string, deps: SharedChannelDeps): PersonaConfig {
+function checkMembershipDraft(before: SharedChannelState, state: SharedChannelState, key: string, fresh: boolean, path: string, deps: SharedChannelDeps, index: BotAttemptIndex): PersonaConfig {
   const life = state.personas[key]!
   checkPersonaRecords(state, key, life, new Set())
-  const attempts = state.outcomes.botAttempts
   if (!fresh) validateBotAttempts(state)
-  else if (attempts !== undefined) {
-    // Positions after every earlier one meet no other persona's attempt.
-    const personas: Record<string, SharedPersona> = {}, mine: Record<string, SharedBotAttempt> = {}
-    put(personas, key, life)
-    for (const [id, attempt] of Object.entries(attempts)) if (attempt.key === key) put(mine, id, attempt)
-    validateBotAttempts({ ...state, personas, outcomes: { ...state.outcomes, botAttempts: mine } })
-  }
+  else index.check(state, key)
   checkPersonaHistory(life, state.revision)
   const config = sharedAppliedConfig(state, path, deps)
   const saved = before.personas[key]!, destination = rawPersona(state, key)['permission_prompts'] as string
@@ -1076,6 +1172,12 @@ export interface SharedChannelAuthority {
    * restart. Never accepts an external snapshot or publishes staged choices. */
   stageRestoration(request: SharedRecoveryRequest, evidence: Uint8Array, prepared: Uint8Array): SharedMutationResult
   snapshot(): SharedChannelState
+  /** Detached metadata only; never exports or clones attempt history. */
+  reviewState(): Pick<SharedChannelState, 'outcomes' | 'pendingIntent' | 'recovery'>
+  reviewDependency(): string
+  recoverySnapshot(): SharedRecoveryRecord | undefined
+  personaKeys(): string[]
+  membershipSetup(key: string, installation: string): MembershipSetupRecord | undefined
   /** One persona's published state, cloned without the rest of the authority. */
   personaSnapshot(key: string): SharedPersona | undefined
   /** Detached membership records only; an omitted channel list selects all.
@@ -1122,7 +1224,11 @@ export interface SharedChannelAuthority {
    * Callback errors and stale revisions write nothing. A batch may reserve
    * multiple ordered positions in one write; the callback receives the final
    * position and publishes only that revision. */
-  transact(expectedRevision: number, change: (next: SharedChannelState, order: number) => void, orderSpan?: number, publish?: (config: PersonaConfig) => void): SharedMutationResult
+  transact(expectedRevision: number, change: (next: SharedChannelState, order: number) => void, orderSpan?: number, publish?: (config: PersonaConfig) => void, scope?: 'review'): SharedMutationResult
+  /** Metadata-only scope: intent, review ledger and recovery cancellation. */
+  transactReview(expectedRevision: number, change: (next: SharedChannelState, order: number) => void): SharedMutationResult
+  /** Reviewed configuration/recovery scope keeps all attempt records unchanged. */
+  transactConfiguration(expectedRevision: number, change: (next: SharedChannelState, order: number) => void, orderSpan?: number, publish?: (config: PersonaConfig) => void): SharedMutationResult
   /** `transact` for one persona's membership, copying only what it changes.
    * `change` may add, replace or delete entries of that persona's record maps
    * (assignments, membership, events, leaves, removed destinations, evidence,
@@ -1132,6 +1238,8 @@ export interface SharedChannelAuthority {
   transactMembership(key: string, expectedRevision: number, change: (next: SharedChannelState, order: number) => void, orderSpan?: number): SharedMutationResult
   previewReviewed(bytes: Uint8Array, assignments?: readonly ReviewedAssignment[]): PersonaConfig
   planReviewed(bytes: Uint8Array, assignments?: readonly ReviewedAssignment[]): ReviewedChannelPlan
+  /** Frozen preview for the reload owner; the ordinary API returns a copy. */
+  readReviewedPlan(bytes: Uint8Array, assignments?: readonly ReviewedAssignment[]): Readonly<ReviewedChannelPlan>
   applyReviewed(bytes: Uint8Array, expectedRevision: number, assignments?: readonly ReviewedAssignment[]): SharedMutationResult
   commitReview(bytes: Uint8Array, expectedRevision: number, review: DurableReview, assignments: readonly ReviewedAssignment[], publish?: (config: PersonaConfig) => void): SharedMutationResult
   observeMembership(key: string, incarnation: string, observation: VerifiedSharedMembership, expectedRevision: number): SharedMutationResult
@@ -1151,9 +1259,66 @@ export interface SharedChannelAuthority {
   clearThreadMemoryCreated(key: string): ThreadMemoryMarkerResult
 }
 export function createSharedChannelAuthority(path: string, initial: SharedChannelState, deps: SharedChannelDeps = {}): SharedChannelAuthority {
-  const validated = parseSharedChannelState(serializeSharedChannelState(initial), path, deps)
+  const validated = readSharedChannelState(serializeSharedChannelState(initial), path, deps)
   if (!validated) throw new Error('The shared channel authority has an invalid envelope.')
-  let current = validated
+  let current = prepareCommitted(validated.state)
+  let currentConfig = freeze(validated.config)
+  let currentSourceConfig = freeze(validated.sourceConfig)
+  let currentSourceBase64 = current.sourceBytesBase64
+  let currentSourceBytes = Buffer.from(currentSourceBase64, 'base64')
+  let attemptIndex = new BotAttemptIndex(current)
+  let uncertainInstall: (() => void) | undefined
+  let dependency: { source: string; applied: object; personas: object; retired: object; boundary: string | undefined; value: string } | undefined
+  let reviewedPlan: { bytes: Buffer; assignments: string; source: object; personas: object; retired: object;
+    recovery: SharedRecoveryRecord | undefined; locations: string; plan: ReviewedChannelPlan } | undefined
+  function reviewedLocations(config: PersonaConfig): string {
+    const declarations = [...currentConfig.personas, ...config.personas, ...Object.values(current.retiredIdentities).map(record => record.declaration)]
+    return JSON.stringify(declarations.map(value => [value.credentials_file, value.working_directory].map(path =>
+      [resolveRealPath(path), resolveRealPath(path, deps.realpath)])))
+  }
+  function reviewedDraft(revision: number): SharedChannelState {
+    return { ...current, revision, retiredIdentities: { ...current.retiredIdentities }, pendingIntent: clone(current.pendingIntent),
+      outcomes: { ...current.outcomes, ...(reviewLedger(current) ? { operatorReviews: clone(reviewLedger(current)!) } : {}) },
+      ...(current.recovery ? { recovery: clone(current.recovery) } : {}) }
+  }
+  function checkCurrentDeclarations(state: SharedChannelState): void {
+    for (const persona of currentConfig.personas) {
+      const life = own(state.personas, persona.key)
+      if (!life || !sameSharedDeclaration(life.declaration, persona, deps.realpath)) throw new Error('The shared channel authority has inconsistent persona identities.')
+    }
+  }
+  /** Native normalization may invoke hooks on the root/outcomes. The index
+   * belongs to this exact dictionary (including absence), never its replacement. */
+  function restoreAttemptHistory(state: SharedChannelState, kept: SharedChannelOutcomes['botAttempts']): void {
+    if (!object(state) || !object(state.outcomes)) throw new Error('Invalid normalized shared authority outcomes.')
+    if (kept === undefined) delete state.outcomes.botAttempts
+    else if (state.outcomes.botAttempts !== kept) put(state.outcomes, 'botAttempts', kept)
+  }
+  /** Unusual callback-installed accessors/toJSON keep native encoding behavior.
+   * Validate those exact bytes with the full reader before any durable write;
+   * ordinary normalized scopes use the indexed proof and cached fragments. */
+  function stageBytes(state: SharedChannelState, config: PersonaConfig, sourceConfig?: PersonaConfig): { bytes: Uint8Array; state: SharedChannelState; config: PersonaConfig; sourceConfig?: PersonaConfig } {
+    const bytes = serializeSharedChannelState(state)
+    if (nativeEncoded.has(state)) {
+      const checked = readSharedChannelState(bytes, path, deps)
+      if (!checked) throw new Error('Invalid shared authority format.')
+      if (Object.hasOwn(checked.state.outcomes, 'botAttempts') !== Object.hasOwn(state.outcomes, 'botAttempts') ||
+          !isDeepStrictEqual(checked.state.outcomes.botAttempts, state.outcomes.botAttempts)) {
+        throw new Error('Native encoding changed protected bot attempt history.')
+      }
+      config = checked.config
+      sourceConfig = checked.sourceConfig
+    }
+    return { bytes, state, config, sourceConfig }
+  }
+  function reviewDependency(): string {
+    if (nativeEncoded.has(current) || !dependency || dependency.source !== current.sourceBytesBase64 || dependency.applied !== current.applied ||
+        dependency.personas !== current.personas || dependency.retired !== current.retiredIdentities || dependency.boundary !== current.recovery?.boundary) {
+      dependency = { source: current.sourceBytesBase64, applied: current.applied, personas: current.personas,
+        retired: current.retiredIdentities, boundary: current.recovery?.boundary, value: sharedReviewDependency(current) }
+    }
+    return dependency.value
+  }
   let readable = true
   let uncertain: SharedChannelState | undefined
   let uncertainPublish: ((config: PersonaConfig) => void) | undefined
@@ -1166,6 +1331,7 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
   const listeners = new Set<(config: PersonaConfig) => void>()
   /** Listeners in `listeners` that read no configuration. */
   const configless = new Set<(config: PersonaConfig) => void>()
+  const configlessPublishers = new WeakSet<(config: PersonaConfig) => void>()
   const watchers = new Set<() => void>()
   let pendingWatchOutcomes = 0
   let watching = false
@@ -1189,9 +1355,18 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
   const readability = (): SharedReadability => ({ current, uncertain, readable, recoveryStaged })
   let stampFacts = readability()
   let deliveredThreadView = threadViewSignature(readability())
+  let signatureFacts = readability()
+  let signatureHolds = JSON.stringify([current.recovery?.phase, reviewLedger(current)?.retirement?.recovery.keys])
   function deliverThreadView(always: boolean): void {
     const facts = readability()
-    const signature = threadViewSignature(facts)
+    const holds = JSON.stringify([current.recovery?.phase, reviewLedger(current)?.retirement?.recovery.keys])
+    const same = !nativeEncoded.has(current) && !nativeEncoded.has(signatureFacts.current) &&
+      signatureFacts.current.personas === current.personas && signatureFacts.current.applied === current.applied &&
+      signatureFacts.uncertain === facts.uncertain && signatureFacts.readable === facts.readable &&
+      signatureFacts.recoveryStaged === facts.recoveryStaged && holds === signatureHolds
+    const signature = same ? deliveredThreadView : threadViewSignature(facts)
+    signatureFacts = facts
+    signatureHolds = holds
     if (!always && signature === deliveredThreadView) return
     deliveredThreadView = signature
     const view = captureThreadView(facts)
@@ -1203,18 +1378,38 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
   // evidence always wins; this map is never recovery authority after restart.
   const attemptsInFlight = new Map<string, { binding: BotAttemptBinding; kind: 'pending' | 'unresolved' }>()
   function writeBotOutcome(record: SharedBotAttempt, activate = false, publish?: (config: PersonaConfig) => void): SharedMutationResult {
-    return authority.transact(authority.revision, (next, order) => {
-      const life = own(next.personas, record.key)
-      if (life?.incarnation !== record.incarnation || authority.reviewHeld(record.key)) throw new Error('Obsolete bot attempt life.')
-      if (record.status === 'pending') record = { ...record, startedOrder: order }
-      else record = { ...record, resolvedOrder: order }
-      next.outcomes.botAttempts ??= {}
-      put(next.outcomes.botAttempts, botAttemptKey(record), record)
+    return reportOutcome(() => commit(authority.revision, 1, publish, order => {
+      checkCurrentDeclarations(current)
+      const original = own(current.personas, record.key)
+      if (original?.incarnation !== record.incarnation || authority.reviewHeld(record.key)) throw new Error('Obsolete bot attempt life.')
+      record = freeze(reparse(record.status === 'pending' ? { ...record, startedOrder: order } : { ...record, resolvedOrder: order }) as SharedBotAttempt)
+      const id = botAttemptKey(record), previous = own(current.outcomes.botAttempts ?? {}, id)
+      if (record.status === 'pending' ? previous !== undefined : !previous || previous.status !== 'pending' ||
+          !sameBotAttempt(previous, record) || previous.startedOrder !== record.startedOrder) throw new Error('Obsolete bot attempt binding.')
+      const outcomes = { ...current.outcomes, botAttempts: withSharedAttempt(current.outcomes.botAttempts ?? sharedAttemptMap({}), id, record) }
+      let next: SharedChannelState = { ...current, revision: order, outcomes }
+      let config = currentConfig
+      const containers: object[] = [next, outcomes]
       if (activate && record.status === 'applied') {
-        putAssignment(life.assignments, record.channel, record.delivery, order, mint)
-        rawPersona(next, record.key)['channels'] = Object.entries(life.assignments).map(([id, assignment]) => ({ id, delivery: assignment.delivery }))
+        const assignments = { ...original.assignments }
+        putAssignment(assignments, record.channel, record.delivery, order, mint)
+        const choice = reparse(assignments[record.channel]) as SharedAssignment
+        checkAssignment(record.channel, choice, order)
+        put(assignments, record.channel, choice)
+        const life = { ...original, assignments }, personas = { ...current.personas }
+        put(personas, record.key, life)
+        const list = (current.applied['personas'] as Record<string, unknown>[]).slice(), index = rawPersonaIndex(list, record.key)
+        const channels = Object.entries(assignments).map(([id, assignment]) => ({ id, delivery: assignment.delivery }))
+        list[index] = { ...list[index]!, channels }
+        const applied = { ...current.applied, personas: list }
+        next = { ...next, personas, applied }
+        config = { ...currentConfig, personas: currentConfig.personas.map(persona => persona.key === record.key ? { ...persona, channels } : persona) }
+        containers.push(next, personas, life, assignments, applied, list, list[index]!)
       }
-    }, 1, publish)
+      validateBotAttemptRecord(next, id, record)
+      const state = sealContainers(next, containers)
+      return { ...stageBytes(state, config), install: () => attemptIndex.add(record) }
+    }))
   }
   function performBotAttempt(key: string, incarnation: string, request: ChannelDeliveryAttemptRequest,
     authorize: () => BotAttemptAuthorization, applied?: (outcome: Extract<SharedBotAttempt, { status: 'applied' }>) => void): BotAttemptResult {
@@ -1242,6 +1437,7 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
         const committed = own(current.outcomes.botAttempts!, id)
         if (committed?.status === 'applied') applied?.(clone(committed))
       } : undefined
+      if (publish) configlessPublishers.add(publish)
       const result = writeBotOutcome(outcome, outcome.status === 'applied', publish)
       if (result.kind === 'applied') {
         const recorded = botAttemptResult(own(current.outcomes.botAttempts!, id)!)
@@ -1264,17 +1460,18 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
   function writeThreadMemoryMarker(key: string, created: boolean): ThreadMemoryMarkerResult {
     if (!readable || recoveryStaged || heldByReview(current, key) || mutating || (created && !own(current.personas, key))) return { kind: 'failed' }
     if ((own(current.threadMemoryCreated ?? {}, key) === true) === created) return { kind: 'saved' }
-    const next = clone(current)
-    const markers = next.threadMemoryCreated ?? {}
+    const next = { ...current }
+    const markers = { ...current.threadMemoryCreated }
     if (created) put(markers, key, true)
     else delete markers[key]
     if (Object.keys(markers).length) next.threadMemoryCreated = markers
     else delete next.threadMemoryCreated
     mutating = true
     try {
-      const bytes = serializeSharedChannelState(next)
-      const saved = parseSharedChannelState(bytes, path, deps)
-      if (!saved) throw new Error('Invalid shared authority format.')
+      checkCurrentDeclarations(current)
+      if (next.threadMemoryCreated !== undefined && !validThreadMemoryMarker(next.threadMemoryCreated)) throw new Error('Invalid Thread Memory marker.')
+      const saved = sealContainers(next, [next, markers])
+      const { bytes } = stageBytes(saved, currentConfig)
       write(path, bytes)
       current = saved
       return { kind: 'saved' }
@@ -1292,10 +1489,13 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
     // the configuration the commit validated, copied for the publisher and
     // for each listener but the last that reads it. A configuration-free
     // listener still runs only once `current` parses.
-    let config = installed
-    const parsed = (): PersonaConfig => config ??= authority.config()
+    let config: PersonaConfig | undefined
+    const parsed = (): PersonaConfig => config ??= installed ? clone(installed) : authority.config()
     // Runtime publication precedes observers while the mutation lock is held.
-    try { publish?.(clone(parsed())) } catch { /* durability cannot be undone by a publisher */ }
+    try {
+      if (publish && configlessPublishers.has(publish)) (publish as () => void)()
+      else publish?.(clone(parsed()))
+    } catch { /* durability cannot be undone by a publisher */ }
     // A membership commit shares every other persona, raw entry and field.
     const changed = key === undefined
       ? !isDeepStrictEqual(before.applied, current.applied) || !isDeepStrictEqual(before.personas, current.personas) ||
@@ -1320,7 +1520,7 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
   /** Every transaction's one order: reserve its positions, stage the next
    * state and its bytes, write them durably, install, then publish. */
   function commit(expectedRevision: number, orderSpan: number, publish: ((config: PersonaConfig) => void) | undefined,
-    stage: (revision: number) => { bytes: Uint8Array; state: SharedChannelState; config: PersonaConfig }, key?: string): SharedMutationResult {
+    stage: (revision: number) => { bytes: Uint8Array; state: SharedChannelState; config: PersonaConfig; sourceConfig?: PersonaConfig; install?: () => void }, key?: string): SharedMutationResult {
     const syncStart = testSyncWorkStart()
     try {
       if (!readable) return { kind: 'unresolved', revision: current.revision }
@@ -1329,14 +1529,25 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
       const before = current
       const appliedRevision = current.revision + orderSpan
       let prepared: SharedChannelState | undefined, installed: PersonaConfig | undefined
+      let install: (() => void) | undefined
       mutating = true
       failure = ''
       try {
         const staged = stage(appliedRevision)
         prepared = staged.state
+        installed = freeze(staged.config)
+        install = () => {
+          currentConfig = installed!
+          if (staged.sourceConfig) currentSourceConfig = freeze(staged.sourceConfig)
+          if (currentSourceBase64 !== staged.state.sourceBytesBase64) {
+            currentSourceBase64 = staged.state.sourceBytesBase64
+            currentSourceBytes = Buffer.from(currentSourceBase64, 'base64')
+          }
+          staged.install?.()
+        }
         write(path, staged.bytes)
         current = staged.state
-        installed = staged.config
+        install()
       } catch (err) {
         mutating = false
         failure = errnoSuffix(err)
@@ -1347,6 +1558,7 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
           unreadableCause = 'unsynced'
           uncertain = prepared
           uncertainPublish = publish
+          uncertainInstall = install
           deliverThreadView(false)
           return { kind: 'unresolved', revision: current.revision }
         }
@@ -1364,7 +1576,11 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
   function candidateInput(bytes: Uint8Array): PersonaConfig {
     // Exact recorded input keeps record-start collision recovery available
     // for credential-only reviews. Edited input still needs full validation.
-    const recorded = Buffer.from(bytes).equals(authority.sourceBytes())
+    const recorded = Buffer.from(bytes).equals(currentSourceBytes)
+    if (recorded && !nativeEncoded.has(current)) {
+      checkCurrentDeclarations(current)
+      return currentSourceConfig
+    }
     return parsePersonaConfigBytes(bytes, deps.sourcePath ?? path, dirname(path), {
       home: deps.home, record: recorded, removedDestination: persona => authority.validatesRemovedDestination(persona),
     })
@@ -1389,12 +1605,14 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
     })
   }
   function prepareReviewed(next: SharedChannelState, order: number, bytes: Uint8Array, explicit: readonly ReviewedAssignment[], effects?: ReviewedChannelEffect[]): void {
+    const recorded = Buffer.from(bytes).equals(currentSourceBytes) && !nativeEncoded.has(current)
     const candidate = candidateInput(bytes)
-    const source = parseConfigJsonBytes(bytes, deps.sourcePath ?? path) as Record<string, unknown>
-    const oldSource = parsePersonaConfigBytes(rawBytes(current.source), path, dirname(path), {
+    const source = recorded ? { ...current.source, personas: (current.source['personas'] as Record<string, unknown>[]).map(persona => ({ ...persona })) }
+      : parseConfigJsonBytes(bytes, deps.sourcePath ?? path) as Record<string, unknown>
+    const oldSource = !nativeEncoded.has(current) ? currentSourceConfig : parsePersonaConfigBytes(rawBytes(current.source), path, dirname(path), {
       home: deps.home, record: true, removedDestination: persona => authority.validatesRemovedDestination(persona),
     })
-    const oldConfig = authority.config()
+    const oldConfig = currentConfig
     const assignmentKeys = new Set<string>()
     for (const assignment of explicit) {
       const key = JSON.stringify([assignment.key, assignment.channel])
@@ -1421,7 +1639,7 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
     for (const persona of candidate.personas) {
       const oldLife = own(current.personas, persona.key)
       const same = oldLife && sameSharedDeclaration(oldLife.declaration, persona, deps.realpath)
-      const life: SharedPersona = same ? clone(oldLife) : {
+      const life: SharedPersona = same ? { ...oldLife, assignments: { ...oldLife.assignments }, removedDestinations: { ...oldLife.removedDestinations } } : {
         incarnation: reviewedReplacementIncarnation(current, path, persona, deps.realpath), resetOrder: order, createdAt: (deps.now ?? Date.now)(), declaration: declaration(persona), assignments: {}, membership: {}, membershipEvents: {}, leaves: {}, removedDestinations: {},
       }
       life.declaration = declaration(persona)
@@ -1445,6 +1663,11 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
         if (assignment.incarnation !== undefined && assignment.incarnation !== life.incarnation) throw new Error('Obsolete reviewed assignment.')
         if (!CHANNEL_ID_RE.test(assignment.channel) || !DELIVERY_MODES.includes(assignment.delivery)) throw new Error('Invalid reviewed assignment.')
         if (assignment.absenceReplacement !== undefined) {
+          life.membership = { ...life.membership }
+          life.membershipEvents = { ...life.membershipEvents }
+          life.leaves = { ...life.leaves }
+          life.membershipAbsenceConflicts = { ...life.membershipAbsenceConflicts }
+          life.replacedAbsences = { ...life.replacedAbsences }
           const binding = assignment.absenceReplacement
           if (!same || absenceReplacementBinding(current, persona.key, assignment.channel) !== binding) throw new Error('Obsolete absence replacement.')
           const conflict = life.membershipAbsenceConflicts![assignment.channel]!
@@ -1488,10 +1711,72 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
     next.personas = personas
     next.applied = source
     // Preserve the submitted source independently of the merged result.
-    next.source = parseConfigJsonBytes(bytes, deps.sourcePath ?? path) as Record<string, unknown>
-    next.sourceBytesBase64 = Buffer.from(bytes).toString('base64')
+    next.source = recorded ? current.source : parseConfigJsonBytes(bytes, deps.sourcePath ?? path) as Record<string, unknown>
+    next.sourceBytesBase64 = recorded ? currentSourceBase64 : Buffer.from(bytes).toString('base64')
     // Intent consumption belongs to its explicit review transaction. Recording
     // these bytes alone cannot consume unrelated pending work or outcomes.
+  }
+  function transactReviewScoped(expectedRevision: number, change: (next: SharedChannelState, order: number) => void): SharedMutationResult {
+    if (current.recovery?.phase === 'review') return authority.transact(expectedRevision, change)
+    return reportOutcome(() => commit(expectedRevision, 1, undefined, revision => {
+      const kept = current.outcomes.botAttempts
+      const next = { ...current, revision, pendingIntent: clone(current.pendingIntent),
+        outcomes: { ...current.outcomes, ...(reviewLedger(current) ? { operatorReviews: clone(reviewLedger(current)!) } : {}) },
+        ...(current.recovery ? { recovery: clone(current.recovery) } : {}) }
+      change(next, revision)
+      checkDataContainer(next)
+      checkDataContainer(next.outcomes)
+      if (next.revision !== revision || !object(next.outcomes) || !object(next.pendingIntent) ||
+          !sameExcept(next, current, new Set(['revision', 'outcomes', 'pendingIntent', 'recovery'])) ||
+          !sameExcept(next.outcomes, current.outcomes, new Set(['operatorReviews']))) throw new Error('Invalid review transaction scope.')
+      next.pendingIntent = reparse(next.pendingIntent) as Record<string, unknown>
+      if (!object(next.pendingIntent)) throw new Error('Invalid review transaction intent.')
+      if (Object.hasOwn(next.outcomes, 'operatorReviews')) {
+        const ledger = reparse(next.outcomes.operatorReviews)
+        if (ledger === undefined) delete next.outcomes.operatorReviews
+        else next.outcomes.operatorReviews = ledger as ReviewLedger
+      }
+      if (next.recovery !== undefined) next.recovery = reparse(next.recovery) as SharedRecoveryRecord
+      else delete next.recovery
+      restoreAttemptHistory(next, kept)
+      // Hooks above may also mutate the draft while returning metadata. Recheck
+      // the scope after their last execution, before borrowing any old proof.
+      checkDataContainer(next)
+      checkDataContainer(next.outcomes)
+      if (next.revision !== revision || !object(next.pendingIntent) ||
+          !sameExcept(next, current, new Set(['revision', 'outcomes', 'pendingIntent', 'recovery'])) ||
+          !sameExcept(next.outcomes, current.outcomes, new Set(['operatorReviews']))) throw new Error('Invalid normalized review transaction scope.')
+      checkCurrentDeclarations(next)
+      checkReviewMetadata(next)
+      for (const outcome of Object.values(reviewLedger(next)?.outcomes ?? {})) attemptIndex.checkPosition(outcome.revision)
+      // The callback can introduce a stage from an ordinary/active state. Its
+      // anchor and restoration facts need the same predicates as a full read.
+      const checked = next.recovery?.phase === 'review'
+        ? validateSharedChannelValue(next, path, deps, state => attemptIndex.check(state)) : undefined
+      if (next.recovery?.phase === 'review' && !checked) throw new Error('Invalid staged review transaction.')
+      const state = sealContainers(next, [next, next.outcomes, next.pendingIntent])
+      return stageBytes(state, checked?.config ?? currentConfig, checked?.sourceConfig)
+    }))
+  }
+  function readReviewedPlan(bytes: Uint8Array, explicit: readonly ReviewedAssignment[] = []): Readonly<ReviewedChannelPlan> {
+    if (!readable) throw new Error('The shared channel outcome is unresolved; preserve its evidence and restore trustworthy state before reviewing another application.')
+    const assignments = JSON.stringify(explicit)
+    if (!nativeEncoded.has(current) && reviewedPlan && reviewedPlan.source === current.source && reviewedPlan.personas === current.personas &&
+        reviewedPlan.retired === current.retiredIdentities && reviewedPlan.recovery === current.recovery && reviewedPlan.assignments === assignments &&
+        reviewedPlan.bytes.equals(Buffer.from(bytes)) && reviewedPlan.locations === reviewedLocations(reviewedPlan.plan.config)) return reviewedPlan.plan
+    const next = reviewedDraft(current.revision + (explicit.some(a => a.absenceReplacement !== undefined) ? 2 : 1))
+    const channels: ReviewedChannelEffect[] = []
+    prepareReviewed(next, next.revision, bytes, explicit, channels)
+    // Exact recorded input with no declaration and the same lives preserves
+    // every applied field/choice. The source and applied predicates established
+    // that equality on read; preview merging above only copied these choices.
+    const sameApplied = explicit.length === 0 && !nativeEncoded.has(current) && Buffer.from(bytes).equals(currentSourceBytes) &&
+      Object.keys(next.personas).length === Object.keys(current.personas).length &&
+      Object.entries(next.personas).every(([key, life]) => life.incarnation === current.personas[key]?.incarnation)
+    const plan = { config: sameApplied ? currentConfig : sharedAppliedConfig(next, path, deps), channels }
+    reviewedPlan = { bytes: Buffer.from(bytes), assignments, source: current.source, personas: current.personas,
+      retired: current.retiredIdentities, recovery: current.recovery, locations: reviewedLocations(plan.config), plan: freeze(plan) }
+    return reviewedPlan.plan
   }
   const authority: SharedChannelAuthority = {
     path,
@@ -1522,6 +1807,8 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
           }
           write(path, bytes)
           current = recovered
+          uncertainInstall?.()
+          uncertainInstall = undefined
           uncertain = undefined
           uncertainPublish = undefined
           readable = true
@@ -1574,6 +1861,15 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
       })
     },
     snapshot: () => clone(current),
+    reviewState: () => ({ outcomes: { ...(reviewLedger(current) ? { operatorReviews: clone(reviewLedger(current)!) } : {}) },
+      pendingIntent: clone(current.pendingIntent), ...(current.recovery ? { recovery: clone(current.recovery) } : {}) }),
+    reviewDependency,
+    recoverySnapshot: () => current.recovery && clone(current.recovery),
+    personaKeys: () => Object.keys(current.personas),
+    membershipSetup: (key, installation) => {
+      const record = own(own(current.personas, key)?.installationReadiness ?? {}, installation)
+      return record && clone(record)
+    },
     personaSnapshot: key => { const life = own(current.personas, key); return life && clone(life) },
     membershipSnapshot(key, channels) {
       const life = own(current.personas, key)
@@ -1590,7 +1886,7 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
       Object.entries(life.replacedAbsences ?? {}).map(([binding, replacement]) =>
         ({ key, incarnation: life.incarnation, binding, channel: replacement.channel }))),
     inspectMembershipHistory: (key, read) => read(own(current.personas, key)),
-    config: () => sharedAppliedConfig(current, path, deps),
+    config: () => nativeEncoded.has(current) ? sharedAppliedConfig(current, path, deps) : clone(currentConfig),
     choice: (key, channel) => { const life = own(current.personas, key); return life ? own(life.assignments, channel)?.delivery : undefined },
     channels: key => { const life = own(current.personas, key); return life ? Object.keys(life.assignments).sort() : [] },
     lookupBotAttempt(key, incarnation, request) {
@@ -1613,7 +1909,7 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
     threadMemoryCreatedKeys: () => Object.keys(current.threadMemoryCreated ?? {}).sort(),
     setThreadMemoryCreated: key => writeThreadMemoryMarker(key, true),
     clearThreadMemoryCreated: key => writeThreadMemoryMarker(key, false),
-    sourceBytes: () => Buffer.from(current.sourceBytesBase64, 'base64'),
+    sourceBytes: () => Buffer.from(currentSourceBytes),
     incarnation: key => own(current.personas, key)?.incarnation,
     reviewHeld: key => heldByReview(current, key),
     lifetime: (key, channel) => sharedChannelLifetime(current, key, channel),
@@ -1645,7 +1941,7 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
       try { if (intent.requested) validateDeclarations(intent, bytes) } catch { return answer('invalid') }
       intent.generation++
       put(intent.requests, request.request_id, { request, generation: intent.generation })
-      const result = authority.transact(authority.revision, (next, order) => {
+      const result = authority.transactReview(authority.revision, (next, order) => {
         put(next.pendingIntent, 'operator', intent)
         if (request.action === 'cancel' && next.recovery?.phase === 'review' && next.recovery.request.action === 'replace') {
           next.recovery.cancelled = true
@@ -1654,7 +1950,8 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
       })
       return answer(result.kind === 'applied' ? 'recorded' : result.kind)
     },
-    transact(expectedRevision, change, orderSpan = 1, publish) {
+    transact(expectedRevision, change, orderSpan = 1, publish, scope) {
+      if (scope === 'review') return orderSpan === 1 ? transactReviewScoped(expectedRevision, change) : { kind: 'failed', revision: current.revision }
       return reportOutcome(() => commit(expectedRevision, orderSpan, publish, revision => {
         const next = clone(current)
         next.revision = revision
@@ -1664,7 +1961,33 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
         const bytes = serializeSharedChannelState(next)
         const published = readSharedChannelState(bytes, path, deps)
         if (!published) throw new Error('Invalid shared authority format.')
-        return { bytes, ...published }
+        const state = prepareCommitted(published.state), index = new BotAttemptIndex(state)
+        return { ...stageBytes(state, published.config, published.sourceConfig), install: () => { attemptIndex = index } }
+      }))
+    },
+    transactReview(expectedRevision, change) {
+      return authority.transact(expectedRevision, change, 1, undefined, 'review')
+    },
+    transactConfiguration(expectedRevision, change, orderSpan = 1, publish) {
+      if (current.recovery?.phase === 'review') return authority.transact(expectedRevision, change, orderSpan, publish)
+      return reportOutcome(() => commit(expectedRevision, orderSpan, publish, revision => {
+        const kept = current.outcomes.botAttempts
+        const next = reviewedDraft(revision)
+        change(next, revision)
+        if (next.revision !== revision || next.outcomes.botAttempts !== kept) throw new Error('Invalid configuration transaction scope.')
+        dropAllSupersededScanRepeats(next, current)
+        const native = needsNativeNormalization(next) || needsNativeNormalization(next.outcomes)
+        const normalized = reparse(native ? next : { ...next, outcomes: { ...next.outcomes, botAttempts: undefined } }) as SharedChannelState
+        // Ordinary normalization omits the protected dictionary. If a native
+        // hook ran or supplied another dictionary, fully validate its result
+        // before restoring our history; the current index cannot prove it.
+        if ((native || (object(normalized) && object(normalized.outcomes) && Object.hasOwn(normalized.outcomes, 'botAttempts'))) &&
+            !validateSharedChannelValue(normalized, path, deps)) throw new Error('Invalid normalized shared authority format.')
+        restoreAttemptHistory(normalized, kept)
+        const checked = validateSharedChannelValue(normalized, path, deps, state => attemptIndex.check(state))
+        if (!checked) throw new Error('Invalid shared authority format.')
+        const state = prepareCommitted(checked.state)
+        return stageBytes(state, checked.config, checked.sourceConfig)
       }))
     },
     transactMembership(key, expectedRevision, change, orderSpan = 1) {
@@ -1685,10 +2008,14 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
         checkMembershipScope(before, key, draft)
         dropSupersededScanRepeats(draft.life, before.personas[key])
         const fresh = settleMembershipDraft(before.personas[key]!, rawPersona(before, key), draft, before.revision)
-        const config = checkMembershipDraft(before, draft.next, key, fresh, path, deps)
+        const config = checkMembershipDraft(before, draft.next, key, fresh, path, deps, attemptIndex)
+        // Normalization/validation may execute a callback-installed hook. It
+        // cannot turn a membership write into a different protected scope.
+        if (draft.next.revision !== revision) throw new Error('Invalid normalized shared application order.')
+        checkMembershipScope(before, key, draft)
         const state = sealMembershipDraft(draft)
         // The same encoding of the same keys and values as a whole copy.
-        return { bytes: serializeSharedChannelState(state), state, config }
+        return stageBytes(state, config)
       }, key))
     },
     observeMembership(key, incarnation, observation, expectedRevision) {
@@ -1711,23 +2038,17 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
     previewReviewed(bytes, explicit = []) {
       return authority.planReviewed(bytes, explicit).config
     },
-    planReviewed(bytes, explicit = []) {
-      if (!readable) throw new Error('The shared channel outcome is unresolved; preserve its evidence and restore trustworthy state before reviewing another application.')
-      const next = clone(current)
-      next.revision += explicit.some(a => a.absenceReplacement !== undefined) ? 2 : 1
-      const channels: ReviewedChannelEffect[] = []
-      prepareReviewed(next, next.revision, bytes, explicit, channels)
-      return { config: sharedAppliedConfig(next, path, deps), channels }
-    },
+    readReviewedPlan,
+    planReviewed: (bytes, explicit = []) => clone(readReviewedPlan(bytes, explicit)),
     applyReviewed(bytes, expectedRevision, explicit = []) {
-      return authority.transact(expectedRevision, (next, order) => {
+      return authority.transactConfiguration(expectedRevision, (next, order) => {
         prepareReviewed(next, order, bytes, explicit)
       }, explicit.some(a => a.absenceReplacement !== undefined) ? 2 : 1)
     },
     commitReview(bytes, expectedRevision, review, assignments, publish) {
-      if (!reviewMatches(current, review, true) || sharedReviewDependency(current) !== review.dependency ||
+      if (!reviewMatches(current, review, true) || reviewDependency() !== review.dependency ||
           reloadFingerprint(bytes, []) !== review.sourceHash) return { kind: 'stale', revision: current.revision }
-      return authority.transact(expectedRevision, (next, order) => {
+      return authority.transactConfiguration(expectedRevision, (next, order) => {
         if (!isDeepStrictEqual(assignments, authority.declaredAssignments(bytes))) throw new Error('Mismatched reviewed assignments.')
         prepareReviewed(next, order, bytes, assignments)
         consumeReview(next, review, order)

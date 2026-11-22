@@ -123,8 +123,7 @@ export function createMembershipReadiness(deps: MembershipReadinessDeps): Member
     let setup = unknownSetup(identity ? 'manual-evidence-missing' : 'installation-unverified', identity)
     if (!deps.authority.readable) setup = unknownSetup('shared-state-unreadable', identity)
     else if (identity) {
-      const life = deps.authority.snapshot().personas[key]
-      const record = life?.installationReadiness?.[slackInstallationKey(identity)]
+      const record = deps.authority.membershipSetup(key, slackInstallationKey(identity))
       if (record) {
         const missingSubscriptions = MEMBERSHIP_REQUIRED_SUBSCRIPTIONS.filter(event => record.subscriptions[event] === 'missing')
         const unknownSubscriptions = MEMBERSHIP_REQUIRED_SUBSCRIPTIONS.filter(event => record.subscriptions[event] === 'unknown')
@@ -157,7 +156,7 @@ export function createMembershipReadiness(deps: MembershipReadinessDeps): Member
       const identityKey = slackInstallationKey(identity)
       if (identityKey !== slackInstallationKey(input.installation)) return { kind: 'installation-mismatch' }
       const recordedAt = (deps.now ?? Date.now)()
-      const result = deps.authority.transact(deps.authority.revision, (next, order) => {
+      const result = deps.authority.transactMembership(key, deps.authority.revision, (next, order) => {
         const life = next.personas[key]
         if (!life || life.incarnation !== incarnation) throw new Error('Superseded installation readiness.')
         life.installationReadiness ??= {}
