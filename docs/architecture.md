@@ -517,7 +517,9 @@ Compaction runs at startup, store creation, later bring-up, explicit `compact`, 
 
 Any append attempt, saved or failed, invalidates that proof. A skip writes no temporary file or seal, performs no fsync or rename, changes no journal state and creates no directory obligation; repeated skips count as completed compactions. A maintenance pass queued but not started serves a later trigger.
 
-Every other compaction, startup included, rewrites in full: temporary-file write, file fsync, rename, directory fsync. Temp-image writes use at most `THREAD_MEMORY_REWRITE_CHUNK_BYTES` (256 KiB) before yielding to the event loop; appends and queue rewrites keep their whole-buffer writes. Read/create clears proof; failure at any rewrite step, before or after rename, leaves none.
+Every other compaction, startup included, rewrites all journal bytes: temporary-file write, file fsync, rename, directory fsync. Read/create clears proof; failure at any rewrite step, before or after rename, leaves none.
+
+Both serializers return a frozen list of encoded chunk Buffers, without allocating a complete-image Buffer; the snapshot retains each accepted Buffer even if publication invalidates or replaces its cache entry. `rewriteChunks` consumes those references unchanged until completion, writing contiguous pieces of at most `THREAD_MEMORY_REWRITE_CHUNK_BYTES` (256 KiB) and yielding before assembling the next piece. A piece contained in one chunk borrows a view; only a piece crossing chunk boundaries is copied; appends and queue rewrites keep their whole-buffer writes.
 
 Maintenance waits while P has an acceptance backlog (an intake or acceptance store queued or running and not yet answered), until it clears or `THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS` (100 ms) passes from the earliest trigger served. This wait owns no queue or Thread Memory writer turn, so join saves proceed meanwhile; startup, bring-up and explicit compactions bypass it. Coalescing never moves the deadline or drops a trigger.
 
