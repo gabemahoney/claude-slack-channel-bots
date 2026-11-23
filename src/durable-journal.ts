@@ -310,16 +310,34 @@ export function createDurableJournal(options: DurableJournalOptions) {
       throw error
     } finally { try { fs.closeSync(fd) } catch { /* fsync is the durability boundary */ } }
   }
-  function* rewriteSteps(path: string, bytes: Uint8Array): DurableSteps {
+  /** Keep pieces contiguous across snapshot chunks, copying only boundary pieces. */
+  function* rewritePieces(chunks: readonly Uint8Array[]): Generator<Uint8Array, void, void> {
+    const size = options.rewriteChunkBytes ?? Infinity
+    let parts: Uint8Array[] = [], length = 0
+    for (const bytes of chunks) {
+      for (let offset = 0; offset < bytes.length;) {
+        const end = Math.min(bytes.length, offset + size - length)
+        parts.push(bytes.subarray(offset, end)); length += end - offset; offset = end
+        if (length === size) {
+          const piece = parts.length === 1 ? parts[0]! : Buffer.concat(parts, length)
+          parts = []; length = 0
+          yield piece
+        }
+      }
+    }
+    if (length) yield parts.length === 1 ? parts[0]! : Buffer.concat(parts, length)
+  }
+  function* rewriteSteps(path: string, chunks: readonly Uint8Array[]): DurableSteps {
     const temp = `${path}.${randomUUID()}.tmp`
     yield* ensureDirSteps()
     try {
       const fd = fs.openSync(temp, 'wx', options.fileMode)
       try {
-        const chunk = options.rewriteChunkBytes ?? Math.max(1, bytes.length)
-        for (let offset = 0; offset < bytes.length; offset += chunk) {
-          writeAll(fd, bytes.subarray(offset, offset + chunk))
-          if (offset + chunk < bytes.length) yield { op: 'yield' }
+        const length = chunks.reduce((sum, bytes) => sum + bytes.length, 0)
+        let written = 0
+        for (const piece of rewritePieces(chunks)) {
+          writeAll(fd, piece); written += piece.length
+          if (written < length) yield { op: 'yield' }
         }
         yield { op: 'fsync', fd, target: 'file' }
       } finally { fs.closeSync(fd) }
@@ -349,7 +367,10 @@ export function createDurableJournal(options: DurableJournalOptions) {
      * synchronous journal read (start, bring-up, read retry). */
     durableAppendSync: (path: string, bytes: Uint8Array, rollback?: AppendRollback): void => runSync(appendSteps(path, bytes, rollback)),
     reconcileRollback: (path: string, j: AppendRollback, scope?: TestSyncWorkScope): Promise<void> => run(reconcileSteps(path, j), undefined, scope),
-    rewrite: (path: string, bytes: Uint8Array, scope?: TestSyncWorkScope): Promise<void> => run(rewriteSteps(path, bytes), undefined, scope),
+    rewrite: (path: string, bytes: Uint8Array, scope?: TestSyncWorkScope): Promise<void> => run(rewriteSteps(path, [bytes]), undefined, scope),
+    /** Thread Memory's immutable image snapshot. Keep its buffers unchanged until
+     * completion; rewriteChunkBytes bounds each write and yields between pieces. */
+    rewriteChunks: (path: string, chunks: readonly Uint8Array[], scope?: TestSyncWorkScope): Promise<void> => run(rewriteSteps(path, chunks), undefined, scope),
     /** The caller's read of the file at `path`. A successful open is an opening
      * even if the read then fails, so a failure counts only when it names a
      * step after the open. Any other failure, ENOENT or one naming no syscall

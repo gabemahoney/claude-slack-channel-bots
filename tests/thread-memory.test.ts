@@ -21,7 +21,7 @@ import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { INITIAL_CREDENTIALS, slackHttpError, slackPlatformError, slackRateLimited } from './test-helpers/slack-stub.ts'
 import { assertNoLeak, LEAK_SENTINEL, writeCredentialsFile, fakeToken, BOT_TOKEN_PREFIX, APP_TOKEN_PREFIX, writtenFile } from './test-helpers/credentials.ts'
 import { PersonaSlackTokens } from '../src/persona-credentials.ts'
-import { isThreadMemoryRecord, parseThreadMemoryRecord, serializeThreadMemoryRecords, THREAD_MEMORY_COMPACTION_SLICE, THREAD_MEMORY_DIRECTORY_MODE, THREAD_MEMORY_FILE_MODE,
+import { createThreadMemory, isThreadMemoryRecord, parseThreadMemoryRecord, serializeThreadMemoryRecords, THREAD_MEMORY_COMPACTION_SLICE, THREAD_MEMORY_DIRECTORY_MODE, THREAD_MEMORY_FILE_MODE,
   normaliseOwnPostText, ownPostDigest, type OwnPostIntent, type ThreadJoin, type ThreadMemory, type ThreadMemoryCompaction } from '../src/thread-memory.ts'
 import { QUEUE_COMPACT_INTERVAL_MS } from '../src/delivery-queue.ts'
 import { recoverQueuedJoins } from '../src/thread-join-recovery.ts'
@@ -3006,6 +3006,130 @@ describe('Thread Memory compaction in slices', () => {
       },
     }
   }
+
+  // Existing 100k population cases take 1.3–2.6 s each; allow both seeds,
+  // warming and verification with the same 30 s hang backstop as those cases.
+  const CACHED_PAIR_TIMEOUT_MS = 30_000
+  test('two cached, dirtied 100k maintenance rewrites copy and write at most 2 * THREAD_MEMORY_REWRITE_CHUNK_BYTES per probe turn', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'thread-memory-cached-pair-'))
+    threadDirs.push(dir)
+    const keys = sr8Personas(2), channels = populationEligible(), count = SR8_POPULATIONS.at(-1)!
+    // Match the approximately 48 MB/persona attribution fixture, using the
+    // existing SR-8 population builder and valid, content-free long stamps.
+    const stamp = { incarnation: 'i'.repeat(155), threadHybridSince: 's'.repeat(155) }
+    for (const key of keys) seedThreads(dir, [threadHeader({ highWater: count + 1 }),
+      ...populationJoins(key, count, channels).map(({ key: _key, ...fact }, i) => joinRecord(threadJoin({ ...fact, stamp }), i + 2))], key)
+    const io = threadFsControls(dir), clock = createFakeClock({ start: THREAD_TIME })
+    clock.settleOn(io.durable)
+    const turns: Array<{ copied: number; written: number }> = []
+    let measuring = false, maintenance: (() => void) | undefined
+    const writes: Array<{ key: string; bytes: number }> = []
+    const base = io.fs, fs = { ...base,
+      writeSync(fd: number, bytes: Uint8Array, offset: number, length: number, position?: number | null) {
+        const written = base.writeSync(fd, bytes, offset, length, position)
+        if (measuring) {
+          turns.at(-1)!.written += written
+          const path = io.calls.at(-1)!.path
+          writes.push({ key: keys.find(key => path.startsWith(`${threadPath(dir, key)}.`)) ?? '<unexpected>', bytes: written })
+        }
+        return written
+      },
+    } as typeof base
+    const seal = createThreadMemorySeal({ stateDir: dir, queueJournalPath: key => queuePath(dir, key),
+      appliedKeys: () => keys, threadHybrid: () => true, created: () => true })
+    const memory = createThreadMemory({ stateDir: dir, fs, seal, now: clock.now, monotonicNow: clock.now,
+      joinSaveClock: clock, maintenanceClock: clock, appliedKeys: () => keys,
+      stamp: () => ({ kind: 'decided', ...stamp }), threadHybridChannels: () => channels,
+      markerKeys: () => keys, setCreated: () => ({ kind: 'saved' }), clearCreated: () => ({ kind: 'saved' }),
+      setInterval: ((callback: () => void) => { maintenance = callback; return { unref() {} } }) as unknown as typeof setInterval,
+      clearInterval: (() => {}) as typeof clearInterval,
+    })
+    const completed: ThreadMemoryCompaction[] = [], sealed: Array<{ key: string; lastRecordNumber: number; steps: string[] }> = []
+    const gates: Array<{ release(): void; ready: boolean }> = []
+    let restoreImmediates: (() => void) | undefined, restoreConcat: (() => void) | undefined
+    let restoreSeal: (() => void) | undefined
+    try {
+      memory.readAtStart(); await seal.loadAtStart(memory.journalFacts()); await memory.activate()
+      await memory.compact() // Install saved order and encoded-chunk caches for both personas.
+      const expected = new Map<string, Buffer>()
+      for (const key of keys) {
+        const { key: _key, ...next } = populationJoins(key, count + 1, channels).at(-1)!
+        expect(await memory.saveJoins(key, [threadJoin({ ...next, stamp })])).toEqual({ kind: 'saved' })
+        const [header, ...records] = readThreads(dir, key)
+        if (header?.kind !== 'header') throw new Error('cached pair needs a journal header')
+        expect(records).toHaveLength(count + 1)
+        expected.set(key, serializeThreadMemoryRecords([{ ...header, highWater: count + 2 }, ...records.sort(bySeq)]))
+        // Every async durability boundary is held until an explicit probe turn.
+        for (const [op, directory] of [['fsync', false], ['rename', false], ['fsync', true]] as const) {
+          const gate = io.hold(op, key, { match: directory
+            ? path => path === join(dir, 'threads') : path => path.startsWith(`${threadPath(dir, key)}.`) })
+          const state = { release: gate.release, ready: false }
+          gate.reached.then(() => { state.ready = true }); gates.push(state)
+        }
+      }
+      memory.setCompactionObserver(c => { completed.push(c) })
+      const entryCompacted = seal.entryCompacted.bind(seal)
+      const sealSpy = spyOn(seal, 'entryCompacted').mockImplementation((key, storeId, lastRecordNumber) => {
+        sealed.push({ key, lastRecordNumber, steps: io.calls.filter(c =>
+          (c.path.startsWith(`${threadPath(dir, key)}.`) || c.path === join(dir, 'threads')) &&
+          ['writeSync', 'fsync', 'rename'].includes(c.op)).map(c => `${c.op}:${c.path === join(dir, 'threads') ? 'directory' : 'temp'}`) })
+        return entryCompacted(key, storeId, lastRecordNumber)
+      })
+      restoreSeal = () => sealSpy.mockRestore()
+      memory.startMaintenance(); expect(maintenance).toBeDefined(); io.reset()
+      const pending: Array<() => void> = []
+      const immediateSpy = spyOn(globalThis, 'setImmediate').mockImplementation(((callback: (...args: unknown[]) => void, ...args: unknown[]) => {
+        pending.push(() => callback(...args)); return { unref() {} }
+      }) as typeof setImmediate)
+      restoreImmediates = () => {
+        immediateSpy.mockRestore()
+        // If a progress assertion fails, let queued production work finish
+        // under the real scheduler before stop waits for its writers.
+        for (const callback of pending.splice(0)) setImmediate(callback)
+      }
+      const concat = Buffer.concat
+      const concatSpy = spyOn(Buffer, 'concat').mockImplementation((...args: Parameters<typeof Buffer.concat>) => {
+        const bytes = concat(...args)
+        if (measuring) turns.at(-1)!.copied += bytes.length
+        return bytes
+      })
+      restoreConcat = () => concatSpy.mockRestore()
+      measuring = true; turns.push({ copied: 0, written: 0 }); maintenance!(); await clock.flush()
+      // SR-2.4.5 requires chunks that yield to intake (b.gkw/fb-o83d-report1).
+      // One snapshot is one probe turn: recursive immediates belong to the next
+      // turn, even when multiple personas resume and drain promise continuations.
+      const maxTurns = 4 * Math.ceil(Math.max(...[...expected.values()].map(b => b.length)) / THREAD_MEMORY_REWRITE_CHUNK_BYTES)
+      for (let turn = 0; sealed.length < keys.length && turn < maxTurns; turn++) {
+        const callbacks = pending.splice(0), ready = gates.filter(g => g.ready)
+        turns.push({ copied: 0, written: 0 })
+        for (const callback of callbacks) { callback(); await clock.flush() }
+        for (const gate of ready) { gate.ready = false; gate.release(); await clock.flush() }
+        await clock.flush()
+      }
+      measuring = false; restoreConcat(); restoreImmediates()
+      expect(completed.map(c => [c.key, c.outcome]).sort()).toEqual(keys.map(key => [key, 'rewritten']))
+      expect(sealed.map(s => s.key).sort()).toEqual(keys)
+      for (const key of keys) {
+        expect(readFileSync(threadPath(dir, key)).equals(expected.get(key)!)).toBe(true)
+        expect(readThreads(dir, key)[0]).toMatchObject({ kind: 'header', highWater: count + 2 })
+        expect(memory.store(key)!.lastRecordNumber).toBe(count + 2)
+        expect(writes.filter(w => w.key === key).reduce((sum, w) => sum + w.bytes, 0)).toBe(expected.get(key)!.length)
+        const notification = sealed.find(s => s.key === key)!
+        expect(notification.lastRecordNumber).toBe(count + 2)
+        // Shared-directory syncs from the other persona may interleave.
+        expect(notification.steps.filter(s => s !== 'fsync:directory').slice(-3)).toEqual(['writeSync:temp', 'fsync:temp', 'rename:temp'])
+        expect(notification.steps.at(-1)).toBe('fsync:directory')
+      }
+      expect(writes.every(w => keys.includes(w.key) && w.bytes > 0 && w.bytes <= THREAD_MEMORY_REWRITE_CHUNK_BYTES)).toBe(true)
+      const budget = keys.length * THREAD_MEMORY_REWRITE_CHUNK_BYTES
+      expect(Math.max(...turns.map(t => t.written))).toBeLessThanOrEqual(budget)
+      expect(Math.max(...turns.map(t => t.copied))).toBeLessThanOrEqual(budget)
+    } finally {
+      measuring = false; restoreConcat?.(); restoreImmediates?.(); restoreSeal?.()
+      for (const gate of gates) gate.release()
+      await memory.stop(); await seal.stop()
+    }
+  }, CACHED_PAIR_TIMEOUT_MS)
 
   test('a mostly cached compaction preserves the complete image through reopen', async () => {
     const { h, header, records } = await large('alternate')

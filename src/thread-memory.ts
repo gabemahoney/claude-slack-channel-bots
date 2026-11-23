@@ -675,9 +675,9 @@ async function sortInSlices(records: ThreadMemoryRecord[], slices: WorkSlices): 
   }
   return runs[0] ?? []
 }
-/** The bytes of `serializeThreadMemoryRecords([header, ...records])`, in slices. */
+/** The bytes of `serializeThreadMemoryRecords([header, ...records])`, as a chunk snapshot. */
 async function serializeInSlices(header: ThreadMemoryHeader, records: Iterable<ThreadMemoryRecord>, slices: WorkSlices,
-  lineOf: (record: ThreadMemoryRecord) => string): Promise<Buffer | undefined> {
+  lineOf: (record: ThreadMemoryRecord) => string): Promise<readonly Buffer[] | undefined> {
   slices.scope?.phase('thread-compact-image-encode')
   const chunks: Buffer[] = []
   let lines = [JSON.stringify(header) + '\n'], previous: string | undefined
@@ -691,16 +691,15 @@ async function serializeInSlices(header: ThreadMemoryHeader, records: Iterable<T
     }
   }
   chunks.push(Buffer.from(lines.join('')))
-  slices.scope?.phase('thread-compact-image-concat')
-  const syncStart = testSyncWorkStart()
-  try { return Buffer.concat(chunks) } finally { testSyncWorkEnd(syncStart, 'thread-image-concat') }
+  return Object.freeze(chunks)
 }
 
 /** Unique, increasing saved records have stable chunk boundaries. A rewrite
  * still writes the complete image, but only changed chunks revisit records
- * and encode UTF-8. Publication invalidates affected chunks between slices. */
+ * and encode UTF-8. The snapshot keeps each accepted Buffer even if publication
+ * invalidates its cached chunk between slices. */
 async function serializeSavedImage(j: MemoryJournal, header: ThreadMemoryHeader, slices: WorkSlices,
-  lineOf: (record: ThreadMemoryRecord) => string): Promise<Buffer | undefined> {
+  lineOf: (record: ThreadMemoryRecord) => string): Promise<readonly Buffer[] | undefined> {
   slices.scope?.phase('thread-compact-image-index')
   const version = j.savedVersion
   let image = j.savedImage
@@ -722,9 +721,7 @@ async function serializeSavedImage(j: MemoryJournal, header: ThreadMemoryHeader,
     chunks.push(chunk.bytes)
     if (slices.due(work) && !await slices.pause()) return undefined
   }
-  slices.scope?.phase('thread-compact-image-concat')
-  const syncStart = testSyncWorkStart()
-  try { return Buffer.concat(chunks) } finally { testSyncWorkEnd(syncStart, 'thread-image-concat') }
+  return Object.freeze(chunks)
 }
 
 /** All state belongs to this instance; reading, activation and timers are explicit. */
@@ -1180,12 +1177,12 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
         }
       }
       const orderedImage = j.savedOrder !== undefined
-      const bytes = ordered && await (orderedImage
+      const chunks = ordered && await (orderedImage
         ? serializeSavedImage(j, header, slices, lineOf)
         : serializeInSlices(header, ordered, slices, lineOf))
-      if (!bytes || !current(key, j)) return
+      if (!chunks || !current(key, j)) return
       scope?.phase('thread-compact-write')
-      await io.rewrite(pathFor(key), bytes, scope)
+      await io.rewriteChunks(pathFor(key), chunks, scope)
       scope?.phase('thread-compact-publish')
       j.header = header; j.hasRecords = true
       // Bind proof to the pre-build version: a change during any await makes

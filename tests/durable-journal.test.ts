@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -763,6 +763,130 @@ describe('whole-file rewrite', () => {
       expect(fs.readdirSync(dir)).toEqual(['alpha.jsonl'])
     },
   )
+})
+
+describe('chunk-list rewrite', () => {
+  const pieceSize = 7
+  async function capture(rewriteChunkBytes?: number) {
+    const r = recordingFs(), writes: Array<{ bytes: Uint8Array; offset: number; length: number }> = []
+    const seam = { ...r.fs, writeSync(fd: number, bytes: Uint8Array, offset: number, length: number) {
+      writes.push({ bytes, offset, length })
+      return r.fs.writeSync(fd, bytes, offset, length)
+    } } as typeof fs
+    const j = createDurableJournal({ dir, parentDir: root, directoryMode: 0o700, fileMode: 0o600, fs: seam, rewriteChunkBytes })
+    await j.ensureDir(); r.ops.length = 0
+    return { r, j, writes }
+  }
+  function rewriteTrace(ops: Op[]) {
+    return ops.filter(op => ['open', 'write', 'sync', 'close', 'rename', 'unlink'].includes(op.step))
+      .map(op => `${op.step}:${op.path.endsWith('.tmp') ? 'temp' : op.path === dir ? 'directory' : 'journal'}`)
+  }
+
+  test.each([
+    ['aligned boundaries', [7, 7, 7]],
+    ['one crossed boundary', [4, 10, 6]],
+    ['several crossed boundaries', [1, 2, 1, 1, 1, 1, 2, 3, 4]],
+    ['chunk larger than a piece', [19, 3]],
+    ['leading, middle and trailing empty chunks', [0, 4, 0, 10, 0, 6, 0]],
+    ['empty list', []],
+    ['only empty chunks', [0, 0, 0]],
+    ['single chunk', [19]],
+  ] as const)('rewriteChunks matches bytes, pieces, yields and durability of rewrite, borrowing contained views: %s', async (_name, lengths) => {
+    const image = Buffer.from(Array.from({ length: lengths.reduce<number>((sum, n) => sum + n, 0) }, (_, i) => (i * 37 + 128) % 256))
+    let at = 0
+    // Separate backing allocations and nonzero offsets make a copied Buffer
+    // distinguishable from a view, even when Bun pools small Buffer payloads.
+    const chunks = Object.freeze(lengths.map(length => {
+      const bytes = new Uint8Array(new ArrayBuffer(length + 4), 2, length)
+      bytes.set(image.subarray(at, at + length)); at += length; return bytes
+    }))
+    const { r, j, writes } = await capture(pieceSize)
+    const expectedLengths = Array.from({ length: Math.ceil(image.length / pieceSize) }, (_, i) => Math.min(pieceSize, image.length - i * pieceSize))
+    const expectedTrace = ['open:temp', ...expectedLengths.map(() => 'write:temp'), 'sync:temp', 'close:temp',
+      'rename:temp', 'open:directory', 'sync:directory', 'close:directory', 'unlink:temp']
+    const immediate = globalThis.setImmediate
+    let yields = 0
+    const immediateSpy = spyOn(globalThis, 'setImmediate').mockImplementation(((...args: Parameters<typeof setImmediate>) => {
+      yields++; return immediate(...args)
+    }) as typeof setImmediate)
+    try {
+      await j.rewrite(path, image)
+      const baseline = { lengths: writes.map(w => w.length), yields, trace: rewriteTrace(r.ops) }
+      expect(read()).toEqual(image)
+      expect(baseline).toEqual({ lengths: expectedLengths, yields: Math.max(0, expectedLengths.length - 1), trace: expectedTrace })
+      writes.length = 0; r.ops.length = 0; yields = 0
+      await j.rewriteChunks(path, chunks)
+      expect(read()).toEqual(image)
+      expect({ lengths: writes.map(w => w.length), yields, trace: rewriteTrace(r.ops) }).toEqual(baseline)
+      let position = 0
+      for (const write of writes) {
+        expect(write.length).toBeLessThanOrEqual(pieceSize)
+        expect(Buffer.from(write.bytes.subarray(write.offset, write.offset + write.length))).toEqual(image.subarray(position, position + write.length))
+        let start = 0
+        for (const source of chunks) {
+          if (position >= start && position + write.length <= start + source.length) {
+            expect(write.bytes.buffer).toBe(source.buffer)
+            expect(write.bytes.byteOffset + write.offset).toBe(source.byteOffset + position - start)
+            break
+          }
+          start += source.length
+        }
+        position += write.length
+      }
+      expect(position).toBe(image.length)
+      expect(r.paths.size).toBe(0); expect(fs.readdirSync(dir)).toEqual(['alpha.jsonl'])
+    } finally { immediateSpy.mockRestore() }
+  })
+
+  test.each(['write', 'sync', 'rename'] as const)('rewriteChunks preserves the %s failure, closes and removes its temp, and retries like rewrite', async failure => {
+    const image = Buffer.from('a replacement image\n'), old = Buffer.from('old image\n')
+    const chunks = Object.freeze([image.subarray(0, 2), image.subarray(2, 9), image.subarray(9)])
+    const traces: string[][] = []
+    for (const form of ['buffer', 'chunks'] as const) {
+      const { r, j } = await capture(pieceSize)
+      seed(old)
+      r.control.maxChunk = failure === 'write' ? 2 : Infinity
+      r.control.fail = op => op.path.endsWith('.tmp') && op.step === failure &&
+        (failure !== 'write' || fs.statSync(op.path).size > 0)
+      let caught: unknown
+      try { await (form === 'chunks' ? j.rewriteChunks(path, chunks) : j.rewrite(path, image)) }
+      catch (error) { caught = error }
+      expect(caught).toBeDefined()
+      expect(caught).toBe(r.errors.get(failure))
+      expect(caught).toMatchObject({ code: 'EIO', message: `EIO injected ${failure}` })
+      const writeCount = failure === 'write' ? 2 : Math.ceil(image.length / pieceSize)
+      const expected = ['open:temp', ...Array(writeCount).fill('write:temp'),
+        ...(failure === 'write' ? [] : ['sync:temp']), 'close:temp',
+        ...(failure === 'rename' ? ['rename:temp'] : []), 'unlink:temp']
+      const trace = rewriteTrace(r.ops); expect(trace).toEqual(expected); traces.push(trace)
+      expect(read()).toEqual(old)
+      expect(r.paths.size).toBe(0); expect(fs.readdirSync(dir)).toEqual(['alpha.jsonl'])
+      r.control.fail = () => false
+      await (form === 'chunks' ? j.rewriteChunks(path, chunks) : j.rewrite(path, image))
+      expect(read()).toEqual(image)
+      expect(r.paths.size).toBe(0); expect(fs.readdirSync(dir)).toEqual(['alpha.jsonl'])
+    }
+    expect(traces[1]).toEqual(traces[0])
+  })
+
+  test('rewrite without rewriteChunkBytes borrows its whole input without copying or yielding', async () => {
+    const { r, j, writes } = await capture()
+    const image = new Uint8Array(new ArrayBuffer(31), 3, 23)
+    image.set(Buffer.from('a whole queue image\n'))
+    const immediate = globalThis.setImmediate, concat = Buffer.concat
+    const immediateSpy = spyOn(globalThis, 'setImmediate').mockImplementation(immediate)
+    const concatSpy = spyOn(Buffer, 'concat').mockImplementation(concat)
+    try {
+      await j.rewrite(path, image)
+      expect(writes).toHaveLength(1)
+      expect(writes[0]!.length).toBe(image.length)
+      expect(writes[0]!.bytes.buffer).toBe(image.buffer)
+      expect(writes[0]!.bytes.byteOffset + writes[0]!.offset).toBe(image.byteOffset)
+      expect(immediateSpy).not.toHaveBeenCalled(); expect(concatSpy).not.toHaveBeenCalled()
+      expect(read()).toEqual(Buffer.from(image))
+      expect(r.paths.size).toBe(0)
+    } finally { immediateSpy.mockRestore(); concatSpy.mockRestore() }
+  })
 })
 
 describe('disk waits run on the I/O pool; only read-time quarantine blocks', () => {
