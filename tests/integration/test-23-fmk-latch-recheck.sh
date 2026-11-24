@@ -36,6 +36,97 @@ MIN_LATCHED_ROUNDS=2
 
 FMK_TEXTS="${SCENARIO_FIXTURES}/fmk-texts.ts"
 
+# Diagnostic stream only: reuse the shim decoder and recorded process windows.
+# NUL framing carries raw values to the redactor on stdin, never in argv.
+pn_evidence_rows() {
+    local lines=() i role time kind pid ppid verb id rejected
+    _scenario_record_load "${SCENARIO_CSCB_RECORD}"
+    # shellcheck disable=SC2031 # shared shim path; sourced setup assigns it in the caller too
+    [[ ! -f "${SCENARIO_AD_SHIM_LOG}" ]] || mapfile -t lines < "${SCENARIO_AD_SHIM_LOG}"
+    for i in "${!lines[@]}"; do
+        (( i + 1 >= PN_EVIDENCE_FROM && i + 1 <= PN_EVIDENCE_TO )) || continue
+        role=other time="" kind="" pid="" ppid="" verb="" id="" rejected=""
+        if _scenario_split_line "${lines[i]}"; then
+            time="$(_scenario_us_text "${_L_US}")" kind="${_L_KIND}" pid="${_L_PID}" ppid="${_L_PPID}"
+            _scenario_role_at "${_L_PPID}" "${_L_US}" && role=cscb
+            if [[ "${_L_KIND}" == call ]] && _scenario_decode_words; then
+                _scenario_ad_verb
+                _scenario_ad_id
+                verb="${_L_VERB}" id="${_L_ID}"
+            elif [[ "${_L_KIND}" == call ]]; then
+                rejected="${lines[i]}"
+            fi
+        else
+            rejected="${lines[i]}"
+        fi
+        printf '%s\0' "$(( i + 1 ))" "${time}" "${kind}" "${pid}" "${ppid}" "${verb}" "${id}" "${role}" "${rejected}"
+    done
+}
+
+# The EXIT cleanup's failure hook runs even when a command substitution in
+# ad_mark_caller/check_pn_marked exits. No new result files; scratch still exists.
+pn_failure_evidence() {
+    [[ -n "${PN_END_MARK:-}" ]] || return 0
+    # Eight preceding lines show the adjacent status/probe/list plus other
+    # personas' interleaved calls. This context never affects attribution.
+    local PN_EVIDENCE_FROM=$(( PN_END_MARK > 8 ? PN_END_MARK - 8 : 1 ))
+    local PN_EVIDENCE_TO="${ROUND_END_MARK[${PN_KEY}]:-$(ad_shim_mark)}"
+    local PN_EVIDENCE_FREE="${FREE_MARK[${PN_KEY}]:-}" PN_EVIDENCE_ID="${PERSONA_ID[${PN_KEY}]}"
+    export PN_EVIDENCE_FROM PN_EVIDENCE_TO PN_EVIDENCE_FREE PN_EVIDENCE_ID PN_END_MARK PN_CLEAR_MS PN_R4_STATUS
+    export SCENARIO_AD_ROOT SCENARIO_FIXTURES
+    pn_evidence_rows 2> /dev/null | bun --no-install --eval '
+        try {
+            const { readFileSync } = await import("node:fs");
+            const { fixtureEvidenceRow } = await import(process.env.SCENARIO_FIXTURES + "/stub-submission-audit.ts");
+            const pkg = process.env.CSCB_PKG_DIR ?? "/test-repo/node_modules/claude-slack-channel-bots";
+            const { redactSlackLogText } = await import(pkg + "/src/slack-log-redaction.ts");
+            // Rejected values use D4s exact hash/byte replacement, not a copy.
+            const rejected = value => fixtureEvidenceRow({ rejected: value }, redactSlackLogText).rejected;
+            const safe = (value, pattern) => value == null || value === "" ? null :
+                typeof value === "string" && pattern.test(value) && redactSlackLogText(value) === value ? value : rejected(value);
+            const words = values => ({ test: value => values.split(" ").includes(value) });
+            const integer = /^[0-9]+$/, stamp = /^[0-9]+\.[0-9]{6}$/;
+            const states = words("pending waiting working ask_user check_permission ended missing");
+            const verbs = words("help spawn status get get-many send-keys read-pane kill decide get-permission record-pane-answer resume sweep find-missing expire make-template list list-subagents pause version hook");
+            const events = words("ad.find_missing.tick ad.spawn.state_transition ad.resume.observed ad.resume.moved_to_pending ad.resume.restored ad.spawn.reused ad.spawn.reuse_restored");
+            const emit = value => console.error("panegone-evidence: " + JSON.stringify(value));
+            const fields = readFileSync(0, "utf8").split("\0");
+            const rows = [];
+            for (let i = 0; i + 8 < fields.length; i += 9) {
+                const [line, time, kind, pid, ppid, verb, id, role, invalid] = fields.slice(i, i + 9);
+                rows.push({ line: safe(line, integer), time: safe(time, stamp), kind: safe(kind, words("call stop")),
+                    pid: safe(pid, integer), ppid: safe(ppid, integer), verb: safe(verb, verbs),
+                    id: safe(id, /^cscb_[a-z0-9_]{1,59}$/), role: safe(role, words("cscb other")),
+                    ...(invalid ? { invalid: rejected(invalid) } : {}) });
+            }
+            const clearing = process.env.PN_EVIDENCE_FREE ? rows.find(row => row.role === "cscb" && row.verb === "status" &&
+                row.id === process.env.PN_EVIDENCE_ID && Number(row.line) > Number(process.env.PN_EVIDENCE_FREE)) : undefined;
+            emit({ PN_CLEAR_MS: safe(process.env.PN_CLEAR_MS, integer), PN_END_MARK: safe(process.env.PN_END_MARK, integer),
+                PN_R4_STATUS: safe(process.env.PN_R4_STATUS, integer),
+                through: safe(process.env.PN_EVIDENCE_TO, integer), clearing_status_line: clearing ?? null });
+            for (const shim of rows) emit({ shim });
+            const path = process.env.SCENARIO_AD_ROOT + "/ad-trail.jsonl";
+            let trail;
+            try { trail = readFileSync(path, "utf8"); }
+            catch { emit({ trail: "unreadable" }); }
+            for (const [i, line] of (trail ?? "").split("\n").entries()) {
+                if (!line) continue;
+                let row;
+                try { row = JSON.parse(line); }
+                catch { emit({ trail_line: i + 1, invalid: rejected(line) }); continue; }
+                if (!row || typeof row !== "object" || row.instance_id !== process.env.PN_EVIDENCE_ID) continue;
+                if (!events.test(row.event)) continue;
+                emit({ trail_line: i + 1, event: safe(row.event, events),
+                    instance_id: safe(row.instance_id, /^cscb_[a-z0-9_]{1,59}$/),
+                    source: safe(row.source, words("ad_recovery ad_find_missing ad_hook ad_resume ad_spawn ad_spawn_store ad_polling hook")),
+                    prior_state: safe(row.prior_state, states), new_state: safe(row.new_state, states),
+                    ts: safe(row.ts, /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z$/) });
+            }
+        } catch { console.error("panegone-evidence: unavailable"); }
+    '
+}
+on_failure pn_failure_evidence
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -1807,8 +1898,20 @@ free_snapshot() {
     fi
 }
 
+# pn_attribution_start <pre-end-mark>: the last CSCB status of panegone at
+# or before the reference. check_latched_rounds validates it against R4.
+pn_attribution_start() {
+    local to="$1" id="${PERSONA_ID[${PN_KEY}]}" rows pos verb last=""
+    rows="$(ad_cscb_calls "${id}" "${LATCH_MARK[${PN_KEY}]}" "${to}")" || exit 1
+    while IFS=$'\t' read -r pos _ _ verb _; do
+        [[ "${verb}" != status ]] || last="${pos}"
+    done <<< "${rows}"
+    [[ "${last}" =~ ^[0-9]+$ ]] || fail "panegone attribution start: no CSCB status of ${id} at or before shim line ${to}"
+    printf '%s\n' "${last}"
+}
+
 p2_clearing_schedule() {
-    local step key n
+    local step key n pn_end_reference
     # R1 and R2: every batched persona still latched; then [harness] the
     # batched round's clearing event: the names are freed.
     for key in "${P2_BATCH_KEYS[@]}"; do
@@ -1850,14 +1953,25 @@ p2_clearing_schedule() {
         || fail "part 2: fmk-texts.ts could not print latchRecheckRoundLine"
     wait_rounds "part 2" "${OI_KEY}" "$(matcher "${ROUND_END_HEAD[${OI_KEY}]}" "cleared (")" 1 $(( MIN_LATCHED_ROUNDS + 2 ))
     ROUND_END_MARK[${OI_KEY}]="$(ad_shim_mark)"
+    # Include reads started during the last still-latched round: a list can
+    # remain in flight across end_session and mark the now-absent process.
+    if ad_release_at_least 0.18.0; then PN_END_MARK="$(ad_shim_mark)"; fi
     wait_rounds "part 2" "${PN_KEY}" "${STILL_LINE[${PN_KEY}]}" $(( MIN_LATCHED_ROUNDS + 2 )) $(( MIN_LATCHED_ROUNDS + 2 ))
     step="part 2: the pane-not-found round's clearing event"
     n="$(count_log "${ROUND_HEAD[${PN_KEY}]}")"
     (( n == MIN_LATCHED_ROUNDS + 2 )) || fail "${step}: ${PN_KEY} has ${n} round lines at its clearing event, not $(( MIN_LATCHED_ROUNDS + 2 ))"
     stub_mode "${PERSONA_WORK[${PN_KEY}]}" "${STUB_MODE_AT_ONCE}"
     if ad_release_at_least 0.18.0; then
+        pn_end_reference="$(ad_shim_mark)"
+        # R4's sequential probe follows its answered status; the completed
+        # round line above proves that status finished before end_session.
+        # Skip only that validated call; every unproven call stays eligible.
+        # Many selecting CSCB poller lists fall in the wide window, so
+        # before=0 sole-status runs fail conservatively in practice. HEAD has
+        # the same exposure; list-first (before=1) passes still hold.
+        # Owed follow-up: shim call-end records to identify in-flight calls.
+        PN_R4_STATUS="$(pn_attribution_start "${pn_end_reference}")" || exit 1
         PN_CLEAR_MS="$(date +%s%3N)"
-        PN_END_MARK="$(ad_shim_mark)"
     fi
     end_session "${SEED_SID[${PN_KEY}]}"
     free_snapshot "${PN_KEY}" "${n}"
@@ -1999,6 +2113,10 @@ check_latched_rounds() {
         i=$(( i + 1 ))
         check_cadence "${step}: round ${i}" "${prev}" "${s_us}" "${c_us}" "${CALL_OF[${key}]}"
         echo "${TEST_NAME}: ${step}: round ${i}: status at shim line ${s_pos}, ${CALL_OF[${key}]} at ${c_pos}"
+        if [[ "${key}" == "${PN_KEY}" ]] && (( i == n )) && ad_release_at_least 0.18.0; then
+            [[ "${PN_R4_STATUS:-}" == "${s_pos}" ]] \
+                || fail "${step}: panegone R4 status ${PN_R4_STATUS:-unset} disagrees with last still-latched round ${i}'s status at shim line ${s_pos}"
+        fi
         prev="${s_us}"
     done <<< "${rounds}"
     PREV_US[${key}]="${prev}"
@@ -2120,8 +2238,8 @@ state_writes_of() {
 # clearing round's `status` reads it `missing`:
 #   - the first missing tick after the session's end is an active read's
 #     (`ad_recovery`); every call that could have made it (`ad_mark_caller`,
-#     after the shim mark taken right before the end) is a CSCB `list`,
-#     `status` or `get`;
+#     in the wide pre-wait window) is a CSCB `list`, `status` or `get`, except
+#     the one validated R4 status proven finished before end and skipped;
 #   - the mark was written before the status began (the tick's millisecond
 #     ends by the status's start, and every candidate comes before it in the
 #     shim log), or the status is the only candidate; and no other write of
@@ -2141,6 +2259,7 @@ check_pn_marked() {
     caller="$(ad_mark_caller "${tick}" "${PN_END_MARK}")" || fail "${step}: no agent-director call after ${id}'s session end could have made the mark: ${tick}"
     (( (tick_ms + 1) * 1000 <= s_us )) && before=1
     while IFS=$'\t' read -r pos time ppid verb role; do
+        [[ -n "${PN_R4_STATUS:-}" && "${pos}" == "${PN_R4_STATUS}" ]] && { [[ "${caller}" == *$'\n'* ]] || fail "${step}: no candidate remains after excluding the proven-finished R4 status at shim line ${PN_R4_STATUS}"; continue; }
         [[ "${role}" == cscb && ( "${verb}" == list || "${verb}" == status || "${verb}" == get ) ]] \
             || fail "${step}: a call that could have made ${id}'s mark (shim line ${pos}, ${verb} at ${time}, parent ${ppid}) is not a CSCB active read (role ${role})"
         if (( before )); then

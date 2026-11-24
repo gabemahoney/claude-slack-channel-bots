@@ -1,20 +1,30 @@
 /** Attribution returns every call that could have made a mark, never one picked call. */
 import { expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { readFileSync, mkdtempSync, rmSync } from 'node:fs'
+import { readFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
+import { assertNoLeak, fakeToken, BOT_TOKEN_PREFIX, sentinelInMessage } from './test-helpers/credentials.ts'
+import { textHash } from './integration/fixtures/stub-submission-audit.ts'
 
 const source = readFileSync(join(import.meta.dir, 'integration/lib/scenario.sh'), 'utf8')
+const test23 = readFileSync(join(import.meta.dir, 'integration/test-23-fmk-latch-recheck.sh'), 'utf8')
+const pnDeclaration = (name: string) => test23.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, 'm'))?.[0] ?? ''
 const declaration = (name: string) => source.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, 'm'))?.[0] ?? ''
 const quote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`
 const call = (us: number, parent: number, args: string) => `call\t1700000000.${us.toString().padStart(6, '0')}\t100\t${parent}\tparent\t${args}`
 // Stamped in millisecond .010: eligible calls start before 1700000000.011000.
 const tickOf = (tickSource: string) => JSON.stringify({ instance_id: 'row', prior_state: 'waiting', source: tickSource, ts: '2023-11-14T22:13:20.010Z' })
+const pnClearingEvent = () => pnDeclaration('p2_clearing_schedule').split('ROUND_END_MARK[${OI_KEY}]="$(ad_shim_mark)"')[1]
+  ?.split('    free_snapshot "${PN_KEY}"')[0] ?? ''
 
 // 42 is the bot server and 43 another CSCB process; any other parent is not CSCB's.
-function probe(calls: string[], labels: Record<string, string> = { service: 'cscb' }, extra: string[] = [], tickSource = 'ad_recovery') {
+function probe(calls: string[], labels: Record<string, string> = { service: 'cscb' }, extra: string[] = [], tickSource = 'ad_recovery', panegone = false,
+  pn: { sameMs?: boolean, validateRound?: boolean, reference?: number, roundEnd?: number } = {}) {
   const root = mkdtempSync('/tmp/fmk-mark-caller-')
+  // Execute the real clearing-event block with only native scheduling stubbed.
+  // Lines 1/2 are R4's completed status/probe; the pre-end reference includes
+  // every line except the clearing status. The old pre-wait mark would be 0.
   const script = [
     'set -euo pipefail',
     'fail() { echo "$*" >&2; exit 1; }',
@@ -28,18 +38,327 @@ function probe(calls: string[], labels: Record<string, string> = { service: 'csc
     `fixture_lines=(${calls.map(quote).join(' ')})`,
     ...['_scenario_check_mark', '_scenario_in_window', '_scenario_to_us', '_scenario_split_line',
       '_scenario_eval_words', '_scenario_decode_words', '_scenario_ad_verb', '_scenario_ad_id',
-      '_scenario_us_text', '_scenario_mark_list_selects', 'ad_mark_caller'].map(declaration),
-    `ad_mark_caller ${[tickOf(tickSource), '0', ...extra].map(quote).join(' ')}`,
+      '_scenario_us_text', '_scenario_mark_list_selects', 'ad_mark_caller', '_scenario_cscb_ad_rows', 'ad_cscb_calls'].map(declaration),
+    ...(panegone ? [
+      declaration('ad_missing_tick'), ...['state_writes_of', 'us_of', 'check_pn_marked', 'pn_attribution_start',
+        'check_latched_rounds', 'latch_rounds', 'rows_count', 'round_call_is'].map(pnDeclaration),
+      `ad_trail_events() { [[ "$1" != ad.find_missing.tick ]] || printf '%s\\n' ${quote(JSON.stringify({ ...JSON.parse(tickOf(tickSource)),
+        ts: pn.sameMs ? '2023-11-14T22:13:20.020Z' : '2023-11-14T22:13:20.010Z', event: 'ad.find_missing.tick', new_state: 'missing' }))}; }`,
+      'TEST_NAME=test-23; PN_KEY=panegone; MIN_LATCHED_ROUNDS=2; STUB_MODE_AT_ONCE=at-once; PN_FIXTURE_READY=0',
+      'declare -A PERSONA_ID=([panegone]=row) LATCH_MARK=([panegone]=0) STILL_LINE=([panegone]=still) ROUND_HEAD=([panegone]=round)',
+      'declare -A PERSONA_WORK=([panegone]=work) SEED_SID=([panegone]=session)',
+      'wait_rounds() { PN_FIXTURE_READY=1; }; count_log() { echo 4; }; stub_mode() { :; }; end_session() { :; }; ad_release_at_least() { return 0; }',
+      `ad_shim_mark() { if (( PN_FIXTURE_READY )); then echo ${pn.reference ?? calls.length - 1}; else echo 0; fi; }`,
+      pnClearingEvent(),
+      'echo "panegone window: ${PN_END_MARK}; R4 status: ${PN_R4_STATUS:-unset}"',
+      ...(pn.validateRound ? [
+        'MIN_LATCHED_ROUNDS=1; CALL_NONE=none; CALL_PROBE=probe; CALL_RESUME=resume; CALL_PLAIN_SPAWN=spawn; CALL_REUSE_SPAWN=reuse; CALL_PENDING_READ=pending',
+        `declare -A FREE_ROUNDS=([panegone]=1) FREE_MARK=([panegone]=${pn.roundEnd ?? 2}) FREE_POSTS=([panegone]=1) POSTS_BEFORE=([panegone]=0)`,
+        'declare -A LATCH_US=([panegone]=1700000000000000) PREV_US=() CALL_OF=([panegone]=probe) READ_OF=()',
+        'check_cadence() { :; }; latch_lines_of() { :; }; calls_of() { :; }',
+        'check_latched_rounds panegone',
+      ] : []),
+      'PN_CLEAR_MS=1700000000005',
+      `check_pn_marked "part 2: panegone clear" row ${calls.length} ${pn.sameMs ? '1700000000.020200' : '1700000000.020000'} 1700000000.021000`,
+    ] : [`ad_mark_caller ${[tickOf(tickSource), '0', ...extra].map(quote).join(' ')}`]),
   ].join('\n')
   try {
     const result = spawnSync('bash', ['-c', script], {
-      env: hostSafeChildEnv(root, { tools: ['bash', 'jq', 'date'] }), encoding: 'utf8', timeout: 10000,
+      env: hostSafeChildEnv(root, { tools: ['bash', 'jq', 'date', 'wc', 'tr'] }), encoding: 'utf8', timeout: 10000,
     })
     expect(result.error).toBeUndefined()
     expect(result.signal).toBeNull()
+    assertNoLeak([result.stdout, result.stderr])
     return result
   } finally { rmSync(root, { recursive: true, force: true }) }
 }
+
+test('test-23 keeps the wide mark and derives only R4 status from the pre-end reference', () => {
+  const schedule = pnDeclaration('p2_clearing_schedule')
+  expect(pnClearingEvent()).not.toBe('')
+  expect(schedule.indexOf('PN_END_MARK=')).toBeLessThan(schedule.indexOf('wait_rounds "part 2" "${PN_KEY}"'))
+  expect(schedule).toContain('PN_R4_STATUS="$(pn_attribution_start "${pn_end_reference}")" || exit 1')
+  expect(schedule.match(/PN_END_MARK=/g)).toHaveLength(1)
+  expect(pnDeclaration('pn_attribution_start')).toContain('[[ "${last}" =~ ^[0-9]+$ ]]')
+  expect(schedule.indexOf('pn_end_reference="$(ad_shim_mark)"')).toBeGreaterThan(schedule.indexOf('stub_mode "${PERSONA_WORK[${PN_KEY}]}"'))
+  expect(schedule.indexOf('pn_end_reference="$(ad_shim_mark)"')).toBeLessThan(schedule.indexOf('PN_R4_STATUS='))
+  expect(schedule.indexOf('PN_CLEAR_MS=')).toBeGreaterThan(schedule.indexOf('stub_mode "${PERSONA_WORK[${PN_KEY}]}"'))
+  expect(schedule.indexOf('PN_CLEAR_MS=')).toBeLessThan(schedule.indexOf('end_session "${SEED_SID[${PN_KEY}]}"'))
+})
+
+test('test-23 candidate checker differs from HEAD only by the exact guarded R4 skip line', () => {
+  const body = pnDeclaration('check_pn_marked')
+  const skip = '        [[ -n "${PN_R4_STATUS:-}" && "${pos}" == "${PN_R4_STATUS}" ]] && { [[ "${caller}" == *$\'\\n\'* ]] || fail "${step}: no candidate remains after excluding the proven-finished R4 status at shim line ${PN_R4_STATUS}"; continue; }\n'
+  expect(body.split(skip)).toHaveLength(2)
+  expect(textHash(body.replace(skip, ''))).toBe('8f64d406809a15255a57224b0920f7024b3e60752c5cecf3aaac391e7bd3a9db')
+})
+
+test.each([
+  ['e06627: selecting list in flight before the old mark', 'list --state waiting --label service=cscb', 42, true],
+  ['non-CSCB selecting read inside the widened window', 'list --state waiting', 99, false],
+  ['wrong-state list inside the widened window', 'list --state check_permission', 42, false],
+  ['wrong-label list inside the widened window', 'list --label service=other', 42, false],
+] as const)('test-23 %s', (_, args, parent, succeeds) => {
+  const result = probe([call(500, 42, 'status --instance-id row'), call(1000, 42, 'read-pane --instance-id row --n-lines 1'), call(2000, parent, args),
+    call(6000, 42, 'get --instance-id other'), call(20000, 42, 'status --instance-id row')], undefined, [], undefined, true)
+  expect(result.status).toBe(succeeds ? 0 : 1)
+  if (succeeds) expect(result.stdout).toContain('list at shim line 3 marked row missing')
+  else expect(result.stderr).toMatch(/no agent-director call|no candidate remains|not a CSCB active read/)
+})
+
+test('test-23 passing-run list after the old mark keeps its attribution', () => {
+  const result = probe([call(500, 42, 'status --instance-id row'), call(1000, 42, 'read-pane --instance-id row --n-lines 1'),
+    call(2000, 42, 'get --instance-id other'), call(6000, 42, 'list --state waiting --label service=cscb'),
+    call(20000, 42, 'status --instance-id row')], undefined, [], undefined, true, { reference: 3 })
+  expect(result.status).toBe(0)
+  expect(result.stdout).toContain('list at shim line 4 marked row missing')
+})
+
+test('test-23 completed R4 status is excluded beside the in-flight list', () => {
+  const result = probe([call(1000, 42, 'status --instance-id row'), call(2000, 42, 'read-pane --instance-id row --n-lines 1'),
+    call(6000, 42, 'list --state waiting'), call(20000, 42, 'status --instance-id row')], undefined, [], undefined, true, { validateRound: true })
+  expect(result.status).toBe(0)
+  expect(result.stdout).toContain('panegone window: 0; R4 status: 1')
+  expect(result.stdout).toContain('round 1: status at shim line 1')
+  expect(result.stdout).toContain('list at shim line 3 marked row missing')
+})
+
+test('test-23 keeps non-CSCB ambiguity inside the widened window', () => {
+  const result = probe([call(500, 42, 'status --instance-id row'), call(1000, 42, 'read-pane --instance-id row --n-lines 1'),
+    call(2000, 99, 'get --instance-id row'), call(6000, 42, 'list --state waiting'),
+    call(20000, 42, 'status --instance-id row')], undefined, [], undefined, true)
+  expect(result.status).toBe(1)
+  expect(result.stderr).toContain('ambiguous')
+})
+
+test('test-23 reviewer counterexample: completed R4 status cannot defeat the sole clearing status in its tick millisecond', () => {
+  const result = probe([call(1000, 42, 'status --instance-id row'), call(2000, 42, 'read-pane --instance-id row --n-lines 1'),
+    call(6000, 42, 'get --instance-id other'), call(20200, 42, 'status --instance-id row')], undefined, [], undefined, true,
+  { sameMs: true, validateRound: true })
+  expect(result.status).toBe(0)
+  expect(result.stdout).toContain('panegone window: 0; R4 status: 1')
+  expect(result.stdout).toContain('status at shim line 4 marked row missing')
+})
+
+test.each([
+  ['CSCB list remains eligible', 42, 'get --instance-id other', true],
+  ['non-CSCB list remains ambiguous beside a later CSCB list', 99, 'list --state waiting', false],
+] as const)('test-23 reviewer 2: before-R4 %s', (_, parent, later, succeeds) => {
+  const result = probe([call(500, parent, 'list --label service=cscb'), call(1000, 42, 'status --instance-id row'),
+    call(2000, 42, 'read-pane --instance-id row --n-lines 1'), call(6000, 42, later),
+    call(20000, 42, 'status --instance-id row')], undefined, [], undefined, true, { validateRound: true, roundEnd: 3 })
+  expect(result.status).toBe(succeeds ? 0 : 1)
+  if (succeeds) {
+    expect(result.stdout).toContain('panegone window: 0; R4 status: 2')
+    expect(result.stdout).toContain('list at shim line 1 marked row missing')
+  } else expect(result.stderr).toMatch(/not a CSCB active read|ambiguous/)
+})
+
+test('test-23 skipping the only candidate fails instead of printing an empty successful caller', () => {
+  const result = probe([call(1000, 42, 'status --instance-id row'), call(2000, 42, 'read-pane --instance-id row --n-lines 1'),
+    call(6000, 42, 'get --instance-id other'), call(20000, 42, 'status --instance-id row')], undefined, [], undefined, true)
+  expect(result.status).toBe(1)
+  expect(result.stderr).toContain('no candidate remains after excluding the proven-finished R4 status at shim line 1')
+  expect(result.stdout).not.toContain("CSCB's  marked")
+})
+
+test('test-23 skips only the exact R4 position, retaining an earlier CSCB status', () => {
+  const result = probe([call(500, 42, 'status --instance-id row'), call(1000, 42, 'read-pane --instance-id row --n-lines 1'),
+    call(2000, 42, 'status --instance-id row'), call(3000, 42, 'read-pane --instance-id row --n-lines 1'),
+    call(6000, 42, 'get --instance-id other'), call(20200, 42, 'status --instance-id row')], undefined, [], undefined, true, { sameMs: true })
+  expect(result.status).toBe(1)
+  expect(result.stdout).toContain('panegone window: 0; R4 status: 3')
+  expect(result.stderr).toContain('shim line 1 (status at 1700000000.000500) could have made it beside the status')
+})
+
+test('test-23 no panegone status before the reference fails loudly instead of widening', () => {
+  const result = probe([call(1000, 42, 'status --instance-id other'), call(2000, 42, 'read-pane --instance-id row --n-lines 1'),
+    call(6000, 42, 'get --instance-id row'), call(20200, 42, 'status --instance-id row')], undefined, [], undefined, true, { sameMs: true })
+  expect(result.status).toBe(1)
+  expect(result.stderr).toContain('no CSCB status of row at or before shim line 3')
+  expect(result.stdout).not.toContain('panegone window:')
+})
+
+test('test-23 a derived status disagreeing with the completed round fails loudly', () => {
+  const result = probe([call(1000, 42, 'status --instance-id row'), call(2000, 42, 'read-pane --instance-id row --n-lines 1'),
+    call(6000, 42, 'status --instance-id row'), call(20200, 42, 'status --instance-id row')], undefined, [], undefined, true,
+  { sameMs: true, validateRound: true })
+  expect(result.status).toBe(1)
+  expect(result.stderr).toContain('panegone R4 status')
+  expect(result.stderr).toContain('disagrees with last still-latched round')
+})
+
+test('test-23 residual: an unproven selecting list in the gap still defeats the sole-status branch conservatively', () => {
+  const result = probe([call(1000, 42, 'status --instance-id row'), call(2000, 42, 'read-pane --instance-id row --n-lines 1'),
+    call(6000, 42, 'list --state waiting'), call(20200, 42, 'status --instance-id row')], undefined, [], undefined, true,
+  { sameMs: true, validateRound: true })
+  expect(result.status).toBe(1)
+  expect(result.stderr).toContain('shim line 3 (list at 1700000000.006000) could have made it beside the status')
+})
+
+// Run the real EXIT cleanup and its failure registration, including nested
+// failures, against only files owned by this test. No native AD, panes or server.
+function failureEvidence(calls: string[], trail: unknown[], mode: 'schedule' | 'attribution' | 'tick' | 'pass' | 'derived-pass' | 'missing' | 'mismatch' | 'reader' = 'schedule', free = '10') {
+  const root = mkdtempSync('/tmp/fmk-pn-evidence-')
+  const deriving = ['derived-pass', 'missing', 'mismatch', 'reader'].includes(mode)
+  try {
+    writeFileSync(join(root, 'shim'), calls.join('\n') + '\n')
+    writeFileSync(join(root, 'roles'), 'proc\tserver\t42\t1\t1700000000.000000\ngone\t42\t1\t1700000000.030000\n')
+    writeFileSync(join(root, 'ad-trail.jsonl'), trail.map(row => typeof row === 'string' ? row : JSON.stringify(row)).join('\n') + '\n')
+    const script = [
+      'set -euo pipefail',
+      `fail() { echo "$*" >&2; exit ${deriving ? 23 : 1}; }`,
+      'require_ci_image() { :; }', 'require_scenario_home() { :; }', '_scenario_query_prep() { _scenario_record_load "${SCENARIO_CSCB_RECORD}"; }',
+      'ad_store_peek() { echo \'{"labels":{"service":"cscb"}}\'; }',
+      ...['_scenario_cleanup', 'on_failure', '_scenario_record_load', '_scenario_role_at',
+        '_scenario_check_mark', '_scenario_in_window', '_scenario_to_us', '_scenario_split_line', '_scenario_read_log',
+        '_scenario_eval_words', '_scenario_decode_words', '_scenario_ad_verb', '_scenario_ad_id', '_scenario_us_text',
+        '_scenario_mark_list_selects', 'ad_mark_caller', 'ad_missing_tick', 'ad_trail_events', '_scenario_shim_diagnostic',
+        '_scenario_cscb_ad_rows', 'ad_cscb_calls'].map(declaration),
+      ...['pn_evidence_rows', 'pn_failure_evidence', 'check_pn_marked', 'us_of', 'state_writes_of', 'pn_attribution_start',
+        'check_latched_rounds', 'latch_rounds', 'rows_count', 'round_call_is'].map(pnDeclaration),
+      '_SCENARIO_BEFORE_CLEANUP_HOOKS=(); _SCENARIO_STATE_DIRS=(); _SCENARIO_SERVER_PIDS=(); _SCENARIO_TRACKED_PIDS=(); _SCENARIO_EXIT_HOOKS=(); _SCENARIO_FAILURE_HOOKS=()',
+      `SCENARIO_FMK=0; PN_KEY=panegone; ${deriving ? '' : `PN_END_MARK=${mode === 'attribution' ? 0 : 10}; PN_CLEAR_MS=1700000000005; PN_R4_STATUS=1`}`,
+      `declare -A ROUND_END_MARK=([panegone]=14) FREE_MARK=([panegone]=${free}) PERSONA_ID=([panegone]=cscb_panegone)`,
+      // Extract the actual registration, so losing it breaks the contract.
+      test23.match(/^on_failure pn_failure_evidence$/m)?.[0] ?? 'false',
+      'trap _scenario_cleanup EXIT',
+      ...(deriving ? [
+        'TEST_NAME=test-23; MIN_LATCHED_ROUNDS=2; STUB_MODE_AT_ONCE=at-once; PN_FIXTURE_READY=0',
+        'declare -A LATCH_MARK=([panegone]=0) STILL_LINE=([panegone]=still) ROUND_HEAD=([panegone]=round)',
+        'declare -A PERSONA_WORK=([panegone]=work) SEED_SID=([panegone]=session)',
+        'wait_rounds() { PN_FIXTURE_READY=1; }; count_log() { echo 4; }; stub_mode() { :; }; end_session() { :; }; ad_release_at_least() { return 0; }',
+        `ad_shim_mark() { if (( PN_FIXTURE_READY )); then echo ${calls.length - 1}; else echo 0; fi; }`,
+        pnClearingEvent(),
+        'MIN_LATCHED_ROUNDS=1; CALL_NONE=none; CALL_PROBE=probe; CALL_RESUME=resume; CALL_PLAIN_SPAWN=spawn; CALL_REUSE_SPAWN=reuse; CALL_PENDING_READ=pending',
+        'declare -A FREE_ROUNDS=([panegone]=1) FREE_POSTS=([panegone]=1); FREE_MARK[panegone]=2',
+        'declare -A POSTS_BEFORE=([panegone]=0) LATCH_US=([panegone]=1700000000000000) PREV_US=() CALL_OF=([panegone]=probe) READ_OF=()',
+        'check_cadence() { :; }; latch_lines_of() { :; }; calls_of() { :; }',
+        'check_latched_rounds panegone',
+        'exit 0',
+      ] : [mode === 'pass' ? 'exit 0' : mode === 'schedule' ? 'fail "clearing round failed"' :
+        'check_pn_marked "part 2: panegone clear" cscb_panegone 14 1700000000.020000 1700000000.021000',
+      ]),
+    ].join('\n')
+    const result = spawnSync('bash', ['-c', script], {
+      env: hostSafeChildEnv(root, { tools: ['bash', 'bun', 'jq', 'date', 'rm', 'wc', 'tr'], extras: {
+        SCENARIO_ROOT: root, SCENARIO_AD_ROOT: root, SCENARIO_AD_SHIM_LOG: join(root, 'shim'),
+        SCENARIO_CSCB_RECORD: join(root, 'roles'), SCENARIO_FIXTURES: join(import.meta.dir, 'integration/fixtures'),
+        CSCB_PKG_DIR: join(import.meta.dir, '..'),
+      } }), encoding: 'utf8', timeout: 10000,
+    })
+    expect(result.error).toBeUndefined()
+    expect(result.signal).toBeNull()
+    assertNoLeak([result.stdout, result.stderr])
+    return result
+  } finally { rmSync(root, { recursive: true, force: true }) }
+}
+const pnTick = { event: 'ad.find_missing.tick', instance_id: 'cscb_panegone', source: 'ad_recovery',
+  prior_state: 'waiting', new_state: 'missing', ts: '2023-11-14T22:13:20.010Z' }
+const evidenceRows = (stderr: string) => stderr.split('\n').filter(line => line.startsWith('panegone-evidence: '))
+  .map(line => JSON.parse(line.slice('panegone-evidence: '.length)))
+const pnCalls = () => Array.from({ length: 16 }, (_, i) => call(i * 1000, i === 11 ? 99 : 42,
+  i === 13 ? 'status --instance-id cscb_panegone' : 'list --state waiting'))
+
+test('test-23 failure retains the numbered margin through round end, status and every state-write event', () => {
+  const events = ['ad.find_missing.tick', 'ad.spawn.state_transition', 'ad.resume.observed', 'ad.resume.moved_to_pending',
+    'ad.resume.restored', 'ad.spawn.reused', 'ad.spawn.reuse_restored']
+  const sources = ['ad_recovery', 'ad_spawn_store', 'ad_polling', 'ad_resume', 'ad_resume', 'ad_spawn', 'ad_spawn']
+  const calls = pnCalls()
+  calls[5] = calls[5]!.replace(/^call/, 'stop')
+  const result = failureEvidence(calls, events.map((event, i) => ({ ...pnTick, event, source: sources[i] })))
+  expect(result.status).toBe(1)
+  expect(result.stdout).toBe('')
+  const rows = evidenceRows(result.stderr)
+  expect(rows[0]).toEqual({ PN_CLEAR_MS: '1700000000005', PN_END_MARK: '10', PN_R4_STATUS: '1', through: '14',
+    clearing_status_line: { line: '14', time: '1700000000.013000', kind: 'call', pid: '100', ppid: '42',
+      verb: 'status', id: 'cscb_panegone', role: 'cscb' } })
+  expect(rows.filter(r => r.shim).map(r => Number(r.shim.line))).toEqual(Array.from({ length: 13 }, (_, i) => i + 2))
+  expect(rows.find(r => r.shim?.line === '12').shim.role).toBe('other')
+  expect(rows.find(r => r.shim?.line === '6').shim).toMatchObject({ kind: 'stop', verb: null, id: null })
+  expect(rows.filter(r => r.event).map(r => r.event)).toEqual(events)
+  expect(rows.filter(r => r.event).map(r => r.source)).toEqual(sources)
+  expect(rows.filter(r => r.event).every(r => r.prior_state === 'waiting' &&
+    r.new_state === 'missing' && r.ts === pnTick.ts)).toBe(true)
+})
+
+test('test-23 failure before the clearing snapshot does not name an earlier status as the clearing status', () => {
+  const result = failureEvidence(pnCalls(), [pnTick], 'schedule', '')
+  expect(result.status).toBe(1)
+  expect(evidenceRows(result.stderr)[0].clearing_status_line).toBeNull()
+})
+
+test.each(['missing', 'mismatch', 'reader'] as const)('test-23 %s derivation failure retains real EXIT evidence and its original failing exit', mode => {
+  const token = fakeToken(BOT_TOKEN_PREFIX, `pn-${mode}`), url = sentinelInMessage(`pn-${mode}`)
+  const calls = [call(1000, 42, `status --instance-id ${mode === 'missing' ? 'cscb_other' : 'cscb_panegone'}`),
+    call(2000, 42, 'read-pane --instance-id cscb_panegone --n-lines 1'),
+    mode === 'reader' ? 'malformed shim line' : call(3000, 42,
+      mode === 'mismatch' ? 'status --instance-id cscb_panegone' : 'list --label service=cscb'),
+    call(6000, 42, `list --label ${quote(token)}`), call(20200, 42, 'status --instance-id cscb_panegone')]
+  const result = failureEvidence(calls, [{ ...pnTick, source: token, prior_state: url }], mode, '')
+  // The real schedule normalizes a failed substitution to 1; the round
+  // checker calls fail directly (23 here). Cleanup must preserve both.
+  expect(result.status).toBe(mode === 'mismatch' ? 23 : 1)
+  expect(result.stderr).toContain(mode === 'missing' ? 'no CSCB status of cscb_panegone at or before shim line 4' :
+    mode === 'mismatch' ? 'disagrees with last still-latched round' : "is not in the shims' line format")
+  const rows = evidenceRows(result.stderr)
+  expect(rows[0]).toMatchObject({ PN_END_MARK: '0', PN_R4_STATUS: mode === 'mismatch' ? '3' : null,
+    PN_CLEAR_MS: mode === 'mismatch' ? expect.stringMatching(/^[0-9]+$/) : null,
+    // The mismatch fixture deliberately puts the unexpected status after
+    // FREE_MARK=2; the unchanged diagnostic projection must retain it.
+    clearing_status_line: mode === 'mismatch' ? { line: '3', time: '1700000000.003000', kind: 'call',
+      pid: '100', ppid: '42', verb: 'status', id: 'cscb_panegone', role: 'cscb' } : null })
+  expect(rows.filter(r => r.shim).map(r => r.shim.line)).toEqual(['1', '2', '3', '4', '5'])
+  expect(rows.find(r => r.event)?.event).toBe('ad.find_missing.tick')
+  expect(result.stdout).not.toContain('marked cscb_panegone missing')
+})
+
+test.each(['attribution', 'tick'] as const)('test-23 EXIT evidence survives a failure inside %s', mode => {
+  const calls = pnCalls()
+  // With FREE_MARK=0, the status is also visible to the diagnostic projection.
+  calls[0] = call(1000, 99, 'get --instance-id cscb_panegone')
+  calls[1] = call(2000, 42, 'list --state waiting')
+  const result = failureEvidence(calls, [{ ...pnTick, source: mode === 'tick' ? 'ad_find_missing' : 'ad_recovery' }], mode, '0')
+  expect(result.status).toBe(1)
+  expect(result.stderr).toContain(mode === 'attribution' ? 'ambiguous' : 'not an active read')
+  expect(evidenceRows(result.stderr).some(r => r.event === 'ad.find_missing.tick')).toBe(true)
+})
+
+test('test-23 failure evidence rejects secret-bearing metadata, invalid records and unknown enum words', () => {
+  const token = fakeToken(BOT_TOKEN_PREFIX, 'pn-evidence'), url = sentinelInMessage('pn-evidence')
+  const calls = pnCalls()
+  calls[2] = call(2000, 42, `unknown-verb --instance-id ${quote(token)}`)
+  calls[3] = call(3000, 42, `${quote(url)} --instance-id cscb_panegone`)
+  calls[4] = token
+  const result = failureEvidence(calls, [{ ...pnTick, source: token, prior_state: url, new_state: 'invented', ts: token },
+    token, { ...pnTick, instance_id: 'cscb_other' }])
+  expect(result.status).toBe(1)
+  const rows = evidenceRows(result.stderr)
+  const invalid = (value: string) => `invalid:sha256:${textHash(value)}:bytes:${Buffer.byteLength(value)}`
+  expect(rows.find(r => r.shim?.line === '3').shim).toMatchObject({ verb: invalid('unknown-verb'), id: invalid(token) })
+  expect(rows.find(r => r.shim?.line === '4').shim.verb).toBe(invalid(url))
+  expect(rows.find(r => r.shim?.line === '5').shim.invalid).toBe(invalid(token))
+  expect(rows.find(r => r.event)?.source).toBe(invalid(token))
+  expect(rows.find(r => r.event)?.prior_state).toBe(invalid(url))
+  expect(rows.find(r => r.event)?.new_state).toBe(invalid('invented'))
+  expect(rows.filter(r => r.event)).toHaveLength(1)
+  expect(rows.find(r => r.trail_line === 2).invalid).toBe(invalid(token))
+})
+
+test('test-23 passing exit emits no failure evidence', () => {
+  const result = failureEvidence(pnCalls(), [pnTick], 'pass')
+  expect(result.status).toBe(0)
+  expect(result.stdout + result.stderr).toBe('')
+})
+
+test('test-23 successful derivation and exact round cross-check exit without a dump', () => {
+  const result = failureEvidence([call(1000, 42, 'status --instance-id cscb_panegone'),
+    call(2000, 42, 'read-pane --instance-id cscb_panegone --n-lines 1'), call(6000, 42, 'get --instance-id cscb_other'),
+    call(20200, 42, 'status --instance-id cscb_panegone')], [pnTick], 'derived-pass', '')
+  expect(result.status).toBe(0)
+  expect(result.stdout).toContain('round 1: status at shim line 1, probe at 2')
+  expect(result.stderr).toBe('')
+})
 
 /** The printed candidates, one array of fields per line. */
 const rows = (stdout: string) => stdout.split('\n').filter(Boolean).map(line => line.split('\t'))
