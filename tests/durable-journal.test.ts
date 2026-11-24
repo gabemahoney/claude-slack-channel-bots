@@ -6,6 +6,7 @@ import {
   cloneJournalData, createDurableJournal, removeTornTail, setDurableAppendTimer, splitJournalLines, yieldToEventLoop,
   type AppendRollback, type DurableAppendTiming,
 } from '../src/durable-journal.ts'
+import { THREAD_MEMORY_REWRITE_CHUNK_BYTES, THREAD_MEMORY_REWRITE_FSYNC_BYTES } from '../src/delivery-constants.ts'
 import { durableIo, heldStep, type DurableStepForm } from './test-helpers/durable-io.ts'
 
 let root: string, dir: string, path: string
@@ -782,6 +783,89 @@ describe('chunk-list rewrite', () => {
       .map(op => `${op.step}:${op.path.endsWith('.tmp') ? 'temp' : op.path === dir ? 'directory' : 'journal'}`)
   }
 
+  // Four production pieces per sync; the last boundary uses only the final
+  // fsync, including when the image ends exactly at the interval.
+  const syncInterval = THREAD_MEMORY_REWRITE_FSYNC_BYTES
+  test.each([syncInterval / 2, syncInterval, 2 * syncInterval, 2.5 * syncInterval])(
+    'rewriteChunks syncs every MiB with bytes remaining and preserves the final publish sequence (%i bytes)', async length => {
+      const { r, j, writes } = await capture(THREAD_MEMORY_REWRITE_CHUNK_BYTES)
+      const image = Buffer.alloc(length)
+      for (let i = 0; i < length; i++) image[i] = (i * 37 + Math.floor(i / THREAD_MEMORY_REWRITE_CHUNK_BYTES)) % 256
+      const synced: number[] = []
+      r.control.before = op => {
+        if (op.step !== 'sync' || !op.path.endsWith('.tmp')) return
+        const prefix = fs.readFileSync(op.path)
+        synced.push(prefix.length)
+        expect(prefix).toEqual(image.subarray(0, prefix.length))
+        expect(op.form).toBe('callback')
+      }
+      // Cross a piece boundary as well as a sync boundary between buffers.
+      await j.rewriteChunks(path, [image.subarray(0, 13), image.subarray(13, syncInterval + 3), image.subarray(syncInterval + 3)])
+      const expectedTrace = ['open:temp'], expectedSyncs: number[] = []
+      for (let written = THREAD_MEMORY_REWRITE_CHUNK_BYTES; written <= length; written += THREAD_MEMORY_REWRITE_CHUNK_BYTES) {
+        expectedTrace.push('write:temp')
+        if (written % syncInterval === 0 && written < length) { expectedTrace.push('sync:temp'); expectedSyncs.push(written) }
+      }
+      expectedTrace.push('sync:temp', 'close:temp', 'rename:temp', 'open:directory', 'sync:directory', 'close:directory', 'unlink:temp')
+      expect(rewriteTrace(r.ops)).toEqual(expectedTrace)
+      expect(synced).toEqual([...expectedSyncs, length])
+      expect(writes.map(w => w.length)).toEqual(Array(length / THREAD_MEMORY_REWRITE_CHUNK_BYTES).fill(THREAD_MEMORY_REWRITE_CHUNK_BYTES))
+      expect(read()).toEqual(image)
+      expect(r.paths.size).toBe(0); expect(fs.readdirSync(dir)).toEqual(['alpha.jsonl'])
+    },
+  )
+
+  test('a periodic fsync failure preserves the original error and journal, cleans the temp and leaves directory durability unchanged', async () => {
+    const { r, j } = await capture(THREAD_MEMORY_REWRITE_CHUNK_BYTES)
+    const old = Buffer.from('old journal\n'), image = Buffer.alloc(2.5 * syncInterval, 97)
+    await j.durableAppend(path, old); r.ops.length = 0
+    r.control.fail = op => op.step === 'sync' && op.path.endsWith('.tmp') && fs.statSync(op.path).size === syncInterval
+    let caught: unknown
+    try { await j.rewriteChunks(path, [image]) } catch (error) { caught = error }
+    expect(caught).toBeDefined(); expect(caught).toBe(r.errors.get('sync'))
+    expect(caught).toMatchObject({ code: 'EIO', message: 'EIO injected sync' })
+    expect(rewriteTrace(r.ops)).toEqual(['open:temp', ...Array(4).fill('write:temp'), 'sync:temp', 'close:temp', 'unlink:temp'])
+    expect(read()).toEqual(old)
+    expect(r.paths.size).toBe(0); expect(fs.readdirSync(dir)).toEqual(['alpha.jsonl'])
+    r.control.fail = () => false; r.ops.length = 0
+    await j.durableAppend(path, Buffer.from('next\n'))
+    expect(syncs(r.ops)).toEqual([path])
+    await j.rewriteChunks(path, [image])
+    expect(read()).toEqual(image)
+    expect(r.paths.size).toBe(0); expect(fs.readdirSync(dir)).toEqual(['alpha.jsonl'])
+  })
+
+  test('each periodic fsync is a separate async step: the event loop runs and the next piece waits', async () => {
+    const { r, j, writes } = await capture(THREAD_MEMORY_REWRITE_CHUNK_BYTES)
+    const image = Buffer.alloc(2.5 * syncInterval, 98)
+    const gates = Array.from({ length: 2 }, () => ({ ...heldStep(), entered: Promise.withResolvers<void>() }))
+    let index = 0
+    r.control.hold = op => {
+      if (op.step !== 'sync' || !op.path.endsWith('.tmp') || fs.statSync(op.path).size === image.length) return
+      expect(op.form).toBe('callback')
+      const gate = gates[index++]!
+      gate.entered.resolve()
+      return gate.promise
+    }
+    const rewriting = j.rewriteChunks(path, [image])
+    try {
+      for (const [i, gate] of gates.entries()) {
+        expect(await Promise.race([gate.entered.promise.then(() => 'held'), rewriting.then(() => 'completed')])).toBe('held')
+        const trace = rewriteTrace(r.ops), writeCount = writes.length
+        expect(writeCount).toBe((i + 1) * 4)
+        expect(trace.at(-1)).toBe('sync:temp')
+        let probed = false
+        await new Promise<void>(resolve => setImmediate(() => { probed = true; resolve() }))
+        expect(probed).toBe(true)
+        expect(writes).toHaveLength(writeCount)
+        expect(rewriteTrace(r.ops)).toEqual(trace)
+        gate.release()
+      }
+      await rewriting
+      expect(index).toBe(2); expect(read()).toEqual(image)
+    } finally { for (const gate of gates) gate.release(); await rewriting }
+  })
+
   test.each([
     ['aligned boundaries', [7, 7, 7]],
     ['one crossed boundary', [4, 10, 6]],
@@ -869,9 +953,9 @@ describe('chunk-list rewrite', () => {
     expect(traces[1]).toEqual(traces[0])
   })
 
-  test('rewrite without rewriteChunkBytes borrows its whole input without copying or yielding', async () => {
+  test.each([23, 2.5 * syncInterval])('rewrite without rewriteChunkBytes borrows its whole input without copying or yielding (%i bytes)', async length => {
     const { r, j, writes } = await capture()
-    const image = new Uint8Array(new ArrayBuffer(31), 3, 23)
+    const image = new Uint8Array(new ArrayBuffer(length + 8), 3, length)
     image.set(Buffer.from('a whole queue image\n'))
     const immediate = globalThis.setImmediate, concat = Buffer.concat
     const immediateSpy = spyOn(globalThis, 'setImmediate').mockImplementation(immediate)
@@ -883,6 +967,8 @@ describe('chunk-list rewrite', () => {
       expect(writes[0]!.bytes.buffer).toBe(image.buffer)
       expect(writes[0]!.bytes.byteOffset + writes[0]!.offset).toBe(image.byteOffset)
       expect(immediateSpy).not.toHaveBeenCalled(); expect(concatSpy).not.toHaveBeenCalled()
+      expect(rewriteTrace(r.ops)).toEqual(['open:temp', 'write:temp', 'sync:temp', 'close:temp',
+        'rename:temp', 'open:directory', 'sync:directory', 'close:directory', 'unlink:temp'])
       expect(read()).toEqual(Buffer.from(image))
       expect(r.paths.size).toBe(0)
     } finally { immediateSpy.mockRestore(); concatSpy.mockRestore() }

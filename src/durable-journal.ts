@@ -4,6 +4,7 @@ import * as nodeFs from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { types } from 'node:util'
 import { durableUnlinkSync } from './atomic-write.ts'
+import { THREAD_MEMORY_REWRITE_FSYNC_BYTES } from './delivery-constants.ts'
 
 export interface AppendRollback { pendingRollback?: number }
 export interface JournalLine {
@@ -334,9 +335,15 @@ export function createDurableJournal(options: DurableJournalOptions) {
       const fd = fs.openSync(temp, 'wx', options.fileMode)
       try {
         const length = chunks.reduce((sum, bytes) => sum + bytes.length, 0)
-        let written = 0
+        let written = 0, unsynced = 0
         for (const piece of rewritePieces(chunks)) {
-          writeAll(fd, piece); written += piece.length
+          writeAll(fd, piece); written += piece.length; unsynced += piece.length
+          // Only chunked Thread Memory rewrites bound write-behind. Leave an
+          // ending boundary to the final fsync, and keep every piece's yield.
+          if (options.rewriteChunkBytes !== undefined && unsynced >= THREAD_MEMORY_REWRITE_FSYNC_BYTES && written < length) {
+            yield { op: 'fsync', fd, target: 'file' }
+            unsynced = 0
+          }
           if (written < length) yield { op: 'yield' }
         }
         yield { op: 'fsync', fd, target: 'file' }

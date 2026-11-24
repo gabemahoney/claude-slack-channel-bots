@@ -13,7 +13,7 @@ import { basename, join, relative } from 'node:path'
 import { THREAD_MEMORY_LOOKUP_METHODS, MetadataCancelledError, classifyMetadataFailure, createMetadataAttempts, metadataRetryDelay,
   THREAD_MEMORY_JOIN_SAVE_WINDOW_MS as JOIN_SAVE_WINDOW_MS, THREAD_MEMORY_JOIN_SAVE_MAX_REQUESTS as JOIN_SAVE_MAX_REQUESTS,
   type MetadataFailure } from '../src/thread-memory.ts'
-import { THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MAX_MS, THREAD_MEMORY_RETRY_MIN_MS, THREAD_MEMORY_NOTICE_MAX_CHARS, THREAD_MEMORY_REWRITE_CHUNK_BYTES, THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS } from '../src/delivery-constants.ts'
+import { THREAD_MEMORY_LOOKUP_DEADLINE_MS, THREAD_MEMORY_RETRY_MAX_MS, THREAD_MEMORY_RETRY_MIN_MS, THREAD_MEMORY_NOTICE_MAX_CHARS, THREAD_MEMORY_REWRITE_CHUNK_BYTES, THREAD_MEMORY_REWRITE_FSYNC_BYTES, THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS } from '../src/delivery-constants.ts'
 import { makeBacklogMemory } from './test-helpers/thread-memory-backlog.ts'
 import { makeRoutingHarness, observedMembership, resetRoutingState, NEVER_FIRE_RESTART_DELAY_S, type RoutingHarness } from './test-helpers/persona-routing-harness.ts'
 import { makeChannelMessage, mentionText } from './test-helpers/slack-stub.ts'
@@ -2897,6 +2897,11 @@ describe('Thread Memory compaction in slices', () => {
     expect(THREAD_MEMORY_REWRITE_CHUNK_BYTES).toBe(262_144)
   })
 
+  test('THREAD_MEMORY_REWRITE_FSYNC_BYTES is 1 MiB, four rewrite pieces', () => {
+    expect(THREAD_MEMORY_REWRITE_FSYNC_BYTES).toBe(1_048_576)
+    expect(THREAD_MEMORY_REWRITE_FSYNC_BYTES).toBe(4 * THREAD_MEMORY_REWRITE_CHUNK_BYTES)
+  })
+
   const SLICE = THREAD_MEMORY_COMPACTION_SLICE, COUNT = 2 * SLICE + 1
   // Capture actual writes without changing the shared harness used by other owners.
   const rewriteWrites = new WeakMap<ThreadMemoryHarness['io']['calls'][number], {
@@ -2952,7 +2957,8 @@ describe('Thread Memory compaction in slices', () => {
     const calls = h.io.calls.filter(c => c.op === 'writeSync' && isTemp(h)(c.path))
     expect(calls.length).toBeGreaterThan(0)
     expect(new Set(calls.map(c => c.path)).size).toBe(1)
-    let covered = 0
+    let covered = 0, unsynced = 0
+    const steps: string[] = []
     const chunks = calls.map(call => {
       const write = rewriteWrites.get(call)!
       expect(write).toBeDefined()
@@ -2962,11 +2968,16 @@ describe('Thread Memory compaction in slices', () => {
       expect(write.bytes.length).toBeLessThanOrEqual(THREAD_MEMORY_REWRITE_CHUNK_BYTES)
       expect(write.bytes.equals(image.subarray(covered, covered + write.bytes.length))).toBe(true)
       covered += write.bytes.length
+      unsynced += write.bytes.length
+      steps.push('writeSync:temp')
+      if (unsynced === THREAD_MEMORY_REWRITE_FSYNC_BYTES && covered < image.length) {
+        steps.push('fsync:temp'); unsynced = 0
+      }
       return write.bytes
     })
     expect(covered).toBe(image.length)
     expect(Buffer.concat(chunks).equals(image)).toBe(true)
-    return [...calls.map(() => 'writeSync:temp'), 'fsync:temp', 'rename:temp', 'fsync:directory']
+    return [...steps, 'fsync:temp', 'rename:temp', 'fsync:directory']
   }
   function observe(h: ThreadMemoryHarness) {
     const completed: ThreadMemoryCompaction[] = [], sealed: Array<{ key: string; steps: string[] }> = []

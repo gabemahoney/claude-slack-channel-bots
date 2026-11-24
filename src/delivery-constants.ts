@@ -34,5 +34,7 @@ export const THREAD_MEMORY_NOTICE_MAX_CHARS = 4000
 export const THREAD_MEMORY_COMPACT_BACKLOG_MAX_MS = 100
 /** Bound each synchronous temp-image write before yielding to socket I/O. */
 export const THREAD_MEMORY_REWRITE_CHUNK_BYTES = 256 * 1024
+/** Bound unsynced temp-image bytes with a separate async fsync every four pieces. */
+export const THREAD_MEMORY_REWRITE_FSYNC_BYTES = 4 * THREAD_MEMORY_REWRITE_CHUNK_BYTES
 /** Bound shared-state notices; their diagnostics retain the entire channel list. */
 export const SHARED_STATE_NOTICE_MAX_CHANNELS = 20
