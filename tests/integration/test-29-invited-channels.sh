@@ -148,6 +148,7 @@ done
 STUB_BIN="${SCENARIO_ROOT}/bin"
 mkdir -p "${STUB_BIN}"
 cp "${FIXTURES}/stub-claude.sh" "${STUB_BIN}/claude"
+: > "${STUB_BIN}/stub-claude-audit-submissions"
 chmod +x "${STUB_BIN}/claude"
 cp "${FIXTURES}/stub-mcp-session.ts" "${STUB_BIN}/stub-mcp-session.ts"
 [[ -f "${STUB_BIN}/stub-mcp-session.ts" && ! -L "${STUB_BIN}/stub-mcp-session.ts" ]] \
@@ -454,15 +455,35 @@ snapshot_queue() {
 }
 wait_queue_drained() {
     snapshot_queue "$1"
+    audit_submissions "$1"
     # The archive fixes the original workload and retains observed receipts
     # removed from the live journal by compaction; supply it in both roles.
     shared_wait_queue_drained "${QUEUE_KEY[$1]}" "${QUEUE_ARCHIVES[$1]}" "${QUEUE_ARCHIVES[$1]}"
     snapshot_queue "$1"
+    audit_submissions "$1"
 }
+audit_submissions() {
+    local key="${QUEUE_KEY[$1]}"
+    bun "${FIXTURES}/stub-submission-audit.ts" "${key}" "${STUB_BIN}" \
+        "${SLACK_STATE_DIR}/queue/${key}.jsonl" "${QUEUE_ARCHIVES[$1]:-${SCENARIO_ROOT}/queue-evidence-${key}.jsonl}"
+}
+audit_before_cleanup() {
+    local dir rc=0
+    for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
+        audit_submissions "${dir}" || rc=1
+    done
+    if (( rc )); then
+        : > "${SCENARIO_ROOT}/submission-audit-failed"
+        OBSERVE_ON_EXIT=1 exit_observe_stderr
+    fi
+    return "${rc}"
+}
+audit_cleanup_result() { [[ ! -f "${SCENARIO_ROOT}/submission-audit-failed" ]]; }
 queue_drain_snapshot() {
     local dir
     for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
         snapshot_queue "${dir}"
+        audit_submissions "${dir}"
         shared_queue_receipts "${QUEUE_KEY[${dir}]}" "${QUEUE_ARCHIVES[${dir}]}" "${QUEUE_ARCHIVES[${dir}]}"
     done
 }
@@ -479,7 +500,9 @@ wait_queued() {
         [[ -n "${PUSHED_EVENTS[$2|$3]:-}" ]] || fail "${step}: no independently retained input"
         EXPECTED_INPUTS["${identity}"]="${PUSHED_EVENTS[$2|$3]}"
         if [[ "${RECEIPT_MODE[${QUEUE_KEY[$1]}]:-ordinary}" == manual ]]; then
-            shared_stub_permission receipt "$1" "${QUEUE_KEY[$1]}" > /dev/null
+            snapshot_queue "$1"
+            shared_stub_permission receipt "$1" "${QUEUE_KEY[$1]}" \
+                "${EXPECTED_QUEUE_ROWS[${identity}]}" "${QUEUE_ARCHIVES[$1]}" > /dev/null
         fi
     fi
     # Check carried joins while their stamp is still current, before any
@@ -1595,29 +1618,81 @@ cleanup_launches() {
 on_exit cleanup_launches
 
 # Failure observation, before the trap stops anything, unless the script
-# reached its PASS line. Diagnostic only: each persona's last queue rows,
+# reached its PASS line. Diagnostic only: each persona's full queue rows,
 # its stub hook records and control commands, and its agent-director row,
 # as whitelisted fields, never message text, hook payloads or tokens. Its
 # setup reads cannot fail the script, and its agent-director read is bounded.
 ALPHA_ID="$(printed personaInstanceId "${ALPHA_KEY}" 2> /dev/null)" || ALPHA_ID=''
 BRAVO_ID="$(printed personaInstanceId "${BRAVO_KEY}" 2> /dev/null)" || BRAVO_ID=''
-OBSERVE_SAFE='def safe: if . == null then "absent" else tostring | if test("^[A-Za-z0-9_.:+-]{1,64}$") and (test("^xox") | not) then . else "invalid" end end;
-    def word: if . == null then "absent" else tostring | if test("^[A-Za-z][A-Za-z0-9_-]{0,39}$") and (test("^xox") | not) then . else "invalid" end end;'
+OBSERVE_SAFE='def safe: if . == null then "absent" else tostring | if test("^invalid:sha256:[a-f0-9]{64}:bytes:[0-9]+$") or (test("^[A-Za-z0-9_.:+-]{1,64}$") and (test("(xox|xapp-)") | not)) then . else "invalid" end end;
+    def word: safe;'
 OBSERVE_ON_EXIT=1
-OBSERVE_ROWS=5
 exit_observe() {
     local name dir id file session line hooks
     [[ "${OBSERVE_ON_EXIT}" == 1 ]] || return 0
+    # Independently safe when Bun/the complete reader fails. Only the projected
+    # fields cross this boundary; rejected values retain their exact identity.
+    local sanitize='
+import hashlib, json, re, sys
+commands = {"subagent", "main-agent", "receipt", "receipt-only", "stop", "receipt-mismatch", "submitted"}
+commands.update(f"{verb}-{n}" for verb in ("permission", "complete", "fallback") for n in (1, 2))
+vocabulary = dict(
+    kind=set("accepted fixed submitted submission-blocked sent delivered refused reply-reminder noticed abandoned withdrawn released hold-withdrawn parked".split()),
+    command=commands,
+    event={"none", "Stop", "UserPromptSubmit", "PermissionRequest", "hook-exited"},
+    send_kind={"text", "enter", "retype"},
+    state=set("pending waiting working ask_user check_permission ended missing".split()),
+)
+fields = set("kind seq attempt send_kind at command event session_id pid text_hash state launch_started_at last_seen_at ended_at".split())
+def safe(value, field):
+    if value is None:
+        return None
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    valid = re.fullmatch(r"[A-Za-z0-9_.:+-]{1,64}", text) and not re.search(r"(?:xox|xapp-)", text)
+    if field in vocabulary:
+        valid = valid and text in vocabulary[field]
+    if field == "control":
+        valid = (text in commands - {"submitted", "receipt-mismatch"} or re.fullmatch(r"receipt:[a-f0-9]{64}", text)) and not re.search(r"(?:xox|xapp-)", text)
+    if valid:
+        return value
+    data = text.encode("utf-8")
+    return f"invalid:sha256:{hashlib.sha256(data).hexdigest()}:bytes:{len(data)}"
+try:
+    mode, *paths = sys.argv[1:]
+    for path in paths:
+        with open(path, encoding="utf-8", newline="") as stream:
+            text = stream.read()
+        lines = [text] if mode == "document" else text.split("\n")
+        if lines[-1] == "":
+            lines.pop()
+        for line in lines:
+            if mode == "control":
+                print(safe(line, "control"))
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict):
+                print(json.dumps({key: safe(value, key) if key in fields else value for key, value in row.items()}, ensure_ascii=True))
+except Exception:
+    sys.exit(1)
+'
+    # Every collector keeps this script's own log. No extra result files or
+    # directories: ordinary /ci enforces regular-file ownership there.
+    bun "${SCENARIO_FIXTURES}/stub-submission-audit.ts" evidence "${SCENARIO_ROOT}" "${ALPHA_ID}" "${BRAVO_ID}" \
+        "${SLACK_STATE_DIR}"/queue/*.jsonl "${SCENARIO_ROOT}"/queue-evidence-* "${STUB_BIN}"/stub-claude-hooks.* \
+        || printf 'exit-observe: complete-evidence=unreadable\n'
     for name in alpha bravo; do
         case "${name}" in
             alpha) dir="${ALPHA_DIR}" id="${ALPHA_ID}" ;;
             bravo) dir="${BRAVO_DIR}" id="${BRAVO_ID}" ;;
         esac
         if [[ -f "${DELIVERIES_FILE[${dir}]}" ]]; then
-            jq -r -R -n --arg name "${name}" --argjson n "${OBSERVE_ROWS}" "${OBSERVE_SAFE}"'
-                [inputs | fromjson? | select(type == "object")] | .[-$n:][] |
-                "exit-observe: persona=\($name) queue kind=\(.kind|word) seq=\(.seq|safe) send_kind=\(.send_kind|word) at=\(.at|safe)"' \
-                "${DELIVERIES_FILE[${dir}]}" 2> /dev/null || printf 'exit-observe: persona=%s queue=unreadable\n' "${name}"
+            python3 -c "${sanitize}" json "${DELIVERIES_FILE[${dir}]}" | jq -r -R -n --arg name "${name}" "${OBSERVE_SAFE}"'
+                inputs | fromjson? | select(type == "object") |
+                "exit-observe: persona=\($name) queue kind=\(.kind|word) seq=\(.seq|safe) attempt=\(.attempt|safe) send_kind=\(.send_kind|word) at=\(.at|safe)"' \
+                2> /dev/null || printf 'exit-observe: persona=%s queue=unreadable\n' "${name}"
         else
             printf 'exit-observe: persona=%s queue=absent\n' "${name}"
         fi
@@ -1630,25 +1705,24 @@ exit_observe() {
             [[ ! -f "${file}" ]] || hooks+=("${file}")
         done
         if (( ${#hooks[@]} > 0 )); then
-            jq -r -R -n --arg id "${id}" --arg name "${name}" --argjson n "${OBSERVE_ROWS}" "${OBSERVE_SAFE}"'
+            python3 -c "${sanitize}" json "${hooks[@]}" | jq -r -R -n --arg id "${id}" --arg name "${name}" "${OBSERVE_SAFE}"'
                 [inputs | fromjson? | select(type == "object" and .instance_id == $id)] |
-                sort_by(.at | tonumber? // 0) | .[-$n:][] |
-                "exit-observe: persona=\($name) stub_hook command=\(.command|word) event=\(.event|word) session_id=\(.session_id|safe) pid=\(.pid|safe) at=\(.at|safe)"' \
-                "${hooks[@]}" 2> /dev/null || printf 'exit-observe: persona=%s stub_hook=unreadable\n' "${name}"
+                sort_by(.at | tonumber? // 0) | .[] |
+                "exit-observe: persona=\($name) stub_hook command=\(.command|word) event=\(.event|word) session_id=\(.session_id|safe) pid=\(.pid|safe) at=\(.at|safe) text_hash=\(.text_hash|safe)"' \
+                2> /dev/null || printf 'exit-observe: persona=%s stub_hook=unreadable\n' "${name}"
         fi
         if timeout 10 agent-director get --instance-id "${id}" > "${SCENARIO_ROOT}/exit-observe.${name}.ad" 2> /dev/null; then
-            session="$(jq -r --arg name "${name}" "${OBSERVE_SAFE}"'
+            session="$(python3 -c "${sanitize}" document "${SCENARIO_ROOT}/exit-observe.${name}.ad" | jq -r --arg name "${name}" "${OBSERVE_SAFE}"'
                 "exit-observe: persona=\($name) ad_state=\(.state|word) session_id=\(.session_id|safe) launch_started_at=\(.launch_started_at|safe) last_seen_at=\(.last_seen_at|safe) ended_at=\(.ended_at|safe)",
-                (.session_id|safe)' "${SCENARIO_ROOT}/exit-observe.${name}.ad" 2> /dev/null)" \
+                (.session_id|safe)' 2> /dev/null)" \
                 || { printf 'exit-observe: persona=%s ad=unreadable\n' "${name}"; continue; }
             printf '%s\n' "${session%$'\n'*}"
             session="${session##*$'\n'}"
             file="${STUB_BIN}/stub-claude-hooks.${session}"
             if [[ "${session}" =~ ^[a-f0-9-]{36}$ && -f "${file}" ]]; then
-                while IFS= read -r line; do
-                    [[ "${line}" =~ ^[a-z0-9-]{1,32}$ ]] || line=invalid
+                python3 -c "${sanitize}" control "${file}" | while IFS= read -r line; do
                     printf 'exit-observe: persona=%s control=%s\n' "${name}" "${line}"
-                done < "${file}"
+                done
             else
                 printf 'exit-observe: persona=%s control=absent\n' "${name}"
             fi
@@ -1661,6 +1735,8 @@ exit_observe() {
 # hooks with that stdout, so the dump goes to stderr.
 exit_observe_stderr() { exit_observe >&2; }
 on_before_cleanup exit_observe_stderr
+on_before_cleanup audit_before_cleanup
+on_exit audit_cleanup_result
 
 # --- Credentials, stub control and MCP config ------------------------------
 # write_credentials <path> <suffix>: a fresh fake bot/app pair ending in
@@ -2551,5 +2627,6 @@ n="$(count_token_like "${leak_files[@]}")"
 
 # The tmux sessions and stub-claude's transcripts go in the exit hook
 # (cleanup_launches), which runs on a failure too.
+audit_before_cleanup || fail 'closing: submission audit failed'
 OBSERVE_ON_EXIT=0
 echo "PASS: ${TEST_NAME} (${SECONDS} s elapsed)"

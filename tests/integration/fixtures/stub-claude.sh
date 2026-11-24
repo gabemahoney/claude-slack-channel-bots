@@ -13,7 +13,8 @@
 # to the transcript for receipt assertions. No native dialog bytes are fixtures.
 # displayed-states fires the registered UserPromptSubmit hook on each typed
 # message and holds it until a command in its per-session control file
-# (stub-claude-hooks.<session>): `receipt` writes the held message's
+# (stub-claude-hooks.<session>): `receipt:<sha256>` checks the held text hash;
+# bare `receipt` remains available to direct fixture controls. Either writes its
 # transcript record and fires the registered Stop hook at once; opt-in,
 # `receipt-only` writes the record and leaves the turn open (no Stop) until a
 # later `stop` fires Stop. While a turn is open no new message may be typed,
@@ -259,14 +260,16 @@ DISPLAY_CONTROL="${STUB_DIR}/stub-claude-hooks.${SESSION_ID}"
 DISPLAY_RECORD="${DISPLAY_CONTROL}.jsonl"
 DISPLAY_NEXT=0
 DISPLAY_TEXT=""
+DISPLAY_TEXT_HASH=""
 # 1 between `receipt-only` and `stop`: the receipt written, Stop not yet fired.
 DISPLAY_STOP_DUE=0
 DISPLAY_AGENT_ID=""
 declare -A DISPLAY_HOOK_PIDS=()
 display_record() {
     jq -nc --arg command "$1" --arg event "$2" --arg instance "${AGENT_DIRECTOR_INSTANCE_ID:-}" \
-        --arg session "${SESSION_ID}" --argjson pid "${3:-$$}" --arg at "${EPOCHREALTIME}" \
-        '{command:$command,event:$event,instance_id:$instance,session_id:$session,pid:$pid,at:$at}' >> "${DISPLAY_RECORD}"
+        --arg session "${SESSION_ID}" --argjson pid "${3:-$$}" --arg at "${EPOCHREALTIME}" --arg hash "${4:-${DISPLAY_TEXT_HASH:-}}" \
+        '{command:$command,event:$event,instance_id:$instance,session_id:$session,pid:$pid,at:$at} +
+         (if $hash == "" then {} else {text_hash:$hash} end)' >> "${DISPLAY_RECORD}"
 }
 display_payload() {
     jq -nc --arg event "$1" --arg session "${SESSION_ID}" --arg cwd "${REALCWD}" --arg path "${TRANSCRIPT}" --arg marker "${2:-}" --arg agent "${DISPLAY_AGENT_ID:-}" \
@@ -276,7 +279,9 @@ display_payload() {
 display_controls() {
     [[ -f "${DISPLAY_CONTROL}" ]] || return 0
     local commands=() command index token n pid
-    mapfile -t commands < "${DISPLAY_CONTROL}"
+    # Consume only newline-terminated controls; an append in progress must
+    # never advance DISPLAY_NEXT past a partial identity.
+    while IFS= read -r command; do commands+=("${command}"); done < "${DISPLAY_CONTROL}"
     while (( DISPLAY_NEXT < ${#commands[@]} )); do
         index="${DISPLAY_NEXT}"
         DISPLAY_NEXT=$(( DISPLAY_NEXT + 1 ))
@@ -290,8 +295,13 @@ display_controls() {
                 DISPLAY_AGENT_ID=""
                 display_record "${command}" none
                 ;;
-            receipt)
+            receipt|receipt:*)
                 [[ -n "${DISPLAY_TEXT}" ]] || exit 1
+                if [[ "${command}" != receipt && "${command}" != "receipt:${DISPLAY_TEXT_HASH}" ]]; then
+                    display_record receipt-mismatch none
+                    exit 1
+                fi
+                command=receipt
                 append_user_receipt "${DISPLAY_TEXT}"
                 DISPLAY_TEXT=""
                 display_payload Stop
@@ -708,14 +718,26 @@ handle_line() {
     # as `/exit` or `/mcp reconnect`) is no message.
     if (( REPORTED )) && [[ "${line}" =~ [^[:space:]] && ! "${line}" =~ ^[[:space:]]*/ ]]; then
         if [[ "${MODE}" == "${MODE_DISPLAYED_STATES}" ]]; then
+            local submitted_hash
+            submitted_hash="$(printf '%s' "${line}" | sha256sum)" || exit 1
+            submitted_hash="${submitted_hash%% *}"
             if [[ -n "${DISPLAY_TEXT}" ]] || (( DISPLAY_STOP_DUE )); then
+                # Preserve the refused input without overwriting the held text's
+                # identity or firing any hook/receipt for the second input.
+                display_record submitted none "$$" "${submitted_hash}"
                 exit 1
             fi
             DISPLAY_TEXT="${line}"
+            DISPLAY_TEXT_HASH="${submitted_hash}"
             display_payload UserPromptSubmit
             fire_hooks "${PROMPT_HOOKS[@]}"
             display_record submitted UserPromptSubmit
         else
+            if [[ -f "${STUB_DIR:-}/stub-claude-audit-submissions" ]]; then
+                DISPLAY_TEXT_HASH="$(printf '%s' "${line}" | sha256sum)" || exit 1
+                DISPLAY_TEXT_HASH="${DISPLAY_TEXT_HASH%% *}"
+                display_record submitted none
+            fi
             append_user_receipt "${line}"
             # Metadata-only receipt counter for the dual-path scenario: one
             # record per complete legacy prompt, never per text/Enter call.

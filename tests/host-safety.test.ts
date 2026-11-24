@@ -4396,10 +4396,21 @@ test('shared registered-hook controls bind the actual row and fail closed withou
   const clock = createFakeClock()
   let oldLifeExited = false, oldLifeExitError = false
   let duringLifeExit: (() => void) | undefined
+  let snapshotEntry: ((name: string, args: readonly string[]) => Promise<string>) | undefined
   // The copied declaration receives its own context; production imports and
   // the preload retain the process HOME, argv, console and clock untouched.
   const context = { env: { HOME: join(scratch, 'home') } as Record<string, string>, argv: [] as string[],
     log: (...args: unknown[]) => captured.push(args), now: clock.now, sleep: clock.advance,
+    // Drive the real printer entry in-process. Only the process transport is
+    // replaced; production queue parsing, merge validation and receipts run.
+    spawn: (args: string[], options: { stdin: 'ignore'; stdout: number; stderr: 'ignore' }) => ({
+      exited: (async () => {
+        if (!snapshotEntry || args[2] !== 'sharedQueueSnapshot') throw Error('unexpected printer entry')
+        try { writeFileSync(options.stdout, await snapshotEntry(args[2], args.slice(3))); return 0 }
+        catch { return 1 }
+      })(),
+      kill() { throw Error('unexpected printer timeout') },
+    }),
     waitLifeExit: async () => {
       // Shaped like ended-life.ts's ExitBarrierError, plus a field the fixture must drop.
       if (oldLifeExitError) throw Object.assign(Error('old life tmux query failed: list-sessions exit 1 (connect-error:permission-denied)'),
@@ -4407,6 +4418,7 @@ test('shared registered-hook controls bind the actual row and fail closed withou
       oldLifeExited = true; duringLifeExit?.()
     } }
   mkdirSync(context.env.HOME!)
+  const receiptHash = (await import('./integration/fixtures/stub-submission-audit.ts')).textHash('fixture receipt')
   const source = readFileSync(join(INTEGRATION_DIR, 'fixtures/shared-stub-permission.ts'), 'utf8')
   writeFileSync(join(scratch, 'permission-source.ts'), source)
   const ast = parse(source, 'permission.ts')
@@ -4425,12 +4437,13 @@ test('shared registered-hook controls bind the actual row and fail closed withou
     return auditClient;
   } } })`).replace("process.env.CSCB_PKG_DIR ?? '/test-repo/node_modules/claude-slack-channel-bots'", JSON.stringify(pkg))
   declarations = declarations.replaceAll('process.env', 'auditContext.env').replaceAll('process.argv', 'auditContext.argv')
-    .replaceAll('console.log', 'auditContext.log').replaceAll('Date.now()', 'auditContext.now()').replaceAll('Bun.sleep(', 'auditContext.sleep(')
+    .replaceAll('Bun.spawn(', 'auditContext.spawn(').replaceAll('console.log', 'auditContext.log').replaceAll('Date.now()', 'auditContext.now()').replaceAll('Bun.sleep(', 'auditContext.sleep(')
   declarations += '\nlet auditClient, auditContext; export function setAuditClient(client) { auditClient = client }; export function setAuditContext(context) { auditContext = context }; export { run };\n'
     + 'export function auditFailure() { return { step: failureStep, state: failureState } }\n'
     + 'export function auditMetadata() { return failureMetadata() }\n'
   const path = join(scratch, 'controls.ts'); writeFileSync(path, declarations)
   copyFileSync(join(INTEGRATION_DIR, 'fixtures/stub-claude.sh'), join(scratch, 'stub-claude.sh'))
+  copyFileSync(join(INTEGRATION_DIR, 'fixtures/stub-submission-audit.ts'), join(scratch, 'stub-submission-audit.ts'))
   const sentinel = /^SENTINEL="([^"\r\n]+)"$/m.exec(readFileSync(join(scratch, 'stub-claude.sh'), 'utf8'))![1]
   const { run, setAuditClient, setAuditContext, auditFailure, auditMetadata } = await import(path)
   setAuditContext(context)
@@ -4449,6 +4462,7 @@ test('shared registered-hook controls bind the actual row and fail closed withou
     for (const p of [bin,work,tmp,stateDir]) mkdirSync(p)
     copyFileSync(join(scratch,'stub-claude.sh'),join(bin,'claude'))
     context.env.SCENARIO_ROOT=root;context.env.TMPDIR=tmp;context.env.SLACK_STATE_DIR=stateDir
+    mkdirSync(join(stateDir,'queue'))
     const config = join(stateDir,'config.json'), record = config+'.last-applied'
     function configFor(delay: number, cwd=work) {
       const input = makePersonaConfigInput({session_restart_delay:delay,personas:[{name,credentials_file:join(root,'credentials.json'),working_directory:cwd,channels:[{id:channel,delivery:'all'}],permission_prompts:channel}]},stateDir)
@@ -4465,6 +4479,7 @@ test('shared registered-hook controls bind the actual row and fail closed withou
         tmux_session_name:'notice-fixture',tmux_socket:'/scratch/notice-socket',
         jsonl_path:transcript,permission_requests:[],unproven_requests:[],last_seen_at:'recorded-hook'}
       calls=[];gets=0;change=undefined;resumeError=false;sendError=false;stays=false;configFor(0)
+      writeFileSync(join(stateDir,'queue',key+'.jsonl'), [{kind:'accepted',seq:1},{kind:'fixed',seq:1,parts:['fixture receipt']}].map(r=>JSON.stringify(r)).join('\n')+'\n')
       oldLifeExited=false;oldLifeExitError=false
       duringLifeExit=undefined
       writeFileSync(join(bin,'stub-claude-modes'),'displayed-states\t'+work+'\n')
@@ -4722,23 +4737,79 @@ test('shared registered-hook controls bind the actual row and fail closed withou
     await check('receipt release requires a submitted item and never repeats an unobserved release', async () => {
       reset()
       const control = join(bin, `stub-claude-hooks.${session}`), record = control + '.jsonl'
-      writeFileSync(record, JSON.stringify({ command: 'submitted', instance_id: id, session_id: session }) + '\n')
+      writeFileSync(record, JSON.stringify({ command: 'submitted', text_hash: receiptHash, instance_id: id, session_id: session }) + '\n')
       change = () => {
         if (existsSync(control)) writeFileSync(record, ['submitted', 'receipt'].map(command =>
-          JSON.stringify({ command, instance_id: id, session_id: session })).join('\n') + '\n')
+          JSON.stringify({ command, text_hash: receiptHash, instance_id: id, session_id: session })).join('\n') + '\n')
       }
       context.argv = ['bun', 'declarations', bin, 'receipt', work, key]
       await run()
-      expect(readFileSync(control, 'utf8')).toBe('receipt\n')
+      expect(readFileSync(control, 'utf8')).toBe(`receipt:${receiptHash}\n`)
       change = undefined
-      writeFileSync(record, JSON.stringify({ command: 'submitted', instance_id: id, session_id: session }) + '\n')
+      writeFileSync(record, JSON.stringify({ command: 'submitted', text_hash: receiptHash, instance_id: id, session_id: session }) + '\n')
       await expect(run()).rejects.toThrow()
-      expect(readFileSync(control, 'utf8')).toBe('receipt\n')
+      expect(readFileSync(control, 'utf8')).toBe(`receipt:${receiptHash}\n`)
       unlinkSync(control); writeFileSync(record, '')
       const started = clock.now()
       await expect(run()).rejects.toThrow()
       expect(clock.now() - started).toBe(20000)
       expect(existsSync(control)).toBe(false)
+    })
+    await check('snapshot, identity release, compaction and receipt drain reuse one validated archive', async () => {
+      reset()
+      const transcriptBefore = readFileSync(transcript)
+      const { test29EvidencePrinter } = await import('./test-helpers/test29-controls.ts')
+      const { makeQueue, acceptedRecord, slackInput, fixedRecord, sentRecord, deliveredRecord } = await import('./test-helpers/delivery-queue.ts')
+      const printerPath = join(scratch, 'fmk-texts.ts')
+      const printerSource = test29EvidencePrinter().split('\ntry { process.stdout.write')[0]!
+        .replace("process.env['SCENARIO_ROOT']", JSON.stringify(root))
+      writeFileSync(printerPath, printerSource + '\nexport { entryValue }\n')
+      const printer = await import(printerPath)
+      snapshotEntry = printer.entryValue
+      const print = async (name: string, ...args: string[]): Promise<string> => {
+        const value = await printer.entryValue(name, args)
+        assertNoLeak(value)
+        return value
+      }
+      const control = join(bin, `stub-claude-hooks.${session}`), record = control + '.jsonl'
+      const queue = join(stateDir, 'queue', key + '.jsonl'), archive = join(root, 'receipt-archive.jsonl')
+      const accepted = acceptedRecord(1, slackInput({ channel: 'CROOM', ts: '1.001', key: { chat_id: 'CROOM', ts: '1.001' } }), 100)
+      const fixed = fixedRecord(1, ['fixture receipt'])
+      const sent = sentRecord(1, 1, 'text', { at: 101, session_id: session, transcript_path: transcript })
+      const journal = (rows: unknown[]) => rows.map(r => JSON.stringify(r)).join('\n') + '\n'
+      writeFileSync(queue, journal([accepted]))
+      writeFileSync(archive, await print('sharedQueueSnapshot', queue))
+      writeFileSync(queue, journal([accepted, fixed, sent]))
+      const submission = { command: 'submitted', text_hash: receiptHash, instance_id: id, session_id: session }
+      writeFileSync(record, journal([submission]))
+      change = () => {
+        if (!existsSync(control)) return
+        writeFileSync(record, journal([submission, { ...submission, command: 'receipt' }]))
+      }
+      context.argv = ['bun', 'declarations', bin, 'receipt', work, key, JSON.stringify({ channel: 'CROOM', ts: '1.001' }), archive]
+      await run()
+      expect(readFileSync(archive, 'utf8').trim().split('\n').map(line => JSON.parse(line))).toContainEqual(fixed)
+      expect(readFileSync(control, 'utf8')).toBe(`receipt:${receiptHash}\n`)
+      const delivered = deliveredRecord(1, 200, { receipt: { path: transcript, uuid: 'release-receipt' } })
+      writeFileSync(transcript, transcriptBefore.toString('utf8') + journal([{ type: 'user', uuid: 'release-receipt', sessionId: session, timestamp: 150,
+        message: { role: 'user', content: 'fixture receipt' } }]))
+      const store = await makeQueue(stateDir, { now: () => 200 })
+      try {
+        await store.append(key, delivered)
+        writeFileSync(archive, await print('sharedQueueSnapshot', queue, archive))
+      } finally { await store.stop() }
+      const reopened = await makeQueue(stateDir, { now: () => 300 })
+      try {
+        const compacted = readFileSync(queue, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+        expect(compacted.some(row => row.kind === 'accepted' && row.compact === 'allocation')).toBe(true)
+        expect(compacted.some(row => row.kind === 'accepted' && !row.compact)).toBe(false)
+      } finally { await reopened.stop() }
+      writeFileSync(archive, await print('sharedQueueSnapshot', queue, archive))
+      writeFileSync(join(stateDir, 'server.log'), '')
+      const drained = JSON.parse(await print('sharedQueueReceipts', key, join(stateDir, 'server.log'), queue, archive, archive))
+      expect(drained.complete).toBe(true)
+      writeFileSync(transcript, transcriptBefore)
+      unlinkSync(control); writeFileSync(record, '')
     })
     await check('unsafe hook scratch and control paths fail before publishing', async () => {
       reset()
@@ -4755,7 +4826,7 @@ test('shared registered-hook controls bind the actual row and fail closed withou
     // Test 29's receipt evidence: hook records only, with a planted record
     // field the failure metadata must never carry.
     const hookRecord = (command: string, at: string) => ({ command, event: command === 'receipt' ? 'Stop' : 'UserPromptSubmit',
-      instance_id: id, session_id: session, at, text: 'PRIVATE_RECORD_TEXT' })
+      instance_id: id, session_id: session, at, text_hash: receiptHash, text: 'PRIVATE_RECORD_TEXT' })
     const receiptFixture = () => {
       reset()
       const control = join(bin, `stub-claude-hooks.${session}`), record = control + '.jsonl'
@@ -4771,7 +4842,7 @@ test('shared registered-hook controls bind the actual row and fail closed withou
       const logged = captured.length
       await run()
       expect(clock.now() - r.started).toBe(20000)
-      expect(readFileSync(r.control, 'utf8')).toBe('receipt\n')
+      expect(readFileSync(r.control, 'utf8')).toBe(`receipt:${receiptHash}\n`)
       expect(captured.slice(logged).map(args => JSON.parse(String(args[0])))).toEqual([{
         instance_id: id, session_id: session, command: 'receipt', state: 'waiting' }])
       r.done()
@@ -4789,7 +4860,7 @@ test('shared registered-hook controls bind the actual row and fail closed withou
       await run()
       expect(appended).toBe(20000)
       expect(clock.now() - r.started).toBe(20600)
-      expect(readFileSync(r.control, 'utf8')).toBe('receipt\n')
+      expect(readFileSync(r.control, 'utf8')).toBe(`receipt:${receiptHash}\n`)
       r.done()
     })
     await check('unobserved receipt evidence fails at its bound with counts and times only', async () => {
@@ -4798,7 +4869,7 @@ test('shared registered-hook controls bind the actual row and fail closed withou
       await assert.rejects(run(), /registered hook not observed/)
       const end = r.started + 20000
       expect(clock.now()).toBe(end)
-      expect(readFileSync(r.control, 'utf8')).toBe('receipt\n')
+      expect(readFileSync(r.control, 'utf8')).toBe(`receipt:${receiptHash}\n`)
       expect(auditFailure()).toEqual({ step: 'registered hook evidence', state: 'waiting' })
       expect(auditMetadata()).toBe('shared-stub-permission: failure metadata command=receipt prior=0 bound=observation ' +
         `deadline_ms=20000 submitted=1 receipt=0 records_read_at=${end} last_record_at=1794059070.251198 ` +
@@ -4905,7 +4976,7 @@ describe('displayed-states stub ends an allowed permission turn only through its
   // Runs the stub's own control declarations in bash with fake registered
   // hooks; no AD, tmux or pane is involved.
   const stub = readFileSync(join(INTEGRATION_DIR, 'fixtures/stub-claude.sh'), 'utf8')
-  const declarations = ['fire_hooks', 'display_record', 'display_payload', 'display_controls'].map(name => {
+  const declarations = ['fire_hooks', 'display_record', 'display_payload', 'display_controls', 'handle_line'].map(name => {
     const match = stub.match(new RegExp(`^${name}\\(\\) \\{\n[\\s\\S]*?^\\}`, 'm'))
     if (!match) throw new Error(`missing stub declaration ${name}`)
     return match[0]
@@ -4938,18 +5009,84 @@ printf 'outstanding=%s\\n' "\${#DISPLAY_HOOK_PIDS[@]}"
 `
       const result = spawnSync('/bin/bash', ['--noprofile', '--norc', '-c', script], {
         encoding: 'utf8', timeout: 10000,
-        env: hostSafeChildEnv(join(root, 'home'), { tools: ['jq', 'cat', 'sleep'], extras: {
+        env: hostSafeChildEnv(join(root, 'home'), { tools: ['jq', 'cat', 'sleep', 'sha256sum', 'chmod'], extras: {
           ROOT: root, HOOK_RC: String(hookRc), AGENT_DIRECTOR_INSTANCE_ID: 'fixture-instance' } }),
       })
       const read = (name: string) => existsSync(join(root, name)) ? readFileSync(join(root, name), 'utf8') : ''
       return { status: result.status, stdout: result.stdout, stderr: result.stderr,
-        stops: read('stop-log').split('\n').filter(Boolean).map(line => line.split('\t')),
+        prompts: read('prompts'), held: read('held'), stops: read('stop-log').split('\n').filter(Boolean).map(line => line.split('\t')),
         records: read('control.jsonl').split('\n').filter(Boolean).map(line => JSON.parse(line)) }
     } finally { rmSync(root, { recursive: true, force: true }) }
   }
 
   const exited = `for ((i = 0; i < 500; i++)); do [[ -e "$ROOT/permission-exited" ]] && break; sleep 0.01; done
 [[ -e "$ROOT/permission-exited" ]] || exit 9`
+
+  test('the submitted record hashes the exact typed Unicode and newline bytes', async () => {
+    const text = '<channel ts="1.001">first\n日本語 😀</channel>'
+    const r = controls(`REPORTED=1 AWAITING_ENTER=0 DISPLAY_STOP_DUE=0
+MODE=displayed-states MODE_DISPLAYED_STATES=displayed-states MODE_SILENT=silent
+MODE_LINGER_ON_EXIT=linger MODE_EXIT_ON_PAUSE=exit-on-pause SENTINEL=fixture-exit
+PROMPT_HOOKS=()
+handle_line '<channel ts="1.001">first
+日本語 😀</channel>'`)
+    expect(r.status).toBe(0)
+    expect(r.records.map(row => [row.command, row.text_hash])).toEqual([
+      ['submitted', (await import('./integration/fixtures/stub-submission-audit.ts')).textHash(text)],
+    ])
+  })
+
+  test.each(['duplicate', 'unmatched'] as const)('busy handle_line records and audits the refused second submission: %s', async kind => {
+    const r = controls(`REPORTED=1 AWAITING_ENTER=0 DISPLAY_STOP_DUE=0
+MODE=displayed-states MODE_DISPLAYED_STATES=displayed-states MODE_SILENT=silent
+MODE_LINGER_ON_EXIT=linger MODE_EXIT_ON_PAUSE=exit-on-pause SENTINEL=fixture-exit
+PROMPT_HOOKS=(1 "$ROOT/prompt-hook")
+printf '#!/bin/bash\\necho fired >> "$ROOT/prompts"\\n' > "$ROOT/prompt-hook"
+chmod +x "$ROOT/prompt-hook"
+append_user_receipt() { printf 'unexpected-receipt\\n'; }
+trap 'printf \"%s\\n%s\\n\" \"$DISPLAY_TEXT\" \"$DISPLAY_TEXT_HASH\" > \"$ROOT/held\"' EXIT
+handle_line first
+handle_line ${kind === 'duplicate' ? 'first' : 'unknown'}`)
+    expect(r.status).toBe(1)
+    expect(r.stdout).toBe('')
+    expect(r.stops).toEqual([])
+    expect(r.prompts).toBe('fired\n')
+    const { auditSubmissions, textHash, formatSubmissionIssues } = await import('./integration/fixtures/stub-submission-audit.ts')
+    const submissions = r.records.filter(row => row.command === 'submitted')
+    expect(submissions.map(row => row.text_hash)).toEqual([textHash('first'), textHash(kind === 'duplicate' ? 'first' : 'unknown')])
+    expect(submissions.every(row => /^\d+\.\d+$/.test(row.at))).toBe(true)
+    expect(r.held).toBe(`first\n${textHash('first')}\n`)
+    const issues = auditSubmissions([{ kind: 'accepted', seq: 1 }, { kind: 'fixed', seq: 1, parts: ['first'] },
+      { kind: 'sent', seq: 1, attempt: 1, send_kind: 'text', at: 10 }], r.records)
+    expect(issues.map(row => row.reason)).toEqual(kind === 'duplicate' ? ['duplicate', 'duplicate'] : ['unmatched'])
+    expect(formatSubmissionIssues(issues).join('\n')).toContain(submissions[1].text_hash)
+    expect(formatSubmissionIssues(issues).join('\n')).toContain(submissions[1].at)
+    expect(r.records.some(row => row.command === 'receipt')).toBe(false)
+  })
+
+  test.each([true, false])('identity receipt releases only the matching held text: match=%s', matching => {
+    const hash = 'a'.repeat(64), requested = matching ? hash : 'b'.repeat(64)
+    const r = controls(`DISPLAY_TEXT='fixture text' DISPLAY_TEXT_HASH=${hash}
+append_user_receipt() { printf 'receipt-written\\n'; }
+step receipt:${requested}`)
+    expect(r.status).toBe(matching ? 0 : 1)
+    expect(r.stdout).toBe(matching ? 'receipt-written\noutstanding=0\n' : '')
+    expect(r.records.map(row => [row.command, row.text_hash])).toEqual([[matching ? 'receipt' : 'receipt-mismatch', hash]])
+    expect(r.stops).toHaveLength(matching ? 1 : 0)
+  })
+  test('partial identity controls are held until their terminating newline', () => {
+    const hash = 'a'.repeat(64)
+    const r = controls(`DISPLAY_TEXT='fixture text' DISPLAY_TEXT_HASH=${hash}
+append_user_receipt() { printf 'receipt-written\\n'; }
+printf '%s' receipt:${hash} > "$DISPLAY_CONTROL"
+display_controls
+printf 'before-next=%s\\n' "$DISPLAY_NEXT"
+printf '\\n' >> "$DISPLAY_CONTROL"
+display_controls`)
+    expect(r.status).toBe(0)
+    expect(r.stdout).toBe('before-next=0\nreceipt-written\noutstanding=0\n')
+    expect(r.records.map(row => row.command)).toEqual(['receipt'])
+  })
 
   test.each([
     // The hook is still undecided when complete-1 is queued; the release

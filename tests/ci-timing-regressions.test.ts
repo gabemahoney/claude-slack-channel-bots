@@ -12,10 +12,11 @@ import { decideDelivery } from '../src/delivery-decision.ts'
 import { buildDeliveryDispatchLine } from '../src/delivery-notices.ts'
 import { createPersonaEventRouter } from '../src/persona-event-router.ts'
 import { RELOAD_NOOP } from '../src/reload-apply.ts'
-import { assertNoLeak, fakeToken, BOT_TOKEN_PREFIX } from './test-helpers/credentials.ts'
+import { assertNoLeak, fakeToken, BOT_TOKEN_PREFIX, APP_TOKEN_PREFIX } from './test-helpers/credentials.ts'
 import { test29ClosingFixture, test29EvidencePrinter, test29PrinterFixture, test29PrinterBindings, test29SwitchBindings, test29SwitchCallOrder } from './test-helpers/test29-controls.ts'
 import { TEST29_ROOT, test29RestartFixture, test29CompactionFixture, test29DiagnosticFixture, test29WatchdogFixture, test29DiagnosticExpectedItem } from './test-helpers/test29-queue.ts'
 import { percentile } from './integration/fixtures/transcript-receipts.ts'
+import { textHash } from './integration/fixtures/stub-submission-audit.ts'
 import * as sr8Evidence from './integration/fixtures/sr8-evidence.ts'
 import { SR8_DISPATCH_ALLOWANCE_MS, SR8_ACK_LIMIT_MS, SR8_STORE_LIMIT_MS, ackVerdict, storeVerdict, postHoldVerdict,
   n4Verdict, n2Verdict, n2Samples, sealVerdict, requireSeedPopulation, startupVerdict, compactionVerdict, storeWindow, faultWindow, faultRewriters, joinsVerdict,
@@ -31,7 +32,7 @@ import { SR8_DISPATCH_ALLOWANCE_MS, SR8_ACK_LIMIT_MS, SR8_STORE_LIMIT_MS, ackVer
   SR8_SERVER_CPUS, SR8_CONTAINER_HEADROOM_CPUS, SR8_GUARDED_CGROUP_FILES, cgroupPathOf, cgroupChain, cpuMaxCpus, driverCpuVerdict, guardedCgroups, cgroupWriteAccess, cgroupOpenFailure,
   type CgroupWriteAccess, type CgroupOpenOutcome,
 } from './integration/fixtures/sr8-evidence.ts'
-import { CPUS_PER_SHARD, DRIVER_CPUS } from '../scripts/ci-run.ts'
+import { checkResultsOwnership, readIntegrityEvidence, type IntegrityInputs, CPUS_PER_SHARD, DRIVER_CPUS } from '../scripts/ci-run.ts'
 import { serializeTestMeasurement, ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement, threadCompactionMeasurement,
   type TestMeasurement, type TestMeasurementRecord } from '../src/test-measurements.ts'
 import { QUEUE_COMPACT_INTERVAL_MS, parseQueueRecord, type AcceptedRecord } from '../src/delivery-queue.ts'
@@ -75,6 +76,11 @@ function sharedPrinterControl(root: string, printerPath = join(root, 'printer.ts
     return child.stdout
   }
 }
+function submissionEvidenceProgram(): string {
+  const body = source('fixtures/stub-submission-audit.ts').split('if (import.meta.main)')[0]!
+    .replace("process.env.CSCB_PKG_DIR ?? '/test-repo/node_modules/claude-slack-channel-bots'", JSON.stringify(join(import.meta.dir, '..')))
+  return body + '\nawait runEvidence()\n'
+}
 function declaration(text: string, name: string): string {
   const match = text.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, 'm'))
   if (!match) throw new Error(`Missing shell function ${name}`)
@@ -85,7 +91,7 @@ function block(text: string, start: string, end: string): string {
   if (from < 0 || to < from) throw new Error(`Missing shell block ${start}`)
   return text.slice(from, to)
 }
-function shell(program: string, files: Record<string, string> = {}) {
+function shell(program: string, files: Record<string, string> = {}, inspect?: (root: string) => void) {
   mkdirSync('/tmp/c9', { recursive: true })
   const root = mkdtempSync('/tmp/c9/cscb-timing-control-')
   try {
@@ -97,11 +103,12 @@ function shell(program: string, files: Record<string, string> = {}) {
       'set -euo pipefail', 'SCENARIO_ROOT="$HOME"', 'SCENARIO_AD_ROOT="$HOME"', 'SLACK_STATE_DIR="$HOME"',
       'fail() { printf "%s\\n" "$*" >&2; exit 1; }', program,
     ].join('\n')], {
-      env: hostSafeChildEnv(root, { tools: ['bash', 'jq', 'tail', 'grep', 'cat', 'wc', 'python3', 'bun', 'realpath', 'mv', 'mkdir'] }),
+      env: hostSafeChildEnv(root, { tools: ['bash', 'jq', 'tail', 'grep', 'cat', 'wc', 'python3', 'bun', 'realpath', 'mv', 'mkdir', 'cp', 'basename'] }),
       encoding: 'utf8', timeout: 10000,
     })
     expect(result.error).toBeUndefined(); expect(result.signal).toBeNull()
     assertNoLeak({ stdout: result.stdout, stderr: result.stderr })
+    inspect?.(root)
     return result
   } finally { rmSync(root, { recursive: true, force: true }) }
 }
@@ -150,6 +157,7 @@ const queueControls = [
   'export SCENARIO_ROOT SLACK_STATE_DIR="$HOME/state"', 'SCENARIO_FIXTURES="$HOME"',
   'mkdir -p "$SLACK_STATE_DIR/queue"', 'require_ci_image() { :; }',
   ...['_scenario_scratch_file', 'shared_queue_snapshot', 'shared_queue_receipts', 'shared_wait_queue_drained'].map(name => declaration(scenario, name)),
+  'audit_submissions() { :; }',
   ...['snapshot_queue', 'wait_queue_drained', 'queue_drain_snapshot'].map(name => declaration(test29, name)),
 ].join('\n')
 // Include only this continued command and its failure branch; later scenario
@@ -2003,11 +2011,12 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
       expect(run.stdout).toBe(status ? '' : 'references checked\n')
     } finally { rmSync(fixtures, { recursive: true, force: true }) }
   })
-  test('test-29 exit_observe prints the last queue rows, last hook records, AD row and controls as whitelisted fields only', () => {
+  test('test-29 exit_observe prints all queue rows, all hook records, AD row and controls as whitelisted fields only', () => {
     const secret = 'private message text', tok = fakeToken(BOT_TOKEN_PREFIX, 'exit-observer')
     const session = '0123abcd-0000-4000-8000-000000000001'
     const hook = (command: string, event: string, at: string, instance = 'cscb_alpha') => ({ command, event, instance_id: instance, session_id: 's1', pid: 4, at })
     const files = {
+      'fixtures/stub-submission-audit.ts': submissionEvidenceProgram(),
       'state/queue/alpha.jsonl': jsonl([{ kind: 'accepted', seq: 1, at: 1, text: secret }, { kind: 'sent', seq: 1, send_kind: 'text', at: 2 },
         { kind: 'sent', seq: 1, send_kind: 'enter', at: 3 }, { kind: 'delivered', seq: 1, at: 4 }, { kind: 'accepted', seq: 2, at: 5, text: secret },
         { kind: 'sent', seq: 2, send_kind: tok, at: 6 }, { kind: secret, seq: 2, at: 7 }]) + '{"kind":"sent",',
@@ -2020,36 +2029,158 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
       'printed() { [[ "$2" == alpha ]] || { echo "FAIL: printer" >&2; exit 1; }; printf "cscb_%s\\n" "$2"; }',
       'timeout() { [[ "$1" == 10 ]] || return 99; shift; "$@"; }',
       `agent-director() { [[ "$*" == "get --instance-id cscb_alpha" ]] || return 1; jq -nc --arg tok "${tok}" '{state:"waiting",session_id:"${session}",launch_started_at:"2030-01-01T00:00:00Z",last_seen_at:"2030-01-01T00:00:04Z",ended_at:null,updated_at:"2030-01-01T00:00:09Z",labels:{t:$tok},cwd:"${secret}"}'; }`,
-      'ALPHA_KEY=alpha BRAVO_KEY=bravo ALPHA_DIR="$HOME/alpha-work" BRAVO_DIR="$HOME/bravo-work" STUB_BIN="$HOME/bin"',
+      'SCENARIO_FIXTURES="$HOME/fixtures"; ALPHA_KEY=alpha BRAVO_KEY=bravo ALPHA_DIR="$HOME/alpha-work" BRAVO_DIR="$HOME/bravo-work" STUB_BIN="$HOME/bin" SLACK_STATE_DIR="$HOME/state"',
       'declare -A DELIVERIES_FILE=(["$ALPHA_DIR"]="$HOME/state/queue/alpha.jsonl" ["$BRAVO_DIR"]="$HOME/state/queue/bravo.jsonl")',
-      ...['ALPHA_ID', 'BRAVO_ID', 'OBSERVE_ROWS'].map(name => test29Script.match(new RegExp(`^${name}=.*$`, 'm'))![0]),
+      ...['ALPHA_ID', 'BRAVO_ID'].map(name => test29Script.match(new RegExp(`^${name}=.*$`, 'm'))![0]),
       test29Script.match(/^OBSERVE_SAFE='[\s\S]*?;'$/m)![0],
-      declaration(test29Script, 'exit_observe'), `OBSERVE_ON_EXIT=${observe}`, 'exit_observe',
+      declaration(test29Script, 'exit_observe').replaceAll('/test-results', '${HOME}/kept-results'), `OBSERVE_ON_EXIT=${observe}`, 'exit_observe',
     ].join('\n')
     const quiet = shell(program('0'), files)
     expect({ status: quiet.status, stdout: quiet.stdout, stderr: quiet.stderr }).toEqual({ status: 0, stdout: '', stderr: '' })
     const run = shell(program('1'), files)
     expect(run.stderr).toBe('')
-    expect(run.stdout.trim().split('\n')).toEqual([
-      'exit-observe: persona=alpha queue kind=sent seq=1 send_kind=enter at=3',
-      'exit-observe: persona=alpha queue kind=delivered seq=1 send_kind=absent at=4',
-      'exit-observe: persona=alpha queue kind=accepted seq=2 send_kind=absent at=5',
-      'exit-observe: persona=alpha queue kind=sent seq=2 send_kind=invalid at=6',
-      'exit-observe: persona=alpha queue kind=invalid seq=2 send_kind=absent at=7',
-      'exit-observe: persona=alpha stub_hook command=receipt event=Stop session_id=s1 pid=4 at=10.5',
-      'exit-observe: persona=alpha stub_hook command=submitted event=UserPromptSubmit session_id=s1 pid=4 at=12.0',
-      'exit-observe: persona=alpha stub_hook command=invalid event=Stop session_id=s1 pid=4 at=13.0',
-      'exit-observe: persona=alpha stub_hook command=complete-1 event=Stop session_id=s1 pid=4 at=14.0',
-      'exit-observe: persona=alpha stub_hook command=receipt event=Stop session_id=s1 pid=4 at=15.0',
+    expect(run.stdout.trim().split('\n').filter(line => !line.startsWith('exit-observe: evidence '))).toEqual([
+      'exit-observe: persona=alpha queue kind=accepted seq=1 attempt=absent send_kind=absent at=1',
+      'exit-observe: persona=alpha queue kind=sent seq=1 attempt=absent send_kind=text at=2',
+      'exit-observe: persona=alpha queue kind=sent seq=1 attempt=absent send_kind=enter at=3',
+      'exit-observe: persona=alpha queue kind=delivered seq=1 attempt=absent send_kind=absent at=4',
+      'exit-observe: persona=alpha queue kind=accepted seq=2 attempt=absent send_kind=absent at=5',
+      `exit-observe: persona=alpha queue kind=sent seq=2 attempt=absent send_kind=invalid:sha256:${textHash(tok)}:bytes:${Buffer.byteLength(tok)} at=6`,
+      `exit-observe: persona=alpha queue kind=invalid:sha256:${textHash(secret)}:bytes:${Buffer.byteLength(secret)} seq=2 attempt=absent send_kind=absent at=7`,
+      'exit-observe: persona=alpha stub_hook command=permission-1 event=PermissionRequest session_id=s1 pid=4 at=9.0 text_hash=absent',
+      'exit-observe: persona=alpha stub_hook command=receipt event=Stop session_id=s1 pid=4 at=10.5 text_hash=absent',
+      'exit-observe: persona=alpha stub_hook command=submitted event=UserPromptSubmit session_id=s1 pid=4 at=12.0 text_hash=absent',
+      `exit-observe: persona=alpha stub_hook command=invalid:sha256:${textHash(`say ${secret}`)}:bytes:${Buffer.byteLength(`say ${secret}`)} event=Stop session_id=s1 pid=4 at=13.0 text_hash=absent`,
+      'exit-observe: persona=alpha stub_hook command=complete-1 event=Stop session_id=s1 pid=4 at=14.0 text_hash=absent',
+      'exit-observe: persona=alpha stub_hook command=receipt event=Stop session_id=s1 pid=4 at=15.0 text_hash=absent',
       `exit-observe: persona=alpha ad_state=waiting session_id=${session} launch_started_at=2030-01-01T00:00:00Z last_seen_at=2030-01-01T00:00:04Z ended_at=absent`,
       'exit-observe: persona=alpha control=receipt',
       'exit-observe: persona=alpha control=permission-1',
-      'exit-observe: persona=alpha control=invalid',
+      `exit-observe: persona=alpha control=invalid:sha256:${textHash(secret)}:bytes:${Buffer.byteLength(secret)}`,
       'exit-observe: persona=bravo queue=absent',
       'exit-observe: persona=bravo instance=unavailable',
     ])
     expect(run.stdout).not.toContain(secret); expect(run.stdout).not.toContain('cscb_other'); expect(run.stdout).not.toContain('updated_at')
     expect(run.stdout).not.toContain(tok)
+    const evidence = run.stdout.split('\n').filter(line => line.startsWith('exit-observe: evidence '))
+      .map(line => JSON.parse(line.slice('exit-observe: evidence '.length)))
+    // Every fixture row is represented, including the partial journal tail and
+    // old controls. Unknown text stays redacted in the complete log too.
+    expect(evidence.filter(row => row.file === 'alpha.jsonl')).toHaveLength(8)
+    expect(evidence.filter(row => row.file === 'stub-claude-hooks.s1.jsonl')).toHaveLength(3)
+    expect(evidence.filter(row => row.file === `stub-claude-hooks.${session}`)).toHaveLength(3)
+    expect(evidence.find(row => row.file === 'alpha.jsonl' && row.line === 8).value.incomplete_or_invalid).toBe(true)
+
+  })
+  test.each([true, false])('test-29 actual evidence reader and observer reject short and embedded token prefixes: reader=%s', reader => {
+    const session = '0123abcd-0000-4000-8000-000000000001'
+    const unsafe = [BOT_TOKEN_PREFIX, APP_TOKEN_PREFIX].flatMap(prefix => [prefix + 'a', 'known-' + prefix + 'a', prefix + 'a\r'])
+    const run = shell([
+      'ALPHA_DIR=alpha BRAVO_DIR=bravo ALPHA_ID=cscb_alpha BRAVO_ID=cscb_bravo',
+      'SCENARIO_FIXTURES="$HOME/fixtures" STUB_BIN="$HOME/bin" SLACK_STATE_DIR="$HOME/state" OBSERVE_ON_EXIT=1',
+      'declare -A DELIVERIES_FILE=([alpha]="$HOME/state/queue/alpha.jsonl" [bravo]="$HOME/state/queue/bravo.jsonl")',
+      ...(reader ? [] : ['bun() { return 1; }']),
+      `timeout() { printf '%s\\n' '{' '  "state":"waiting",' '  "session_id":"${session}"' '}'; }`,
+      test29Script.match(/^OBSERVE_SAFE='[\s\S]*?;'$/m)![0], declaration(test29Script, 'exit_observe'),
+      'exit_observe',
+    ].join('\n'), {
+      'fixtures/stub-submission-audit.ts': submissionEvidenceProgram(),
+      'state/queue/alpha.jsonl': jsonl(unsafe.map((text, i) => ({ kind: text, seq: i + 1, attempt: 2, send_kind: text, at: i }))),
+      [`bin/stub-claude-hooks.${session}.jsonl`]: jsonl(unsafe.map((text, i) => ({
+        command: text, event: text, instance_id: 'cscb_alpha', text_hash: textHash(`item-${i}`), at: `${i}.0`,
+      }))),
+      // Include an unterminated control: observation must keep it too.
+      [`bin/stub-claude-hooks.${session}`]: ['receipt', ...unsafe].join('\n'),
+    })
+    assertNoLeak({ stdout: run.stdout, stderr: run.stderr })
+    expect(run.status).toBe(0)
+    expect(run.stderr).toBe('')
+    for (const text of unsafe) {
+      const marker = `invalid:sha256:${textHash(text)}:bytes:${Buffer.byteLength(text)}`
+      for (const field of ['kind', 'send_kind', 'command', 'event', 'control']) expect(run.stdout).toContain(`${field}=${marker}`)
+    }
+    expect(run.stdout).toContain('control=receipt')
+    if (reader) {
+      const evidence = run.stdout.split('\n').filter(line => line.startsWith('exit-observe: evidence '))
+        .map(line => JSON.parse(line.slice('exit-observe: evidence '.length)))
+      expect(evidence.filter(row => row.file === 'alpha.jsonl')).toHaveLength(unsafe.length)
+      expect(evidence.filter(row => row.file === `stub-claude-hooks.${session}.jsonl`)).toHaveLength(unsafe.length)
+      const controls = evidence.filter(row => row.file === `stub-claude-hooks.${session}`)
+      expect(controls).toHaveLength(unsafe.length + 1)
+      expect(controls.at(-1).terminated).toBe(false)
+      for (const [i, text] of unsafe.entries()) {
+        const marker = `invalid:sha256:${textHash(text)}:bytes:${Buffer.byteLength(text)}`
+        expect(controls[i + 1].value.control).toBe(marker)
+        const queueRow = evidence.find(row => row.file === 'alpha.jsonl' && row.line === i + 1)
+        expect(queueRow.value).toMatchObject({ kind: marker, send_kind: marker, seq: i + 1, attempt: 2 })
+        const hookRow = evidence.find(row => row.file === `stub-claude-hooks.${session}.jsonl` && row.line === i + 1)
+        expect(hookRow.value).toMatchObject({ command: marker, event: marker, text_hash: textHash(`item-${i}`) })
+      }
+    } else expect(run.stdout).toContain('complete-evidence=unreadable')
+  })
+  test('test-29 emitted failure evidence obeys ordinary /ci ownership and logs archived rows and old controls', () => {
+    const session = '0123abcd-0000-4000-8000-000000000001'
+    const run = shell([
+      'mkdir -p "$HOME/results/shard-1" "$HOME/bin" "$HOME/state/queue"',
+      'ALPHA_DIR=alpha BRAVO_DIR=bravo ALPHA_ID=cscb_alpha BRAVO_ID=cscb_bravo',
+      'SCENARIO_FIXTURES="$HOME/fixtures" STUB_BIN="$HOME/bin" SLACK_STATE_DIR="$HOME/state" OBSERVE_ON_EXIT=1',
+      'declare -A DELIVERIES_FILE=([alpha]="$HOME/state/queue/alpha.jsonl" [bravo]="$HOME/state/queue/bravo.jsonl")',
+      'timeout() { return 1; }; mkdir() { echo unexpected-mkdir >&2; return 1; }; cp() { echo unexpected-copy >&2; return 1; }',
+      test29Script.match(/^OBSERVE_SAFE='[\s\S]*?;'$/m)![0],
+      declaration(test29Script, 'exit_observe').replaceAll('/test-results', '${HOME}/results/shard-1'),
+      'exit_observe > "$HOME/results/shard-1/test-29-invited-channels.sh.log"',
+      'cat "$HOME/results/shard-1/test-29-invited-channels.sh.log"',
+    ].join('\n'), {
+      'fixtures/stub-submission-audit.ts': submissionEvidenceProgram(),
+      'queue-evidence-alpha.jsonl': jsonl([{ kind: 'fixed', seq: 42, parts: ['archived-fixture'] },
+        { kind: 'sent', seq: 42, attempt: 7, send_kind: 'text', at: 123 }]),
+      [`bin/stub-claude-hooks.${session}`]: 'receipt:' + 'a'.repeat(64) + '\n',
+      [`bin/stub-claude-hooks.${session}.jsonl`]: jsonl([{ command: 'submitted', instance_id: 'cscb_alpha', text_hash: 'a'.repeat(64), at: '1.0' }]),
+    }, root => {
+      const inputs: IntegrityInputs = { runDir: join(root, 'results'), expectedScripts: ['test-29-invited-channels.sh'],
+        assignment: [{ shard: 1, assigned: ['test-29-invited-channels.sh'], expectedSeconds: 1, limitMinutes: 1 }], shards: [], pinnedImageId: null,
+        packageSha256: null, tarballPath: null, faults: [], firingRecords: [], runState: { shardsScheduled: true, imageBuildFailed: false, stopTime: null } }
+      expect(checkResultsOwnership(inputs, readIntegrityEvidence(inputs.runDir, [1]))).toEqual([])
+    })
+    expect(run.status).toBe(0)
+    expect(run.stdout).toContain(textHash('archived-fixture'))
+    expect(run.stdout).toContain('"attempt":7')
+    expect(run.stdout).toContain('receipt:' + 'a'.repeat(64))
+  })
+  test('test-29 retains its diagnostic log when the complete evidence reader fails', () => {
+    const run = shell([
+      'ALPHA_DIR=alpha BRAVO_DIR=bravo ALPHA_ID=cscb_alpha BRAVO_ID=cscb_bravo',
+      'SCENARIO_FIXTURES=unused STUB_BIN="$HOME/bin" SLACK_STATE_DIR="$HOME/state" OBSERVE_ON_EXIT=1',
+      'declare -A DELIVERIES_FILE=([alpha]="$HOME/state/queue/alpha.jsonl" [bravo]="$HOME/state/queue/bravo.jsonl")',
+      'bun() { return 1; }; timeout() { return 1; }',
+      test29Script.match(/^OBSERVE_SAFE='[\s\S]*?;'$/m)![0], declaration(test29Script, 'exit_observe'),
+      'exit_observe',
+    ].join('\n'), { 'state/queue/alpha.jsonl': jsonl([{ kind: 'sent', seq: 9, attempt: 3, send_kind: 'text', at: 50 }]) })
+    expect(run.status).toBe(0)
+    expect(run.stdout).toContain('exit-observe: complete-evidence=unreadable\n')
+    expect(run.stdout).toContain('queue kind=sent seq=9 attempt=3 send_kind=text at=50')
+  })
+  test.each([false, true])('test-29 cleanup audit failures survive diagnostic-only before-cleanup hooks: bad=%s', bad => {
+    const run = shell([
+      'ALPHA_DIR=alpha BRAVO_DIR=bravo',
+      `audit_submissions() { echo "audit:$1"; ${bad ? '[[ "$1" != alpha ]]' : ':'}; }`,
+      'exit_observe_stderr() { echo evidence-kept; }', declaration(test29Script, 'audit_before_cleanup'),
+      test29Script.match(/^audit_cleanup_result\(\) \{.*\}$/m)![0],
+      'if audit_before_cleanup; then echo before-pass; else echo before-fail; fi',
+      'audit_cleanup_result',
+    ].join('\n'))
+    expect(run.status).toBe(bad ? 1 : 0)
+    expect(run.stdout).toBe('audit:alpha\naudit:bravo\n' + (bad ? 'evidence-kept\nbefore-fail\n' : 'before-pass\n'))
+  })
+  test.each(['healthy', 'audit-fails'])('test-29 drain calls the submission audit on both sides of receipt completion: %s', mode => {
+    const run = shell([
+      'declare -A QUEUE_KEY=([alpha]=k_alpha) QUEUE_ARCHIVES=([alpha]=archive)',
+      'snapshot_queue() { echo snapshot; }', 'shared_wait_queue_drained() { echo receipts-complete; }',
+      `audit_submissions() { echo audit; ${mode === 'audit-fails' ? 'return 1' : ':'}; }`,
+      declaration(test29Script, 'wait_queue_drained'), 'wait_queue_drained alpha',
+    ].join('\n'))
+    expect(run.status).toBe(mode === 'healthy' ? 0 : 1)
+    expect(run.stdout).toBe(mode === 'healthy' ? 'snapshot\naudit\nreceipts-complete\nsnapshot\naudit\n' : 'snapshot\naudit\n')
   })
   // In a script file, a failure inside a call whose stdout is discarded runs
   // the exit hooks with that stdout (as the scenario's cleanup runs them, in a

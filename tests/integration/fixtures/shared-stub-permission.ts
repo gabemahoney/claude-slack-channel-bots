@@ -1,7 +1,8 @@
 /** Shared-mode controls for the existing registered-hook stub, image only.
  * setup <work> selects displayed-states BEFORE that worker is launched.
  * permission-1|permission-2 <work> <key> queues each permission once/session.
- * receipt <work> <key> releases one submitted text (displayed-states delays it).
+ * receipt <work> <key> [<accepted-identity-json> <queue-archive>] releases
+ * only the held submission matching that accepted item (or the FIFO head).
  * outcome <work> <key> <token> reads AD's decision/delivery, never decides it.
  * complete-1|complete-2 <work> <key> <token>, once AD reads that observed
  * request allow/delivered: ends the allowed turn through the registered Stop
@@ -23,7 +24,7 @@
  * notice-resume also accepts the same-session row a server start already
  * resumed, without resuming it again.
  */
-import { existsSync, realpathSync, lstatSync, readFileSync, openSync, closeSync, fstatSync, readSync, writeSync, constants } from 'node:fs'
+import { existsSync, realpathSync, lstatSync, readFileSync, openSync, closeSync, fstatSync, readSync, writeSync, renameSync, constants } from 'node:fs'
 import { join, resolve, sep } from 'node:path'
 
 if (!existsSync('/etc/cscb-ci-image')) {
@@ -31,6 +32,7 @@ if (!existsSync('/etc/cscb-ci-image')) {
   process.exit(2)
 }
 const { captureLiveLife, waitForLifeExit } = await import('./ended-life.ts')
+const { pairReceipt, auditSubmissions, formatSubmissionIssues } = await import('./stub-submission-audit.ts')
 
 // The redacted failure line's fixed step label and last bound AD row state.
 let failureStep = 'prerequisites'
@@ -90,6 +92,35 @@ function appendControl(path: string, text: string): void {
     requireFact(fstatSync(fd).isFile() && fstatSync(fd).size < 1024 * 1024)
     requireFact(writeSync(fd, text) === Buffer.byteLength(text))
   } finally { closeSync(fd) }
+}
+async function retainQueueSnapshot(root: string, queuePath: string, archive: string, deadline: number): Promise<void> {
+  const prior = scratchPath(root, archive)
+  const observation = scratchPath(root, archive + '.receipt-observation.jsonl')
+  const merged = scratchPath(root, archive + '.receipt-merged.jsonl')
+  const live = boundedText(queuePath)
+  const writeFile = (path: string, text: string) => {
+    const fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NONBLOCK | constants.O_NOFOLLOW, 0o600)
+    try {
+      requireFact(fstatSync(fd).isFile())
+      requireFact(writeSync(fd, text) === Buffer.byteLength(text))
+    } finally { closeSync(fd) }
+  }
+  // A separate observation preserves the merger's one-acceptance-per-input
+  // contract. Never append a second observation into an existing snapshot.
+  writeFile(observation, live.slice(0, live.lastIndexOf('\n') + 1))
+  writeFile(merged, '')
+  const output = openSync(merged, constants.O_WRONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW)
+  try {
+    requireFact(Date.now() < deadline)
+    const child = Bun.spawn([process.execPath, join(import.meta.dir, 'fmk-texts.ts'), 'sharedQueueSnapshot',
+      observation, ...(existsSync(prior) ? [prior] : [])], { stdin: 'ignore', stdout: output, stderr: 'ignore' })
+    // The merge shares the existing submission deadline, with no new retry.
+    const timer = setTimeout(() => child.kill(), deadline - Date.now())
+    try { requireFact(await child.exited === 0) }
+    finally { clearTimeout(timer) }
+    boundedText(merged)
+    renameSync(merged, prior)
+  } finally { closeSync(output) }
 }
 function writeNoticeEvidence(path: string, value: object, exclusive = false): void {
   const fd = openSync(path, constants.O_WRONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW |
@@ -208,7 +239,7 @@ async function run() {
   failureStep = 'prerequisites'
   failureState = undefined
   failureFacts = {}
-  const [binArg, command, workArg, key, token] = process.argv.slice(2)
+  const [binArg, command, workArg, key, token, archive] = process.argv.slice(2)
   requireFact(binArg && workArg && ['setup', 'permission-1', 'permission-2', 'receipt', 'outcome',
     'complete-1', 'complete-2', 'notice-setup', 'notice-end', 'notice-ended', 'notice-resume'].includes(command))
   const root = realpathSync(process.env.SCENARIO_ROOT!)
@@ -301,7 +332,7 @@ async function run() {
     }
     const complete = command.startsWith('complete-')
     failureStep = 'hook control files'
-    requireFact(complete ? token : !token)
+    requireFact(complete ? token : command === 'receipt' || !token)
     const control = scratchPath(root, join(bin, `stub-claude-hooks.${session}`))
     const record = scratchPath(root, control + '.jsonl')
     const observed = scratchPath(root, control + '.observed')
@@ -320,19 +351,49 @@ async function run() {
     const prior = records().filter(r => r.command === command).length
     failureFacts = { command, prior, bound: 'submission', deadline_ms: 20000 }
     const waitStarted = Date.now(), deadline = waitStarted + 20000
+    let releaseHash: string | undefined
     if (command === 'receipt') {
       // A durable queue ACK can precede typing. Wait for this stub's recorded
       // submission, never a pane. A previously queued, unobserved release is
       // not retried: it might still execute.
-      requireFact(commands.filter(c => c === 'receipt').length === prior)
+      requireFact(commands.filter(c => c === 'receipt' || c.startsWith('receipt:')).length === prior)
+      const queuePath = scratchPath(root, join(process.env.SLACK_STATE_DIR!, 'queue', `${key}.jsonl`))
+      const queue = () => [queuePath, ...(archive ? [scratchPath(root, archive)] : [])].flatMap(path => {
+        const text = boundedText(path, true)
+        return text.slice(0, text.lastIndexOf('\n') + 1).split('\n').filter(Boolean).map(line => JSON.parse(line))
+      })
+      const target = token ? JSON.parse(token) : undefined
+      if (target) requireFact(typeof target.channel === 'string' && typeof target.ts === 'string')
+      const held = () => {
+        const all = observe(), rows = queue()
+        // The scenario archive preserves accepts removed by compaction.
+        if (archive) {
+          const issues = auditSubmissions(rows, all)
+          for (const line of formatSubmissionIssues(issues)) console.error(line)
+          requireFact(!issues.length)
+        }
+        try { return pairReceipt(rows, all, target) }
+        catch (error) {
+          const issues = (error as { issues?: import('./stub-submission-audit.ts').SubmissionIssue[] }).issues ?? auditSubmissions(rows, all)
+          for (const line of formatSubmissionIssues(issues)) console.error(line)
+          const reason = (error as Error).message.split(' ')[0]!
+          failureFacts.pairing = /^[a-z-]+$/.test(reason) ? reason : 'invalid'
+          throw error
+        }
+      }
       failureStep = 'receipt: no submitted record'
-      while (observe().filter(r => r.command === 'submitted').length <= prior) {
+      let submission
+      while (!(submission = held())) {
         failureFacts.elapsed_ms = Date.now() - waitStarted
         requireFact(Date.now() < deadline)
         bind(await client.get({ instance_id: id }))
         failureFacts.ad_read_at = Date.now()
         await Bun.sleep(100)
       }
+      releaseHash = submission.text_hash
+      requireFact(releaseHash && /^[a-f0-9]{64}$/.test(releaseHash))
+      // Publish one validated snapshot before this release can permit compaction.
+      if (archive) await retainQueueSnapshot(root, queuePath, archive, deadline)
     }
     if (complete) {
       // Only this session's observed request, decided allow and delivered to
@@ -356,7 +417,7 @@ async function run() {
     failureStep = 'control append'
     requireFact(!complete || bind(await client.get({ instance_id: id })).state !== 'waiting')
     bind(await client.get({ instance_id: id }))
-    appendControl(control, command + '\n')
+    appendControl(control, (releaseHash ? `receipt:${releaseHash}` : command) + '\n')
     failureStep = 'registered hook evidence'
     // The appended control's evidence has its own bound, not what the
     // submission wait left. One last pass after it expires reads the records
@@ -373,6 +434,7 @@ async function run() {
       if (events.length === prior + 1) {
         requireFact(events.at(-1).instance_id === id && events.at(-1).session_id === session)
         if (command === 'receipt') {
+          requireFact(events.at(-1).text_hash === releaseHash)
           console.log(JSON.stringify({ instance_id: id, session_id: session, command, state: row.state }))
           return
         }
