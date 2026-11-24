@@ -3190,8 +3190,10 @@ describe('SR-8 evidence execution boundaries', () => {
     expect(compact(main.body!.statements[0]!.getText(sf))).toBe(
       "if (!existsSync('/etc/cscb-ci-image')) { console.error('FAIL: sr8-evidence requires the CI image'); return 2 }")
     const printer = functions.find(f => f.name?.text === 'printer')!
-    expect(compact(printer.getText(sf))).toBe(compact(`function printer(name: string, ...args: string[]): string {
-      return execFileSync(process.execPath, [fixture('fmk-texts.ts'), name, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+    expect(compact(printer.getText(sf))).toBe(compact(`function printer(command: string | { name: string; stdout: number }, ...args: string[]): string {
+      const { name, stdout } = typeof command === 'string' ? { name: command, stdout: 'pipe' as const } : command
+      const result = execFileSync(process.execPath, [fixture('fmk-texts.ts'), name, ...args], { encoding: 'utf8', stdio: ['ignore', stdout, 'pipe'] })
+      return stdout === 'pipe' ? result.trim() : ''
     }`))
     const withoutPrinter = source.slice(0, printer.getStart(sf)) + source.slice(printer.end)
     expect(childProcessAudit(parse(withoutPrinter, file))).toEqual({ calls: 0, findings: [] })

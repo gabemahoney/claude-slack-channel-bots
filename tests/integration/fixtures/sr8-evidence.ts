@@ -1497,8 +1497,10 @@ export function faultRewriters(plan: FaultPlan): string[] {
 // CLI adapters. Errors never echo raw evidence, event text, credentials or exceptions.
 const pkg = () => resolve(process.env.CSCB_PKG_DIR ?? '/test-repo/node_modules/claude-slack-channel-bots')
 const fixture = (name: string) => join(import.meta.dir, name)
-function printer(name: string, ...args: string[]): string {
-  return execFileSync(process.execPath, [fixture('fmk-texts.ts'), name, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+function printer(command: string | { name: string; stdout: number }, ...args: string[]): string {
+  const { name, stdout } = typeof command === 'string' ? { name: command, stdout: 'pipe' as const } : command
+  const result = execFileSync(process.execPath, [fixture('fmk-texts.ts'), name, ...args], { encoding: 'utf8', stdio: ['ignore', stdout, 'pipe'] })
+  return stdout === 'pipe' ? result.trim() : ''
 }
 const population = () => import('../../test-helpers/thread-populations.ts')
 function jsonl(path: string, offset = 0, requireNewline = false): any[] | undefined {
@@ -1819,8 +1821,8 @@ function heldProbeQueues(items: HeldProbe[], stateDir: string, out: string): Rec
     const fd = openSync(temporary, 'wx', 0o600)
     let saved = false
     try {
-      execFileSync(process.execPath, [fixture('fmk-texts.ts'), 'sharedQueueSnapshot', join(stateDir, 'queue', `${key}.jsonl`),
-        ...(existsSync(archive) ? [archive] : [])], { stdio: ['ignore', fd, 'pipe'] })
+      printer({ name: 'sharedQueueSnapshot', stdout: fd }, join(stateDir, 'queue', `${key}.jsonl`),
+        ...(existsSync(archive) ? [archive] : []))
       writeSync(fd, '\n')
       const queue = jsonl(temporary, 0, true)
       if (!queue) throw new Error('invalid held queue snapshot')
