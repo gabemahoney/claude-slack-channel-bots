@@ -1,0 +1,7 @@
+recorded: denied subagent settled {"request_token":"511bfb85-263f-412a-a7aa-1fe76d269c8b","agent_id":"af346bbb4eae1f98f","session_id":"cf597918-e1f1-44c6-9c0f-a0880b5b5246","denial_at":"2026-11-24T09:06:25.652Z","subagent_completed_at":1795511190218,"main_completed_at":1795511201919}
+recorded: denied subagent request proven gone at turn end {"proven_gone_at":"2026-11-24T09:06:30.173Z","decided_at":"2026-11-24T09:06:25Z"}
+  | [2026-11-24T09:06:26.859Z] [slack] message-received: persona="busy" (key=busy) source=interject sender="reply-reminder" ts="1795511186.855000" sender_id="reply-reminder"
+  | [2026-11-24T09:06:29.979Z] [slack] delivery-stuck: persona="busy" (key=busy) source=interject sender="reply-reminder" ts="1795511186.855000" sender_id="reply-reminder" reason=dialog-hold age_ms=3124
+  | [2026-11-24T09:06:42.316Z] [slack] message-received: persona="busy" (key=busy) source=slack chat_id="D0BUSY" ts="1795511202.276771" sender_id="U0BUSY"
+  | [2026-11-24T09:06:43.906Z] [slack] message-delivered: persona="busy" (key=busy) source=interject sender="reply-reminder" ts="1795511186.855000" sender_id="reply-reminder" at=1795511203906 wait_ms=17051
+  | [2026-11-24T09:06:53.804Z] [slack] message-delivered: persona="busy" (key=busy) source=slack chat_id="D0BUSY" ts="1795511202.276771" sender_id="U0BUSY" at=1795511213804 wait_ms=11490

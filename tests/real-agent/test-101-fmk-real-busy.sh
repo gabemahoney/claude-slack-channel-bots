@@ -84,7 +84,11 @@ real_ad get --instance-id "$(real_instance "${REAL_KEY}")" > "${SCENARIO_ROOT}/d
 case_assert subagent-proven-gone "${SCENARIO_ROOT}/deny-click.json" "${SCENARIO_ROOT}/denied-request.json" "${SCENARIO_ROOT}/denied-row.json"
 real_dm "${REAL_LABEL}" 'message after denied subagent request'
 real_wait_delivery "${REAL_KEY}" 6
-case_assert no-stuck
+# An async main turn may queue a reply reminder into the denied subagent's
+# dialog hold, which can outlast this test's 3 s stuck interval. Allow only
+# that pre-proof item with exactly one post-proof delivery; all other stuck
+# notices still fail. The earlier permission-hold no-stuck stays strict.
+case_assert no-stuck "${SCENARIO_ROOT}/deny-click.json" "${SCENARIO_ROOT}/denied-request.json" "${SCENARIO_ROOT}/denied-row.json"
 # The kill must find accepted, durably incomplete work. Setup only: a
 # pre-allowed sleep keeps the agent inside one tool call while message eight
 # is accepted, and leaves no prompt for the resumed session to re-ask. Native

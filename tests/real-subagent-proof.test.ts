@@ -1,6 +1,6 @@
-/** Synthetic test-101 subagent proof and test-32 off-script tool evidence; no native agent or credentials. */
+/** Recorded test-101 diagnostics and synthetic AD/subagent proof; no native agent or credentials. */
 import { afterEach, expect, test } from 'bun:test'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { assertDenialEligible, assertSubagentProvenGone, denyClickToken } from './integration/fixtures/real-case-assertions.ts'
@@ -107,6 +107,72 @@ function files(values: { click?: unknown; request?: unknown; row?: unknown }) {
 const cli = (h: ReturnType<typeof files>, command: string, ...args: string[]) =>
   runFixture('fixtures/real-case-assertions.ts', [command, h.root, 'busy', join(h.root, 'shim.log'), h.root, ...args])
 
+// f1fe5ce3 heavy matrix job 3, run.log lines 21784-21785, 21814, 21817,
+// 21819-21820, 21822, kept verbatim; all other lines trimmed. Remove only the
+// failure printer's server.log gutter at replay. The AD proof supplies the
+// real closeout time; click/request/row envelopes below are synthetic.
+const dialogHoldFixture = readFileSync(join(import.meta.dir, 'fixtures/test-101-dialog-hold.log'), 'utf8').split('\n')
+const recorded = (prefix: string) => JSON.parse(dialogHoldFixture.find(line => line.startsWith(prefix))!.slice(prefix.length))
+const settled = recorded('recorded: denied subagent settled ')
+const gone = recorded('recorded: denied subagent request proven gone at turn end ')
+const dialogHoldLog = dialogHoldFixture.filter(line => line.startsWith('  | ')).map(line => line.slice(4)).join('\n') + '\n'
+const reminderDelivery = dialogHoldLog.split('\n').find(line => line.includes('message-delivered:') && line.includes('source=interject'))!
+const reminderNotice = dialogHoldLog.split('\n').find(line => line.includes('delivery-stuck:'))!
+function dialogHoldReplay(log = dialogHoldLog, requestChanges: Record<string, unknown> = {}) {
+  const h = files({ click: click(`perm_deny_${INSTANCE}_${settled.request_token}`),
+    request: permission({ request_token: settled.request_token, ...gone, ...requestChanges }) })
+  writeFileSync(join(h.root, 'server.log'), log)
+  return { ...h, run: () => cli(h, 'no-stuck', h.click, h.request, h.row) }
+}
+
+test('regression: test-101 permits the recorded pre-proof reply-reminder dialog hold with one post-proof delivery', async () => {
+  const result = await dialogHoldReplay().run()
+  expect(result).toMatchObject({ code: 0, err: [] })
+})
+
+test('the permission-hold no-stuck check still rejects the recorded notice without the scoped AD proof', async () => {
+  const h = dialogHoldReplay()
+  expect(await cli(h, 'no-stuck')).toMatchObject({ code: 1, err: ['real-case-assertions: permission prompt raised Delivery stuck'] })
+})
+
+test('scoped no-stuck binds each of two pre-proof reminders to its own post-proof delivery', async () => {
+  const second = dialogHoldLog.split('\n').filter(line => line.includes('source=interject'))
+    .map(line => line.replace('ts="1795511186.855000"', 'ts="1795511186.856000"')).join('\n')
+  expect((await dialogHoldReplay(dialogHoldLog + second + '\n').run()).code).toBe(0)
+})
+
+test('no-stuck passes with no notices, with and without the scoped AD proof', async () => {
+  const h = dialogHoldReplay(dialogHoldLog.replace(reminderNotice + '\n', ''))
+  expect((await h.run()).code).toBe(0)
+  expect((await cli(h, 'no-stuck')).code).toBe(0)
+})
+
+test.each([
+  ['missing proof', { proven_gone_at: null }],
+  ['unreadable proof', { proven_gone_at: 'later' }],
+  ['another request', { request_token: TOKEN }],
+  ['still held', { unproven_since: gone.decided_at }],
+] as const)('scoped no-stuck rejects %s', async (_name, requestChanges) => {
+  expect((await dialogHoldReplay(dialogHoldLog, requestChanges).run()).code).toBe(1)
+})
+
+test.each([
+  ['another reason', dialogHoldLog.replace('reason=dialog-hold', 'reason=receipt-wait')],
+  ['another source', dialogHoldLog.replaceAll('source=interject', 'source=cron')],
+  ['another sender', dialogHoldLog.replaceAll('sender="reply-reminder"', 'sender="other"')],
+  ['accepted after proof', dialogHoldLog.replace('09:06:26.859Z', '09:06:30.174Z')],
+  ['accepted exactly at proof', dialogHoldLog.replace('09:06:26.859Z', '09:06:30.173Z')],
+  ['never delivered', dialogHoldLog.replace(reminderDelivery + '\n', '')],
+  ['delivered twice', dialogHoldLog + reminderDelivery + '\n'],
+  ['delivered before proof', dialogHoldLog.replace('09:06:43.906Z', '09:06:30.172Z').replace('at=1795511203906', 'at=1795511190172')],
+  ['a second stuck item without its own delivery', dialogHoldLog + reminderNotice.replace('ts="1795511186.855000"', 'ts="1795511186.856000"') + '\n'],
+  ['missing acceptance', dialogHoldLog.replace(/^.*message-received:.*source=interject.*\n/m, '')],
+  ['another delivery identity', dialogHoldLog.replace(reminderDelivery, reminderDelivery.replace('ts="1795511186.855000"', 'ts="1795511186.856000"'))],
+  ['another persona', dialogHoldLog.replaceAll('(key=busy)', '(key=other)')],
+] as const)('scoped no-stuck rejects %s', async (_name, log) => {
+  expect((await dialogHoldReplay(log).run()).code).toBe(1)
+})
+
 test('CLI deny-token prints only the token; subagent-proven-gone records the proof', async () => {
   const h = files({})
   const token = await cli(h, 'deny-token', h.click)
@@ -212,7 +278,7 @@ test('test-101 proves message eight still open after the kill with the server st
   expect([...text.matchAll(/'Run exactly sleep ([\d ]+) with Bash now\.'/g)].map(m => m[1])).toEqual(['20', '20 20 20'])
 })
 
-test('test-101 reads the denied request, then the row, before its next DM, and the next DM is delivered without a stuck notice', async () => {
+test('test-101 reads the denied request, then the row, before its next DM and passes that proof only to the second no-stuck check', async () => {
   const text = await Bun.file(join(import.meta.dir, 'real-agent/test-101-fmk-real-busy.sh')).text()
   const settled = text.indexOf('busy_denial_settled\n', text.indexOf('wait_until 180 \'denied subagent did not settle'))
   const at = (needle: string) => { const i = text.indexOf(needle, settled); expect(i).toBeGreaterThan(settled); return i }
@@ -221,7 +287,7 @@ test('test-101 reads the denied request, then the row, before its next DM, and t
   const proof = at('case_assert subagent-proven-gone')
   const dm = at("real_dm \"${REAL_LABEL}\" 'message after denied subagent request'")
   const delivered = at('real_wait_delivery "${REAL_KEY}" 6')
-  const noStuck = at('case_assert no-stuck')
+  const noStuck = at('case_assert no-stuck "${SCENARIO_ROOT}/deny-click.json" "${SCENARIO_ROOT}/denied-request.json" "${SCENARIO_ROOT}/denied-row.json"')
   const kill = at('real_kill_and_reconcile')
   expect(at('real_wait_idle "${REAL_KEY}"')).toBeLessThan(permissionRead)
   expect([permissionRead, rowRead, proof, dm, delivered, noStuck, kill]).toEqual([permissionRead, rowRead, proof, dm, delivered, noStuck, kill].sort((a, b) => a - b))
@@ -229,6 +295,9 @@ test('test-101 reads the denied request, then the row, before its next DM, and t
   const relaunch = at('real_wait_relaunch "${REAL_KEY}"')
   expect(text.indexOf('real_wait_delivery "${REAL_KEY}" 8', relaunch)).toBeGreaterThan(relaunch)
   expect(text).not.toContain('dialog-notice')
+  // The earlier permission-hold proof and the measured timer stay exact.
+  expect(text.match(/^case_assert no-stuck$/gm)).toHaveLength(1)
+  expect(text).toContain('real_write_config \'{"test_timer_overrides":{"delivery_stuck_after_ms":3000}}\'')
 })
 
 test('test-32 pre-allows only the harmless router acknowledgements; reply stays CSCB\'s launch pair', async () => {

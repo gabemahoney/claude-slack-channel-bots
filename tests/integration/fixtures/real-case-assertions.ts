@@ -151,6 +151,42 @@ export function assertSubagentProvenGone(token: string, permission: any, row: an
   return { proven_gone_at: permission.proven_gone_at, decided_at: permission.decided_at ?? null }
 }
 
+/** Test 101's second no-stuck check only: an async main turn can queue a
+ * reply reminder while the denied subagent still holds its dialog. That hold
+ * can exceed the scenario's 3 s stuck interval. Every allowed item needs its
+ * own exact acceptance identity and one delivery after AD's closeout proof. */
+function assertNoStuck(log: string, key: string, provenGoneAt?: string) {
+  const lines = log.split('\n'), notices = lines.filter(line => line.includes('delivery-stuck:'))
+  if (provenGoneAt === undefined) {
+    check(notices.length === 0, 'permission prompt raised Delivery stuck')
+    return
+  }
+  const proofAt = Date.parse(provenGoneAt)
+  check(Number.isFinite(proofAt), 'dialog-hold allowance has no readable AD proof time')
+  const events = lines.flatMap(line => {
+    const match = line.match(/^\[([^\]]+)\] \[slack\] (message-received|message-delivered): (.*)$/)
+    return match ? [{ at: Date.parse(match[1]!), kind: match[2], body: match[3]! }] : []
+  })
+  for (const line of notices) {
+    const notice = line.match(/^\[([^\]]+)\] \[slack\] delivery-stuck: (.+) reason=dialog-hold age_ms=\d+$/)
+    check(notice, 'unexpected Delivery stuck outside the denied subagent dialog-hold allowance')
+    const identity = notice[2]!, noticedAt = Date.parse(notice[1]!)
+    const reminder = identity.match(/^persona=(.+) \(key=([^)]*)\) source=interject sender="reply-reminder" ts="(\d+\.\d+)" sender_id="reply-reminder"$/)
+    check(reminder && reminder[1] === JSON.stringify(key) && reminder[2] === key && Number.isFinite(noticedAt),
+      'Delivery stuck is not this persona\'s reply reminder')
+    const accepted = events.filter(event => event.kind === 'message-received' && event.body === identity)
+    check(accepted.length === 1 && Number.isFinite(accepted[0]!.at) && accepted[0]!.at < proofAt,
+      'dialog-hold item lacks one acceptance before the denied request was proven gone')
+    const delivered = events.filter(event => event.kind === 'message-delivered'
+      && (event.body === identity || event.body.startsWith(identity + ' ')))
+    check(delivered.length === 1, 'dialog-hold item was not delivered exactly once')
+    const completion = delivered[0]!, timing = completion.body.slice(identity.length).match(/^ at=(\d+) wait_ms=(\d+)$/)
+    check(timing && Number.isFinite(completion.at) && completion.at > proofAt
+      && Number.isSafeInteger(Number(timing[1])) && Number(timing[1]) > proofAt && completion.at >= noticedAt,
+      'dialog-hold item was not delivered after the denied request was proven gone')
+  }
+}
+
 /** Bind first-waiting evidence to this persona and its durable AD session. */
 export function assertFirstLaunchWaiting(waiting: LaunchObservation[], sent: { session_id?: string; at: number }[], key: string, start: number, textAt: number): LaunchObservation {
   check(waiting.some(r => r.key === key && r.at >= start && r.at <= textAt), 'actual first-waiting launch observation missing')
@@ -561,7 +597,14 @@ try {
     const proof=assertSubagentProvenGone(token,read(arg2),read(arg3),'cscb_'+key)
     console.log('recorded: denied subagent request proven gone at turn end '+JSON.stringify(proof))
   } else if(command==='no-stuck') {
-    check(!readFileSync(join(state!,'server.log'),'utf8').includes('delivery-stuck:'),'permission prompt raised Delivery stuck')
+    // No arguments keeps the earlier permission-hold proof strict. The second
+    // check reuses the very same recorded Deny and AD reads as its closeout proof.
+    let provenGoneAt: string | undefined
+    if(arg!==''||arg2!==''||arg3!=='') {
+      const [click,request,row]=[arg,arg2,arg3].map(path=>JSON.parse(readFileSync(path,'utf8')))
+      provenGoneAt=assertSubagentProvenGone(denyClickToken(click,'cscb_'+key),request,row,'cscb_'+key).proven_gone_at
+    }
+    assertNoStuck(readFileSync(join(state!,'server.log'),'utf8'),key!,provenGoneAt)
   } else if(command==='mention-body') {
     const j=cumulativeJournal(), a=j.filter(r=>r.kind==='accepted'&&!r.compact), m=a.find(r=>r.text.includes('<!here>'))
     check(m,'mention not stored');const f=j.find(r=>r.kind==='fixed'&&r.seq===m.seq)
