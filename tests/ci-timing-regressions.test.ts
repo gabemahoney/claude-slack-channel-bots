@@ -16,6 +16,7 @@ import { assertNoLeak, fakeToken, BOT_TOKEN_PREFIX } from './test-helpers/creden
 import { test29ClosingFixture, test29EvidencePrinter, test29PrinterFixture, test29PrinterBindings, test29SwitchBindings, test29SwitchCallOrder } from './test-helpers/test29-controls.ts'
 import { TEST29_ROOT, test29RestartFixture, test29CompactionFixture, test29DiagnosticFixture, test29WatchdogFixture, test29DiagnosticExpectedItem } from './test-helpers/test29-queue.ts'
 import { percentile } from './integration/fixtures/transcript-receipts.ts'
+import * as sr8Evidence from './integration/fixtures/sr8-evidence.ts'
 import { SR8_DISPATCH_ALLOWANCE_MS, SR8_ACK_LIMIT_MS, SR8_STORE_LIMIT_MS, ackVerdict, storeVerdict, postHoldVerdict,
   n4Verdict, n2Verdict, n2Samples, sealVerdict, requireSeedPopulation, startupVerdict, compactionVerdict, storeWindow, faultWindow, faultRewriters, joinsVerdict,
   windowsVerdict, turnEndVerdict, resultLine, summary, evidenceExit, printResults, type Measurement, type Times, type Result,
@@ -33,7 +34,7 @@ import { SR8_DISPATCH_ALLOWANCE_MS, SR8_ACK_LIMIT_MS, SR8_STORE_LIMIT_MS, ackVer
 import { CPUS_PER_SHARD, DRIVER_CPUS } from '../scripts/ci-run.ts'
 import { serializeTestMeasurement, ackTimingMeasurement, durableAppendMeasurement, threadSaveMeasurement, threadCompactionMeasurement,
   type TestMeasurement, type TestMeasurementRecord } from '../src/test-measurements.ts'
-import { QUEUE_COMPACT_INTERVAL_MS, type AcceptedRecord } from '../src/delivery-queue.ts'
+import { QUEUE_COMPACT_INTERVAL_MS, parseQueueRecord, type AcceptedRecord } from '../src/delivery-queue.ts'
 import { THREAD_REPLY_HOLD_MS, DELIVERY_MAX_AD_CALLS_PER_S } from '../src/delivery-constants.ts'
 import { NAME_LOOKUP_TIMEOUT_MS } from '../src/tag-wrapper.ts'
 import { buildThreadMemoryChangedWhileStoppedLine } from '../src/thread-memory-reports.ts'
@@ -1652,7 +1653,7 @@ describe('SR-8 additional cases (synthetic evidence only)', () => {
       .toEqual({ status: 0, stdout: 'recorded: sr8 seal verdict=pass\nafter\n', stderr: '' })
     // Every verdict command goes through it; setup and observation commands do not.
     const direct = [...load.matchAll(/bun "\$\{E\}" ([a-z-]+)/g)].map(m => m[1]).sort()
-    expect([...new Set(direct)]).toEqual(['bodies', 'burst', 'conditions', 'config', 'cpu-mark', 'diag-ack', 'envelope-times', 'fault-burst', 'fault-ids', 'fault-plan', 'fault-recover', 'member-cpu', 'plan', 'seed'])
+    expect([...new Set(direct)]).toEqual(['bodies', 'burst', 'conditions', 'config', 'cpu-mark', 'diag-ack', 'envelope-times', 'fault-burst', 'fault-ids', 'fault-plan', 'fault-recover', 'held-resolved', 'member-cpu', 'plan', 'seed'])
   })
   test('test-45/48 reopen observer prints AD rows, lifecycle, stub hook and MCP session fields only on a reopen failure', () => {
     const load = source('lib/membership-load.sh'), safe = load.match(/^REOPEN_SAFE='[\s\S]*?;'$/m)![0]
@@ -2855,7 +2856,7 @@ process.exit(exit ?? status)\n`,
   })
   test('every verdict command goes through sr8_verdicts; setup and observation commands do not', () => {
     expect([...new Set([...t44.matchAll(/bun "\$\{SR8\}" ([a-z-]+)/g)].map(m => m[1]))].sort())
-      .toEqual(['bodies', 'burst', 'combinations', 'conditions', 'config', 'envelope-times', 'observe', 'plan', 'seed'])
+      .toEqual(['bodies', 'burst', 'combinations', 'conditions', 'config', 'envelope-times', 'held-resolved', 'observe', 'plan', 'seed'])
     expect([...t44.matchAll(/^\s*sr8_verdicts (seal [a-z]+|[a-z-]+) /gm)].map(m => m[1]))
       .toEqual(['seal first', 'seal measured', 'driver-cpu', 'seal measured', 'check', 'driver-cpu', 'pending-post', 'shared-list'])
   })
@@ -3057,7 +3058,7 @@ else process.exitCode = command === 'burst' ? 3 : 0
 describe('test-44 pending probe lookup over burst.jsonl (stub shell)', () => {
   // The script's own probe loop and scenario.sh's fail, over a ledger whose
   // probes lead the second wave, so later replies follow every probe row.
-  const loop = block(source('test-44-fmk-thread-burst.sh'), '        : > "${EVIDENCE}/probes.tsv"\n', '        for persona in "${KEYS[@]}"; do snapshot')
+  const loop = block(source('test-44-fmk-thread-burst.sh'), '        : > "${EVIDENCE}/probes.tsv"\n', '        bun "${SR8}" held-resolved')
   const plan = [['other', 'C1', '1.000002'], ['bot', 'C1', '1.000003']]
   const item = (phase: string, ts: string, envelope_id: string) => ({ key: 'alpha', phase, channel: 'C1', ts, sender: 'U1', envelope_id })
   const run = (ledger: unknown[]) => shell([
@@ -3509,6 +3510,80 @@ test('a staged inventory replaces only its label\'s inventory, in place: fault c
 })
 
 describe('SR-8 fault-aware composition and hold overlap (synthetic only)', () => {
+  test('held-resolution wait precedes every live held-probe stop', () => {
+    const membership = source('lib/membership-load.sh')
+    const burst = membership.indexOf('bun "${E}" burst')
+    const recovery = membership.indexOf('bun "${E}" fault-recover')
+    const stop = membership.indexOf('stop_server --stop-bots', burst)
+    const wait = membership.indexOf('bun "${E}" held-resolved', recovery)
+    expect(burst).toBeGreaterThan(0)
+    expect(recovery).toBeGreaterThan(burst)
+    expect(wait).toBeGreaterThan(recovery)
+    expect(wait).toBeLessThan(membership.indexOf('bun "${E}" conditions', recovery))
+    expect(wait).toBeLessThan(stop)
+    expect(membership).toContain('HOLD_MS="$(printed THREAD_REPLY_HOLD_MS)"')
+    expect(membership.slice(wait, stop)).toContain('"$((HOLD_MS + WAIT_MS))"')
+    const script = source('test-44-fmk-thread-burst.sh')
+    expect(script).toContain('HOLD_MS="$(printed THREAD_REPLY_HOLD_MS)"')
+    for (const [start, end] of [['    burst)\n', '    pending)\n'], ['    pending)\n', '    shared-list)\n']]) {
+      const lane = block(script, start, end), burst = lane.indexOf('bun "${SR8}" burst')
+      const guarded = lane.indexOf('bun "${SR8}" held-resolved', burst)
+      expect(burst).toBeGreaterThan(0)
+      expect(guarded).toBeGreaterThan(burst)
+      expect(guarded).toBeLessThan(lane.indexOf('clean_stop', burst))
+      expect(lane.slice(guarded, lane.indexOf('clean_stop', burst))).toContain('"$((HOLD_MS + RECORD_WAIT_S * 1000))"')
+      if (start.includes('burst)')) {
+        const sleep = lane.indexOf('        sleep 5\n', burst)
+        expect(sleep).toBeGreaterThan(lane.indexOf('envelope-times', burst))
+        expect(sleep).toBeLessThan(guarded)
+      }
+    }
+  })
+  test('held-resolution wait covers an unexpired hold plus the existing observation wait', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'sr8-held-due-')), file = join(root, 'measurements.jsonl')
+    const items = [{ key: 'beta', channel: 'C', ts: 'held' }]
+    const queues = { beta: [{ kind: 'accepted', channel: 'C', ts: 'held', seq: 1 }] }
+    let now = 0
+    writeFileSync(file, '')
+    try {
+      const pending = await sr8Evidence.waitHeldResolutions(items, file, 0, THREAD_REPLY_HOLD_MS + 60, {
+        queues: () => queues, now: () => now,
+        pause: async () => {
+          now += 20
+          if (now === THREAD_REPLY_HOLD_MS + 40) writeFileSync(file, JSON.stringify({ v: 1,
+            kind: 'post-hold-resolved', key: 'beta', seq: 1, at_mono_ms: now, held_ms: now }) + '\n')
+        },
+      })
+      expect(pending).toEqual([])
+      expect(now).toBe(THREAD_REPLY_HOLD_MS + 40)
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
+  test.each(['timed', 'late', 'restart', 'absent', 'duplicate', 'negative', 'before-mark'] as const)
+  ('held-resolution wait requires every probe exactly once after the mark: %s', async mode => {
+    const root = mkdtempSync(join(tmpdir(), 'sr8-held-resolved-')), file = join(root, 'measurements.jsonl')
+    const items = ['alpha', 'beta'].map(key => ({ key, channel: 'C', ts: key }))
+    const queues = Object.fromEntries(items.map(i => [i.key, [{ kind: 'accepted', seq: 1, channel: i.channel, ts: i.ts }]]))
+    const row = (key: string, held_ms: number | undefined = 3000) => ({ v: 1, kind: 'post-hold-resolved', key, seq: 1, at_mono_ms: 4000, held_ms })
+    const lines = (rows: unknown[]) => rows.map(r => JSON.stringify(r) + '\n').join('')
+    const before = lines([row('alpha'), row('beta')])
+    writeFileSync(file, before + lines([row('alpha'), ...(mode === 'timed' ? [row('beta', 0)]
+      : mode === 'restart' ? [{ ...row('beta'), held_ms: undefined }]
+      : mode === 'duplicate' ? [row('beta'), row('beta')]
+      : mode === 'negative' ? [row('beta', -1)] : [])]))
+    let now = 0, polls = 0
+    try {
+      const pending = await sr8Evidence.waitHeldResolutions(items, file, Buffer.byteLength(before), 60, {
+        queues: () => { polls++; return queues }, now: () => now,
+        pause: async () => {
+          now += 20
+          if (mode === 'late' && now === 40) writeFileSync(file, before + lines([row('alpha'), row('beta')]))
+        },
+      })
+      expect(pending).toEqual(['timed', 'late'].includes(mode) ? [] : [{ key: 'beta', seq: 1 }])
+      expect(now).toBe(mode === 'timed' ? 0 : mode === 'late' ? 40 : 60)
+      expect(polls).toBe(1)
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
   const counts = { roots: SR8_BURST_JOINS, replies: SR8_BURST_REPLIES, dropped: SR8_BURST_DROPPED }
   const epoch = 1800000000000, iso = (t: number) => new Date(epoch + t).toISOString()
   function composed(denied = false): FaultLoadEvidence {
@@ -3870,6 +3945,100 @@ describe('SR-8 fault-aware composition and hold overlap (synthetic only)', () =>
     } finally { rmSync(root, { recursive: true, force: true }) }
   }
   const lines = (rows: any[]) => rows.map(r => JSON.stringify(r)).join('\n') + '\n'
+  test('held-resolution CLI binds a membership-sized queue once and waits for late timed evidence', () => withCLI(async (root, cli) => {
+    const key = sr8Personas(2)[0], state = join(root, 'state'), out = join(root, 'out')
+    const file = join(root, 'measurements.jsonl'), q = await makeQueue(state, { now: () => 100 })
+    mkdirSync(out)
+    try {
+      const input = heldSlackInput(postHold(100))
+      expect((await q.accept(key, input)).status).toBe('accepted')
+      await q.stop()
+      const journal = queuePath(state, key), held = readQueue(state, key)[0]
+      const name = 'test-63-fmk-membership-load-open-lookup', caseName = 'test-63-open-first-lookup'
+      const ordinary: AcceptedRecord[] = Array.from({ length: 2000 }, (_, n) => {
+        const ts = `${1800000000 + n}.000001`, root = n < 1000, phase = root ? 'roots' : 'replies'
+        return { v: 1, kind: 'accepted', seq: n + 2, item_id: `00000000-0000-4000-8000-${String(n + 2).padStart(12, '0')}`,
+          ...slackInput({ channel: 'C0MEMBERSHIP', ts, key: { chat_id: 'C0MEMBERSHIP', ts }, user: 'U0MEMBERSHIPORDINARY',
+            via: root ? 'mention' : 'thread', queued_ack_reaction: 'inbox_tray',
+            text: (root ? `<@U0ALPHABOT> ${name} <@U0BETABOT> ${name} ` : '') + `${name} ${caseName}-${phase}-${ts}`,
+            ...(root ? { thread_join: { thread_ts: ts, stamp: postHold(100).stamp, at: 100 } } : { thread_ts: '1800000000.000001' }),
+          }), received_at: 100, ts }
+      })
+      const bytes = lines([held, ...ordinary])
+      expect(ordinary.every(r => !!parseQueueRecord(JSON.stringify(r)))).toBe(true)
+      expect(Buffer.byteLength(bytes)).toBeGreaterThan(1024 * 1024)
+      writeFileSync(journal, bytes)
+      writeFileSync(join(out, `${key}.held-admission.jsonl`), lines([held]))
+      writeFileSync(join(out, 'burst.jsonl'), lines([{ key, phase: 'held', channel: input.channel, ts: input.ts }]))
+      writeFileSync(file, '')
+      const fixturePrinter = join(root, 'tests/integration/fixtures/fmk-texts.ts')
+      sharedPrinterControl(root, fixturePrinter)
+      const overflow = spawnSync(process.execPath, [fixturePrinter, 'sharedQueueSnapshot', journal, join(out, `${key}.held-admission.jsonl`)],
+        { env: hostSafeChildEnv(root, { extras: { SCENARIO_ROOT: root } }), encoding: 'utf8', timeout: 1000 })
+      expect((overflow.error as NodeJS.ErrnoException | undefined)?.code).toBe('ENOBUFS')
+      console.log(`recorded: held-resolution scale accepted=2001 snapshot_input_bytes=${Buffer.byteLength(bytes)} default_capture=ENOBUFS`)
+      const result = cli('held-resolved', [state, out, file, '0', '1000'])
+      expect({ status: result.status, stdout: result.stdout, stderr: result.stderr }).toEqual({ status: 0, stdout: '', stderr: '' })
+      expect(JSON.parse(readFileSync(join(root, 'late-published.json'), 'utf8'))).toEqual({ pauses: 2 })
+      const archive = join(out, `${key}.held-admission.jsonl`), archived = readFileSync(archive, 'utf8')
+      expect(archived.trim().split('\n')).toHaveLength(2001)
+      // A valid archive and timed row cannot excuse a failed current read.
+      writeFileSync(journal, 'invalid queue evidence\n')
+      const refused = cli('held-resolved', [state, out, file, '0', '1000'])
+      expect({ status: refused.status, stdout: refused.stdout, stderr: refused.stderr }).toEqual({ status: 1,
+        stdout: '', stderr: 'FAIL: sr8-evidence evidence unavailable or invalid\n' })
+      expect(readFileSync(archive, 'utf8')).toBe(archived)
+      expect(existsSync(`${archive}.binding`)).toBe(false)
+    } finally { await q.stop() }
+  }, `let holdPauses = 0; const holdTimeout = globalThis.setTimeout;
+globalThis.setTimeout = ((callback, ms, ...args) => {
+  if (ms === 20) {
+    holdPauses++;
+    const root = process.env.SCENARIO_ROOT;
+    if (holdPauses === 1) for (const entry of readdirSync(join(root, 'state/queue'))) unlinkSync(join(root, 'state/queue', entry));
+    if (holdPauses === 2) {
+      writeFileSync(join(root, 'measurements.jsonl'), JSON.stringify({ v: 1, kind: 'post-hold-resolved',
+        key: 'alpha', seq: 1, at_mono_ms: 4000, held_ms: 3000 }) + '\\n');
+      writeFileSync(join(root, 'late-published.json'), JSON.stringify({ pauses: holdPauses }));
+    }
+  }
+  return holdTimeout(callback, ms, ...args);
+});\n`))
+  test.each(['held', 'pending', 'fault'] as const)('held-resolution CLI retains compacted admission and diagnoses restart-only resolution: %s', mode => withCLI(async (root, cli) => {
+    const key = sr8Personas(2)[0], state = join(root, 'state'), q = await makeQueue(state, { now: () => 100 })
+    const input = heldSlackInput(postHold(100)), out = join(root, 'out'), file = join(root, 'measurements.jsonl')
+    mkdirSync(out)
+    try {
+      const printer = sharedPrinterControl(root, join(root, 'tests/integration/fixtures/fmk-texts.ts'))
+      expect((await q.accept(key, input)).status).toBe('accepted')
+      const original = printer('sharedQueueSnapshot', queuePath(state, key))
+      writeFileSync(join(out, `${key}.held-admission.jsonl`), original)
+      const seq = JSON.parse(original.trim().split('\n').find(l => JSON.parse(l).kind === 'accepted')!).seq
+      const resolved = [{ seq, outcome: 'released' as const, at: 150 }]
+      expect(await q.resolveHolds(key, resolved)).toEqual(resolved)
+      await q.compact(key); await q.stop()
+      const item = { key, phase: 'held', channel: input.channel, ts: input.ts }
+      if (mode === 'fault') writeFileSync(join(out, 'fault-plan.json'), JSON.stringify({
+        context: { scenario: 'test-fault', mode: 'strict', population: 0, recipients: 2 },
+        plan: { kind: 'hang', key, keys: sr8Personas(2), all: false, channels: [input.channel],
+          items: [{ ...item, ordinal: 0, dependent: false, sender: 'sender', root: 'own' }] },
+      }))
+      else writeFileSync(join(out, 'burst.jsonl'), lines([item]))
+      const probes = join(root, 'probes.tsv')
+      writeFileSync(probes, `other\tCother\tother-ts\tother-envelope\nbot\t${input.channel}\t${input.ts}\theld-envelope\n`)
+      const args = [state, out, file, '0', '1', ...(mode === 'pending' ? [key, probes] : [])]
+      const row = { v: 1, kind: 'post-hold-resolved', key, seq, at_mono_ms: 4000, held_ms: 3000 }
+      writeFileSync(file, lines([row]))
+      const success = cli('held-resolved', args)
+      expect({ status: success.status, stdout: success.stdout, stderr: success.stderr }).toEqual({ status: 0, stdout: '', stderr: '' })
+      const archived = readFileSync(join(out, `${key}.held-admission.jsonl`), 'utf8').trim().split('\n').map(l => JSON.parse(l))
+      expect(archived.some(r => r.kind === 'accepted' && !r.compact && r.seq === seq && r.hold?.on === 'post')).toBe(true)
+      writeFileSync(file, lines([{ ...row, held_ms: undefined }]))
+      const timeout = cli('held-resolved', args)
+      expect({ status: timeout.status, stdout: timeout.stdout, stderr: timeout.stderr }).toEqual({ status: 1,
+        stdout: `recorded: sr8 held-resolved unresolved=${key}:${seq}\n`, stderr: '' })
+    } finally { await q.stop() }
+  }))
   test.each(['valid', 'mismatched-sender'] as const)('N4 CLI matches production Slack acceptance through the real shared snapshot: %s', defect => withCLI(async (root, cli) => {
     const key = sr8Personas(1)[0], state = join(root, 'state'), q = await makeQueue(state, { now: () => 100 })
     const samples = ['hung', 'delayed'].map((user, i) => slackInput({ user, ts: `${1700000000 + i}.000001`,

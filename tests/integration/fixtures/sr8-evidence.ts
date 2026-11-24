@@ -61,6 +61,13 @@
  *     AFTER stat too; a replacement first seen after completion cannot pass. Creation is
  *     not compaction. Thread Memory compactions are proved by check from the measurement
  *     file's thread-compaction entries, not by file identity (a skip changes no file).
+ *   held-resolved C <state-dir> <evidence-dir> <measurement-file> <measurement-byte-mark> <wait-ms> [<pending-key> <probes-tsv>]
+ *     Before stopping live held probes, wait for exactly one timed resolution per
+ *     held item from fault-plan.json or burst.jsonl (or bot/none pending probe).
+ *     Bind channel/ts to seq once through sharedQueueSnapshot's current/archive
+ *     union, captured to a file, then poll only measurements. Timeout
+ *     prints one recorded diagnostic naming unresolved key/seq and returns 1;
+ *     callers continue to the existing verdicts, which still require the evidence.
  *   seal <first|measured> C <server-log> <log-byte-mark> <config-path>
  *     First: exactly one printer-built entry-missing report per seeded key. Measured:
  *     no changed-while-stopped OR THREAD_MEMORY_JOINS_LOST report, including any
@@ -549,7 +556,7 @@
  * Post Hold and N4 STRICT limits and the membership hang request duration D-A;
  * each prints signed excess and allowance always.
  */
-import { existsSync, readdirSync, readFileSync, readlinkSync, writeFileSync, appendFileSync, mkdirSync, statSync, statfsSync, openSync, readSync, writeSync, closeSync, constants as fsConstants } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, readlinkSync, writeFileSync, appendFileSync, mkdirSync, statSync, statfsSync, openSync, readSync, writeSync, closeSync, renameSync, unlinkSync, constants as fsConstants } from 'node:fs'
 import { basename, join, resolve } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { cpus } from 'node:os'
@@ -1782,6 +1789,60 @@ async function plan(args: string[]) {
   const spec = p.burstSpec(c, await channels(), Number(start))
   for (const [phase, messages] of [['roots', spec.rootMentions], ['replies', spec.replies], ['dropped', spec.dropped]] as const)
     for (const m of messages) console.log([phase, m.channel, m.ts, m.threadTs ?? '-', m.mentions.join(',') || '-'].join('\t'))
+}
+
+type HeldProbe = Pick<BurstItem, 'key' | 'channel' | 'ts'>
+type UnresolvedHeldProbe = { key: string; seq: number | 'missing' | 'ambiguous' }
+/** Only a live timed resolution counts; a restart release cannot replace it. */
+export function heldResolutionPending(holds: UnresolvedHeldProbe[], rows: Measurement[] | undefined): UnresolvedHeldProbe[] {
+  return holds.filter(h => typeof h.seq !== 'number' || rows?.filter(r => r.kind === 'post-hold-resolved'
+    && r.key === h.key && r.seq === h.seq && nonnegative(r.held_ms)).length !== 1)
+}
+export async function waitHeldResolutions(items: HeldProbe[], file: string, mark: number, waitMs: number,
+  io: { queues(): Record<string, any[] | undefined>; now(): number; pause(): Promise<void> }): Promise<UnresolvedHeldProbe[]> {
+  const until = io.now() + waitMs
+  const queues = io.queues(), holds = items.map(i => {
+    const accepted = acceptedFor(queues[i.key], i.channel, i.ts)
+    return { key: i.key, seq: accepted.length === 1 ? accepted[0].seq : accepted.length ? 'ambiguous' as const : 'missing' as const }
+  })
+  while (true) {
+    const pending = heldResolutionPending(holds, measurements(file, mark))
+    if (!pending.length || io.now() >= until) return pending
+    await io.pause()
+  }
+}
+/** Capture the validated union once without a pipe's maxBuffer boundary.
+ * Replace the archive only after a successful printer exit and complete read. */
+function heldProbeQueues(items: HeldProbe[], stateDir: string, out: string): Record<string, any[]> {
+  return Object.fromEntries([...new Set(items.map(i => i.key))].map(key => {
+    const archive = join(out, `${key}.held-admission.jsonl`), temporary = `${archive}.binding`
+    const fd = openSync(temporary, 'wx', 0o600)
+    let saved = false
+    try {
+      execFileSync(process.execPath, [fixture('fmk-texts.ts'), 'sharedQueueSnapshot', join(stateDir, 'queue', `${key}.jsonl`),
+        ...(existsSync(archive) ? [archive] : [])], { stdio: ['ignore', fd, 'pipe'] })
+      writeSync(fd, '\n')
+      const queue = jsonl(temporary, 0, true)
+      if (!queue) throw new Error('invalid held queue snapshot')
+      renameSync(temporary, archive); saved = true
+      return [key, queue]
+    } finally { closeSync(fd); if (!saved) unlinkSync(temporary) }
+  }))
+}
+async function heldResolved(c: Context, args: string[]): Promise<number> {
+  countArgs(args, 5, 7)
+  const [stateDir, out, file, mark, waitMs, key, probes] = args
+  if (args.length === 6 || !integer(numeric(mark)) || !positive(numeric(waitMs))) throw new Error('usage')
+  const items: HeldProbe[] | undefined = probes
+    ? tsv(probes, ['parent', 'channel', 'ts', 'envelope_id'])?.filter(p => ['bot', 'none'].includes(p.parent)).map(p => ({ key, channel: p.channel, ts: p.ts }))
+    : (existsSync(join(out, 'fault-plan.json')) ? (await readFaultPlan(out, c)).items : jsonl(join(out, 'burst.jsonl')))?.filter(i => i.phase === 'held')
+  if (!items || items.some(i => !/^[a-z0-9_]+$/.test(i.key) || !i.channel || !i.ts)) throw new Error('invalid held probes')
+  const pending = await waitHeldResolutions(items, file, numeric(mark), numeric(waitMs), {
+    now: () => performance.now(), pause: () => new Promise(r => setTimeout(r, 20)),
+    queues: () => heldProbeQueues(items, stateDir, out),
+  })
+  if (pending.length) console.log(`recorded: sr8 held-resolved unresolved=${pending.map(p => `${p.key}:${p.seq}`).join(',')}`)
+  return pending.length ? 1 : 0
 }
 
 async function holdAdmission(items: BurstItem[], stateDir: string, file: string, mark: number, waitMs: number, out: string): Promise<boolean> {
@@ -3385,6 +3446,7 @@ async function main(args: string[]): Promise<number> {
   if (command === 'envelope-times') return bulkTimings(args)
   const phase = command === 'seal' ? args.shift()! : ''
   const c = context(args)
+  if (command === 'held-resolved') return heldResolved(c, args)
   const faultResult = await faultCommands(command!, c, args)
   if (faultResult !== undefined) return faultResult
   if (command === 'burst') return burst(c, args)

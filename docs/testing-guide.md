@@ -1098,6 +1098,22 @@ complete, but each recipient needs at least one rewrite. Retain
 pre-compaction queue observations, including the fixture's validated
 held-admission archive, for later readers.
 
+Before stopping a measured server with live held probes, run the evidence
+fixture's `held-resolved` wait: every declared probe needs exactly one
+`post-hold-resolved` row with nonnegative `held_ms` after the measurement
+mark. Bind channel/ts to queue sequence once through `sharedQueueSnapshot`,
+merging the held-admission archive across compaction and capturing its output
+to a file; subsequent polls read only measurements.
+
+Bound this observation by `THREAD_REPLY_HOLD_MS` plus the existing wait:
+membership's `WAIT_MS` or Test 44's `RECORD_WAIT_S` in milliseconds, including
+its bot/unknown-parent pending probes. This covers holds whose timers have
+not fired yet.
+
+A timeout prints one `recorded:` line naming unresolved key/sequence pairs
+and continues to the existing verdicts and cleanup. Restart releases supply no timed
+sample, and the observation wait changes no latency limit or allowance.
+
 Test 44 also keeps a new channel post unresolved for at least 120 seconds in
 each mode, through a full 100,000-join, two-recipient burst: replies in another
 user's new thread must acquire no Post Hold, while bot-parent and

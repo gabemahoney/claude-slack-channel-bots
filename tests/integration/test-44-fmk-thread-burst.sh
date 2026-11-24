@@ -19,6 +19,7 @@ CONFIG="${SLACK_STATE_DIR}/config.json"
 LAST="${CONFIG}.last-applied"
 LOG="${SLACK_STATE_DIR}/server.log"
 printed() { bun "${PRINTER}" "$@" || fail "printer entry $1 failed"; }
+HOLD_MS="$(printed THREAD_REPLY_HOLD_MS)"
 mono_ms() { python3 -c 'import time; print(time.monotonic_ns() / 1000000)'; }
 byte_mark() { if [[ -e "$1" ]]; then stat -c %s "$1"; else printf '0\n'; fi; }
 # Runs one sr8-evidence verdict command and prints all its rows; a failing
@@ -393,6 +394,10 @@ case "${CASE}" in
         # An observation wait, not an allowance: check uses each hold's actual
         # receipt/resolution/append times and the sole 100 ms dispatch allowance.
         sleep 5
+        # Observe live resolutions before teardown. A timeout leaves check's
+        # evidence requirements and latency limits in charge of the verdict.
+        bun "${SR8}" held-resolved "${CONTEXT[@]}" "${SLACK_STATE_DIR}" "${RESULTS}" \
+            "${MEASUREMENTS}" "${measurement_mark}" "$((HOLD_MS + RECORD_WAIT_S * 1000))" || :
         for key in "${KEYS[@]}"; do
             prior=()
             if [[ -f "${RESULTS}/${key}.held-admission.jsonl" ]]; then
@@ -478,6 +483,8 @@ case "${CASE}" in
                 "${RESULTS}/burst.jsonl")" || fail "pending ${parent} probe ${ts} has no unique burst envelope"
             printf '%s\t%s\t%s\t%s\n' "${parent}" "${channel}" "${ts}" "${envelope}" >> "${EVIDENCE}/probes.tsv"
         done < "${EVIDENCE}/probe-plan.tsv"
+        bun "${SR8}" held-resolved "${CONTEXT[@]}" "${SLACK_STATE_DIR}" "${RESULTS}" \
+            "${MEASUREMENTS}" "${pending_mark}" "$((HOLD_MS + RECORD_WAIT_S * 1000))" "${key}" "${EVIDENCE}/probes.tsv" || :
         for persona in "${KEYS[@]}"; do snapshot "${persona}" "${RESULTS}/${persona}.queue.jsonl"; done
         sr8_verdicts driver-cpu "${CONTEXT[@]}" "${SERVER_PID}" "${RESULTS}/driver-cgroup"
         clean_stop

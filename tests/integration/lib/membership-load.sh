@@ -528,6 +528,7 @@ run_membership_load() {
     READINESS_ROUTE="$(printed MEMBERSHIP_READINESS_ROUTE)"
     WRITE_TOOL="$(printed SET_CHANNEL_DELIVERY_TOOL)"
     # Observation watchdogs only: none changes the fixture's strict verdict bounds.
+    HOLD_MS="$(printed THREAD_REPLY_HOLD_MS)"
     WAIT_MS="$((ATTEMPT_MS + RETRY_MAX_MS + REQUEST_MS))"
     WAIT_S="$(((WAIT_MS + 999) / 1000))"
     COMPACT_MS="$(printed effectiveTestTimer queue_compact_interval_ms queue_compact_interval_ms=250)"
@@ -780,6 +781,10 @@ PY
             while IFS=$'\t' read -r _ envelope _; do slack_envelope_times "${envelope}"; done \
                 < "${WRITES}/membership.tsv" > "${WRITES}/membership-times.jsonl"
         else stub_slice "${CASE_MARK}" "${OUT}/stub.jsonl"; fi
+        # Observe every live hold before teardown can suppress its timed row.
+        # A timeout keeps the normal verdict/cleanup path and its missing evidence.
+        bun "${E}" held-resolved "${C[@]}" "${SLACK_STATE_DIR}" "${OUT}" \
+            "${MEASUREMENTS}" "${MEASURE_MARK}" "$((HOLD_MS + WAIT_MS))" || :
         # Stop drains the measurement recorder. Queue contents remain retained
         # by the manual-receipt stub; capture before the required clean restart.
         bun "${E}" conditions "${SLACK_STATE_DIR}" "${SERVER_PID}" "${ROOT}/cpu.before"
