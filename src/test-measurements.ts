@@ -25,6 +25,8 @@
  * clock, the queue's default): for the store kinds and `append`, when the
  * append became durable; for `ack`, when the ack call returned or was
  * suppressed; for `thread-compaction`, when the compaction completed;
+ * its `start_mono_ms` includes image building, and rewrites alone carry
+ * `write_start_mono_ms`, taken after building, immediately before writing;
  * for attribution, the observation time (or the end of a span);
  * for the others, when the recorder was handed the fact.
  *
@@ -83,6 +85,7 @@ export interface ThreadSaveMeasurement { kind: 'thread-save'; key: string; recor
 export interface ThreadCompactionMeasurement {
   kind: 'thread-compaction'; key: string; start_mono_ms: number; end_mono_ms: number
   outcome: 'rewritten' | 'skipped'; at_mono_ms: number
+  write_start_mono_ms?: number
 }
 /** What `record` takes. */
 export type TestMeasurement = StoreMeasurement | ResolutionStoreMeasurement | PostHoldResolvedMeasurement
@@ -129,7 +132,8 @@ export function serializeTestMeasurement(record: TestMeasurementRecord): string 
     case 'thread-save':
       return JSON.stringify({ ...head, key: record.key, records: record.records, joins: record.joins, intents: record.intents, outcomes: record.outcomes })
     case 'thread-compaction':
-      return JSON.stringify({ ...head, key: record.key, start_mono_ms: record.start_mono_ms, end_mono_ms: record.end_mono_ms, outcome: record.outcome })
+      return JSON.stringify({ ...head, key: record.key, start_mono_ms: record.start_mono_ms, end_mono_ms: record.end_mono_ms, outcome: record.outcome,
+        ...(record.outcome === 'rewritten' ? { write_start_mono_ms: record.write_start_mono_ms } : {}) })
   }
 }
 
@@ -164,7 +168,8 @@ export function threadSaveMeasurement(save: ThreadMemorySave): ThreadSaveMeasure
 /** The measurement a completed Thread Memory compaction carries. Pure. */
 export function threadCompactionMeasurement(compaction: ThreadMemoryCompaction): ThreadCompactionMeasurement {
   return { kind: 'thread-compaction', key: compaction.key, start_mono_ms: compaction.startMonoMs, end_mono_ms: compaction.endMonoMs,
-    outcome: compaction.outcome, at_mono_ms: compaction.endMonoMs }
+    outcome: compaction.outcome, at_mono_ms: compaction.endMonoMs,
+    ...(compaction.outcome === 'rewritten' ? { write_start_mono_ms: compaction.writeStartMonoMs } : {}) }
 }
 
 /** The measurement a queue event carries: a timed store, a `fixed` append or a saved resolution. Pure. */

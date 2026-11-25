@@ -92,7 +92,8 @@
  *     or missing endpoints is missing; slow overlapping ACK is fail. Clocks never mix.
  *     Compaction (required at 100000 only), per recipient: the queue by compactions.jsonl's
  *     file identities as burst records them; Thread Memory by that persona's
- *     thread-compaction entries after the byte mark lying WHOLLY inside the burst's
+ *     thread-compaction entries after the byte mark with their write start (rewrite)
+ *     or start (skip), and the midpoint of that time and end, inside the burst's
  *     span on the SERVER clock: the first store's start (at_mono_ms - store_ms) to
  *     the last store's at_mono_ms, over the acceptance stores of the burst's own
  *     accepted items (key/seq bound through the queue snapshots). Each store follows
@@ -574,7 +575,7 @@ export const SR8_USER_HZ = 100
 export type Verdict = 'pass' | 'fail' | 'missing' | 'recorded'
 export interface Context { scenario: string; mode: 'strict' | 'open'; population: number; recipients: number }
 export interface Result { measure: string; samples: number; stats: Record<string, string | number>; limit: string | number; verdict: Verdict; placement?: Record<string, string | number> }
-export interface Measurement { v: number; kind: string; key: string; seq?: number; seqs?: number[]; store?: string; at_mono_ms: number; store_ms?: number; held_ms?: number; outcome?: string; cause?: string; start_mono_ms?: number; end_mono_ms?: number }
+export interface Measurement { v: number; kind: string; key: string; seq?: number; seqs?: number[]; store?: string; at_mono_ms: number; store_ms?: number; held_ms?: number; outcome?: string; cause?: string; start_mono_ms?: number; end_mono_ms?: number; write_start_mono_ms?: number }
 export interface Accepted { key: string; seq: number }
 export interface Times { envelope_id: string; push: { sent_mono_ms: number; connection_id: unknown }; acks: { ack_mono_ms: number; connection_id: unknown }[] }
 export interface BurstItem { key: string; phase: string; channel: string; ts: string; sender: string; envelope_id?: string }
@@ -729,13 +730,17 @@ export function storeWindow(rows: Measurement[] | undefined, accepted: Accepted[
   return { start, end }
 }
 /** A `thread-compaction` entry as the server writes it: start and end on the
- * server clock, end at or after start and equal to `at_mono_ms`, a known outcome. */
+ * server clock, end at or after start and equal to `at_mono_ms`. A rewrite's
+ * finite write start lies between them; a skip has no write start. */
 const threadCompaction = (r: Measurement) => r.kind === 'thread-compaction' && nonnegative(r.start_mono_ms) && nonnegative(r.end_mono_ms)
-  && r.end_mono_ms >= r.start_mono_ms && r.at_mono_ms === r.end_mono_ms && ['rewritten', 'skipped'].includes(r.outcome!)
+  && r.end_mono_ms >= r.start_mono_ms && r.at_mono_ms === r.end_mono_ms
+  && (r.outcome === 'rewritten' ? finite(r.write_start_mono_ms) && r.write_start_mono_ms >= r.start_mono_ms && r.write_start_mono_ms <= r.end_mono_ms
+    : r.outcome === 'skipped' && !('write_start_mono_ms' in r))
 /** SR-8.2's compaction proof, required only at 100,000. Per recipient: a queue
  * compaction by file identity (`compactions.jsonl`), and that persona's
- * `thread-compaction` entries wholly inside `window`, rewritten and
- * skipped-identical alike complete. Each persona in `rewriters` (every recipient
+ * `thread-compaction` entries whose write start (rewrite) or start (skip) lies
+ * inside `window`, with the midpoint of that time and end inside too. Each
+ * persona in `rewriters` (every recipient
  * unless fault-check narrows it) needs at least one of them rewritten, and fails
  * when all skipped; any other persona is proved by any such entry. None, or no
  * window, is missing. Entries outside the window (startup and bring-up included)
@@ -744,7 +749,10 @@ export function compactionVerdict(queue: Compaction[] | undefined, rows: Measure
   keys: string[], required: boolean, rewriters: string[] = keys): Result {
   const entries = rows?.filter(r => keys.includes(r.key) && threadCompaction(r)) ?? []
   const span = window && nonnegative(window.start) && finite(window.end) && window.end >= window.start ? window : undefined
-  const inside = span ? entries.filter(r => r.start_mono_ms! >= span.start && r.end_mono_ms! <= span.end) : []
+  const inside = span ? entries.filter(r => {
+    const start = r.outcome === 'rewritten' ? r.write_start_mono_ms! : r.start_mono_ms!
+    return start >= span.start && (start + r.end_mono_ms!) / 2 <= span.end
+  }) : []
   const queued = keys.filter(key => queue?.some(r => r.key === key && r.kind === 'queue' && r.inside === true && !!r.before && !!r.after && r.before !== r.after))
   const proved = keys.filter(key => inside.some(r => r.key === key && (r.outcome === 'rewritten' || !rewriters.includes(key))))
   const skippedOnly = keys.filter(key => !proved.includes(key) && inside.some(r => r.key === key))

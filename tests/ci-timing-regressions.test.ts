@@ -117,10 +117,13 @@ const jsonl = (rows: unknown[]) => rows.map(row => JSON.stringify(row)).join('\n
 const serverLine = (entry: TestMeasurement, at: number) => serializeTestMeasurement({ ...entry, v: 1, at_mono_ms: at } as TestMeasurementRecord)
 /** A completed Thread Memory compaction as the server writes it; `at_mono_ms` is its end. */
 const compactionLine = (key: string, startMonoMs: number, endMonoMs: number, outcome: 'rewritten' | 'skipped') =>
-  serverLine(threadCompactionMeasurement({ key, startMonoMs, endMonoMs, outcome }), endMonoMs)
+  serverLine(threadCompactionMeasurement({ key, startMonoMs, endMonoMs, outcome,
+    ...(outcome === 'rewritten' ? { writeStartMonoMs: startMonoMs } : {}) }), endMonoMs)
 /** That line as the verdicts read it back. */
-const compactionRow = (key: string, startMonoMs: number, endMonoMs: number, outcome: 'rewritten' | 'skipped'): Measurement =>
-  JSON.parse(compactionLine(key, startMonoMs, endMonoMs, outcome))
+const compactionRow = (key: string, startMonoMs: number, endMonoMs: number, outcome: 'rewritten' | 'skipped',
+  writeStartMonoMs = startMonoMs): Measurement & { write_start_mono_ms?: number } =>
+  ({ ...JSON.parse(compactionLine(key, startMonoMs, endMonoMs, outcome)),
+    ...(outcome === 'rewritten' ? { write_start_mono_ms: writeStartMonoMs } : {}) })
 const serverRows = {
   ack: serverLine(ackTimingMeasurement({ keys: ['alpha'], ts: '1700000000.000001', targets: [{ key: 'alpha', seq: 1 }], outcome: 'acked', receiveToAckMs: 4, ackCallMs: 1, atMonoMs: 9 }), 9),
   append: serverLine(durableAppendMeasurement({ dir: '/s/queue', path: '/s/queue/alpha.jsonl', records: 2, bytes: 10, appendMs: 3,
@@ -3784,6 +3787,10 @@ describe('SR-8 fault-aware composition and hold overlap (synthetic only)', () =>
       [...e.rows!, ...entries], faultWindow(e), e.plan.keys, true, faultRewriters(e.plan)).verdict
     const qEntries = [compactionRow(q, 99, 150, 'skipped'), compactionRow(q, 900, 1000, 'rewritten')]
     expect(verdict([compactionRow(p, 200, 300, 'rewritten'), ...qEntries])).toBe('pass')
+    // The same write-interval rule applies to fault-check's Q-only span.
+    expect(verdict([compactionRow(p, 200, 300, 'rewritten'), compactionRow(q, 50, 1100, 'rewritten', 900)])).toBe('pass')
+    expect(verdict([compactionRow(p, 200, 300, 'rewritten'), compactionRow(q, 50, 1100.002, 'rewritten', 900),
+      compactionRow(q, 99, 150, 'skipped')])).toBe('fail')
     // P's rewrite after Q's last store, among P's own later stores, is outside Q's burst: P only skipped inside it.
     expect(verdict([compactionRow(p, 1500, 199_000, 'rewritten'), compactionRow(p, 200, 300, 'skipped'), ...qEntries])).toBe(all ? 'pass' : 'fail')
     // P still needs an in-span entry, and Q always a rewrite.
@@ -5030,7 +5037,7 @@ describe('SR-8 evidence verdicts (synthetic evidence, no runtime performance cla
       expect(child.stdout).toContain('start_to_ready_ms=missing limit=none verdict=missing\n')
     })
   })
-  describe('compaction: the queue by file identity, Thread Memory by its entries wholly inside the burst\'s server-clock store span', () => {
+  describe('compaction: queue completion inside the store span, Thread Memory write start and write midpoint inside it', () => {
     // The burst's own acceptance stores: alpha's starts the span at 1000 (at_mono_ms - store_ms), beta's ends it at 2000.
     const stores = [store(1, 5, 'accepted', 1005), { ...store(1, 10, 'post-hold', 2000), key: other }]
     const burst = [item(), { key: other, seq: 1 }], keys = [key, other]
@@ -5049,8 +5056,55 @@ describe('SR-8 evidence verdicts (synthetic evidence, no runtime performance cla
       const r = run([compactionRow(other, 1100, 1200, 'skipped'), compactionRow(other, 1500, 1600, 'skipped')])
       expect(r.verdict).toBe('fail'); expect(r.stats).toMatchObject({ threads: 1, rewritten: 1, skipped: 2 })
     })
+    test('8ee95f: the recorded straddling rewrite counts by its write interval beside the recorded skip', () => {
+      // Only the failing cell's numbers are copied; no retained JSONL is needed.
+      const rows = [
+        store(1, 3.8998900000001413, 'post-hold', 3104.907063),
+        store(1996, 1.1251900000006572, 'accepted', 4203.349855),
+        compactionRow(key, 3289.257547, 3289.314317, 'skipped'),
+        compactionRow(key, 3640.049309, 4235.63101, 'rewritten', 3700),
+      ]
+      const span = storeWindow(rows, [item(), item(1996)])
+      expect(span).toEqual({ start: 3101.007173, end: 4203.349855 })
+      const r = compactionVerdict([queue(key)], rows, span, [key], true)
+      expect(resultLine(context, r)).toContain('queue=1 threads=1 rewritten=1 skipped=1 outside=0')
+      expect(r.verdict).toBe('pass')
+    })
+    test.each([
+      ['write start at the first store', 1000, 1200, 1000, true],
+      ['write start just before the first store', 999.999, 1200, 999.999, false],
+      ['write midpoint at the last store', 1500, 2500, 1500, true],
+      ['write midpoint just after the last store', 1500, 2500.002, 1500, false],
+      ['whole midpoint inside but write midpoint outside', 1000, 2800, 1500, false],
+      ['build starts before the span but writes start inside', 900, 2500, 1500, true],
+    ] as const)('rewrite: %s', (_name, start, end, writeStart, counts) => {
+      const r = run([compactionRow(other, start, end, 'rewritten', writeStart), compactionRow(other, 1500, 1600, 'skipped')])
+      expect(r.verdict).toBe(counts ? 'pass' : 'fail')
+      expect(r.stats).toMatchObject({ threads: counts ? 2 : 1, rewritten: counts ? 2 : 1, skipped: 1, outside: counts ? 0 : 1 })
+    })
+    test.each([
+      ['start at the first store', 1000, 1200, true],
+      ['start just before the first store', 999.999, 1200, false],
+      ['midpoint at the last store', 1500, 2500, true],
+      ['midpoint just after the last store', 1500, 2500.002, false],
+    ] as const)('skip: %s', (_name, start, end, counts) => {
+      const rows = [...stores, compactionRow(key, 1100, 1200, 'rewritten'), compactionRow(other, start, end, 'skipped')]
+      const r = compactionVerdict(keys.map(queue), rows, storeWindow(rows, burst), keys, true, [key])
+      expect(r.verdict).toBe(counts ? 'pass' : 'missing')
+      expect(r.stats).toMatchObject({ skipped: counts ? 1 : 0, outside: counts ? 0 : 1 })
+    })
+    test.each([undefined, NaN, Infinity, -Infinity, 1299.999, 1400.001])('invalid rewrite write start %s never counts', writeStart => {
+      const bad = { ...compactionRow(other, 1300, 1400, 'rewritten'), write_start_mono_ms: writeStart }
+      missing(run([bad]))
+      expect(run([bad, compactionRow(other, 1500, 1600, 'skipped')]).verdict).toBe('fail')
+    })
+    test('a skipped entry carrying a write start is malformed', () => {
+      const bad = { ...compactionRow(other, 1300, 1400, 'skipped'), write_start_mono_ms: 1350 }
+      missing(run([bad]))
+      expect(run([bad, compactionRow(other, 1500, 1600, 'skipped')]).stats.skipped).toBe(1)
+    })
     test.each([['at startup, before the first store', 10, 500], ['across the first store\'s start', 990, 1010],
-      ['across the last store', 1990, 2010], ['after the last store', 2001, 2100]] as const)
+      ['past the last store\'s midpoint', 1990, 2010.002], ['after the last store', 2001, 2100]] as const)
     ('beta\'s rewrite %s never counts', (_name, start, end) => {
       const outside = compactionRow(other, start, end, 'rewritten')
       missing(run([outside]))

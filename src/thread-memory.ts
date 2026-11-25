@@ -381,6 +381,8 @@ export interface ThreadMemorySave { key: string; records: number; joins: number;
 /** One completed rewrite or maintenance skip, timed inside its writer turn. */
 export interface ThreadMemoryCompaction {
   key: string; startMonoMs: number; endMonoMs: number; outcome: 'rewritten' | 'skipped'
+  /** Rewrites only: immediately before writing the completed image. */
+  writeStartMonoMs?: number
 }
 const memoryObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 const memoryInteger = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0
@@ -1125,9 +1127,10 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
   function newHeader(j: MemoryJournal): ThreadMemoryHeader {
     return { v: 1, kind: 'header', seq: 0, storeId: randomUUID(), digestKey: randomBytes(32).toString('hex'), highWater: j.highWater }
   }
-  function observeCompaction(key: string, startMonoMs: number | undefined, outcome: ThreadMemoryCompaction['outcome']): void {
+  function observeCompaction(key: string, startMonoMs: number | undefined, outcome: ThreadMemoryCompaction['outcome'], writeStartMonoMs?: number): void {
     if (!compactionObserver || startMonoMs === undefined) return
-    try { compactionObserver({ key, startMonoMs, endMonoMs: monotonicNow(), outcome }) } catch {
+    try { compactionObserver({ key, startMonoMs, endMonoMs: monotonicNow(), outcome,
+      ...(outcome === 'rewritten' ? { writeStartMonoMs } : {}) }) } catch {
       /* an observer cannot change a completed compaction */
     }
   }
@@ -1182,13 +1185,14 @@ export function createThreadMemory(options: ThreadMemoryOptions): ThreadMemory {
         : serializeInSlices(header, ordered, slices, lineOf))
       if (!chunks || !current(key, j)) return
       scope?.phase('thread-compact-write')
+      const writeStartMonoMs = compactionObserver ? monotonicNow() : undefined
       await io.rewriteChunks(pathFor(key), chunks, scope)
       scope?.phase('thread-compact-publish')
       j.header = header; j.hasRecords = true
       // Bind proof to the pre-build version: a change during any await makes
       // this witness ineligible, even though the rewrite itself completed.
       if (orderedImage) j.compactionWitness = { header, savedVersion, appendAttempts }
-      observeCompaction(key, startMonoMs, 'rewritten')
+      observeCompaction(key, startMonoMs, 'rewritten', writeStartMonoMs)
       if (current(key, j)) event({ type: 'compacted', key, path: pathFor(key), outcome: 'rewritten' })
       scope?.phase('thread-compact-digest')
       digestKept(j)

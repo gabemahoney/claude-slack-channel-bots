@@ -179,8 +179,10 @@ describe('test-only measurement records (Decision 25)', () => {
       entry: { kind: 'thread-save', key: 'reader', records: 3, joins: 1, intents: 1, outcomes: 1 } },
     ...(['rewritten', 'skipped'] as const).map(outcome => ({
       name: `thread-compaction ${outcome}`,
-      mapped: (extra: Record<string, unknown>) => threadCompactionMeasurement({ ...extra, key: 'reader', startMonoMs: 120.25, endMonoMs: 140.5, outcome }),
-      entry: { kind: 'thread-compaction' as const, key: 'reader', start_mono_ms: 120.25, end_mono_ms: 140.5, outcome, at_mono_ms: 140.5 },
+      mapped: (extra: Record<string, unknown>) => threadCompactionMeasurement({ ...extra, key: 'reader', startMonoMs: 120.25,
+        writeStartMonoMs: 125, endMonoMs: 140.5, outcome }),
+      entry: { kind: 'thread-compaction' as const, key: 'reader', start_mono_ms: 120.25, end_mono_ms: 140.5, outcome, at_mono_ms: 140.5,
+        ...(outcome === 'rewritten' ? { write_start_mono_ms: 125 } : {}) },
     })),
   ]
 
@@ -188,7 +190,7 @@ describe('test-only measurement records (Decision 25)', () => {
     let clockReads = 0
     const h = harness({ monotonicNow: () => { clockReads++; return 900.5 } })
     const extra = { text: `message-${LEAK_SENTINEL}`, channel: `C${LEAK_SENTINEL}`, user: `U${LEAK_SENTINEL}`,
-      token: fakeToken(BOT_TOKEN_PREFIX, 'measurement'), path: `path-${LEAK_SENTINEL}`, dir: `dir-${LEAK_SENTINEL}` }
+      token: fakeToken(BOT_TOKEN_PREFIX, 'measurement'), path: `path-${LEAK_SENTINEL}`, dir: `dir-${LEAK_SENTINEL}`, write_start_mono_ms: 125 }
     const entryOf = mapped(extra)
     expect(entryOf).toEqual(entry)
     h.recorder.record({ ...entryOf!, ...extra })
@@ -200,7 +202,8 @@ describe('test-only measurement records (Decision 25)', () => {
     expect(Object.keys(JSON.parse(line)).slice(0, 3)).toEqual(['v', 'kind', 'at_mono_ms'])
     expect(serializeTestMeasurement({ ...expected, ...extra })).toBe(line.trimEnd())
     if (entry.kind === 'thread-compaction') {
-      expect(Object.keys(JSON.parse(line))).toEqual(['v', 'kind', 'at_mono_ms', 'key', 'start_mono_ms', 'end_mono_ms', 'outcome'])
+      expect(Object.keys(JSON.parse(line))).toEqual(['v', 'kind', 'at_mono_ms', 'key', 'start_mono_ms', 'end_mono_ms', 'outcome',
+        ...(entry.outcome === 'rewritten' ? ['write_start_mono_ms'] : [])])
       expect(line.endsWith('\n')).toBe(true)
       expect(line.split('\n')).toHaveLength(2)
       expect(clockReads).toBe(0)

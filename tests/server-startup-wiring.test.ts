@@ -6040,7 +6040,7 @@ describe('test-only measurement wiring (Decision 25)', () => {
     const compactionObserver = h.compactionObserver()
     expect(compactionObserver).toBeFunction()
     expect(h.compactionObservers).toEqual([compactionObserver])
-    compactionObserver!({ key: 'reader', startMonoMs: 70.25, endMonoMs: 75.5, outcome: 'rewritten' })
+    compactionObserver!({ key: 'reader', startMonoMs: 70.25, writeStartMonoMs: 72, endMonoMs: 75.5, outcome: 'rewritten' })
     h.apply({ ...h.config, test_measurement_timings: true })
     noTimingObservers()
     expect(h.compactionObserver()).toBe(compactionObserver)
@@ -6052,7 +6052,7 @@ describe('test-only measurement wiring (Decision 25)', () => {
     expect(h.compactionObserver()).toBeUndefined()
     expect(h.compactionObservers).toEqual([compactionObserver, undefined])
     expect(readFileSync(h.path, 'utf8').trim().split('\n').map(line => JSON.parse(line))).toEqual([
-      { v: 1, kind: 'thread-compaction', at_mono_ms: 75.5, key: 'reader', start_mono_ms: 70.25, end_mono_ms: 75.5, outcome: 'rewritten' },
+      { v: 1, kind: 'thread-compaction', at_mono_ms: 75.5, key: 'reader', start_mono_ms: 70.25, write_start_mono_ms: 72, end_mono_ms: 75.5, outcome: 'rewritten' },
       { v: 1, kind: 'thread-compaction', at_mono_ms: 77.5, key: 'writer', start_mono_ms: 76.25, end_mono_ms: 77.5, outcome: 'skipped' },
       { v: 1, kind: 'store', key: 'reader', seq: 7, store: 'accepted', store_ms: 2, at_mono_ms: 80 },
     ])
@@ -6088,7 +6088,7 @@ describe('test-only measurement wiring (Decision 25)', () => {
     h.appendTimer()!.record({ dir: join(h.root, 'queue'), path: join(h.root, 'queue', 'reader.jsonl'), records: 3, bytes: 300, appendMs: 9, fileFsyncMs: 6, dirFsyncMs: 2, fsyncs: 2, atMonoMs: 120 })
     h.appendTimer()!.record({ dir: join(h.root, 'queue'), path: join(h.root, 'queue', 'reader.unreadable'), records: 1, bytes: 10, appendMs: 1, fileFsyncMs: 1, dirFsyncMs: 0, fsyncs: 2, atMonoMs: 121 })
     h.saveObserver()!({ key: 'reader', records: 2, joins: 1, intents: 1, outcomes: 0 })
-    compactionObserver!({ key: 'reader', startMonoMs: 122.25, endMonoMs: 124.5, outcome: 'rewritten' })
+    compactionObserver!({ key: 'reader', startMonoMs: 122.25, writeStartMonoMs: 123, endMonoMs: 124.5, outcome: 'rewritten' })
     expect(h.unrefs()).toBe(1)
     expect(h.forwarded).toEqual(events)
     expect(h.recorded).toHaveLength(8)
@@ -6102,7 +6102,7 @@ describe('test-only measurement wiring (Decision 25)', () => {
       { v: 1, kind: 'ack', at_mono_ms: 110, keys: ['reader'], ts: '1730000000.000100', targets: [{ key: 'reader', seq: 7 }], outcome: 'acked', receive_to_ack_ms: 5, ack_call_ms: 1 },
       { v: 1, kind: 'append', at_mono_ms: 120, journal: 'queue', key: 'reader', records: 3, bytes: 300, append_ms: 9, file_fsync_ms: 6, dir_fsync_ms: 2, fsyncs: 2 },
       { v: 1, kind: 'thread-save', at_mono_ms: 555.25, key: 'reader', records: 2, joins: 1, intents: 1, outcomes: 0 },
-      { v: 1, kind: 'thread-compaction', at_mono_ms: 124.5, key: 'reader', start_mono_ms: 122.25, end_mono_ms: 124.5, outcome: 'rewritten' },
+      { v: 1, kind: 'thread-compaction', at_mono_ms: 124.5, key: 'reader', start_mono_ms: 122.25, write_start_mono_ms: 123, end_mono_ms: 124.5, outcome: 'rewritten' },
     ])
     expect(h.clock.pendingCount()).toBe(0)
     expect(h.deliveryQueueEvents.emit).toBe(h.original)

@@ -60,6 +60,8 @@ import {
 } from '../src/thread-memory-reports.ts'
 import { THREAD_MEMORY_NOT_SAVED, THREAD_MEMORY_UNREADABLE } from '../src/persona-diagnostics.ts'
 import type { MemoryHoldEvent } from '../src/memory-holds.ts'
+import { createPersonaRouting } from '../src/persona-routing.ts'
+import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
 
 const T0 = 1_700_000_000_000
 
@@ -2738,11 +2740,12 @@ describe('SR-9.11 Thread Memory maintenance beside acceptance', () => {
     const steps = [...writes(h).map(c => `writeSync:${c.path}`), `fsync:${tempPath}`, `rename:${tempPath}`, `fsync:${join(h.stateDir, 'threads')}`]
     expect(operations.map(c => `${c.op}:${c.path}`)).toEqual(steps)
     expect(h.sealCalls).toEqual([{ key: 'alpha', steps }])
-    expect(h.completed).toEqual([{ key: 'alpha', startMonoMs: started, endMonoMs: started + 1, outcome: 'rewritten' }])
+    expect(h.completed).toEqual([{ key: 'alpha', startMonoMs: started, writeStartMonoMs: started, endMonoMs: started + 1, outcome: 'rewritten' }])
     expect(started).toBeGreaterThan(trigger)
     await h.measurements.flush()
     expect(JSON.parse(readFileSync(h.measurementsPath, 'utf8').trim().split('\n').at(-1)!)).toEqual({
       v: 1, kind: 'thread-compaction', key: 'alpha', start_mono_ms: started, end_mono_ms: started + 1,
+      write_start_mono_ms: started,
       outcome: 'rewritten', at_mono_ms: started + 1,
     })
     const before = h.bytes(), identity = statSync(threadPath(h.stateDir), { bigint: true })
@@ -2890,6 +2893,80 @@ describe('SR-9.11 Thread Memory maintenance beside acceptance', () => {
     expect(readFileSync(threadPath(dir)).subarray(0, image.length).equals(image)).toBe(true)
     expect(readThreads(dir).filter(r => r.kind === 'join').map(r => r.root)).toEqual([...facts.map(f => f.root), R.secondary])
   })
+
+  test('a started maintenance rewrite completes under continuous intake, with an event decided, stored and acked at every yield between chunks', async () => {
+    const h = await setup(); await h.start()
+    const count = 8 * THREAD_MEMORY_COMPACTION_SLICE
+    const facts = Array.from({ length: count }, (_, i) => ({ ...h.fact(), root: `1700000000.${400000 + i}` }))
+    expect(await h.memory.saveJoins('alpha', facts)).toEqual({ kind: 'saved' })
+    const image = h.image(), decided: string[] = [], acked: string[] = [], logs: string[] = []
+    expect(image.length).toBeGreaterThan(THREAD_MEMORY_REWRITE_FSYNC_BYTES)
+    const identity = makeStubSlack().identity, choices = createChannelDeliveryStore(h.authority)
+    const routing = createPersonaRouting({
+      queue: h.queue, getPersonaConfig: () => h.authority.config(), getBotIdentity: () => identity,
+      getChannelDelivery: () => choices, membership: observedMembership({ alpha: [C.primary] }),
+      threadMemory(key, channel, root) { decided.push(root); return h.memory.view(key, channel, root) },
+      prepare: async () => {}, archive() {}, log: line => logs.push(line), now: h.clock.now,
+    })
+    const pending: Array<() => void> = [], receives: Promise<void>[] = [], guards: Promise<unknown>[] = []
+    const holds: Array<{ release(): void }> = []
+    let guard: { release(): void } | undefined, cleared = false, fsHeld = false
+    const temp = h.io.hold('fsync', 'alpha', { match: p => p.endsWith('.tmp') }); holds.push(temp)
+    temp.reached.then(() => { fsHeld = true })
+    const immediateSpy = spyOn(globalThis, 'setImmediate').mockImplementation(((callback: (...args: unknown[]) => void, ...args: unknown[]) => {
+      pending.push(() => callback(...args)); return { unref() {} }
+    }) as typeof setImmediate)
+    let unsubscribe: (() => void) | undefined
+    try {
+      h.reset(); h.memory.startMaintenance(CADENCE); await h.clock.advance(CADENCE)
+      const pieces = Math.ceil(image.length / THREAD_MEMORY_REWRITE_CHUNK_BYTES)
+      let yieldCount = 0
+      // Bounded probe turns make a starved rewrite fail without a timing claim.
+      for (let turn = 0; h.completed.length === 0 && turn < 10 * count / THREAD_MEMORY_COMPACTION_SLICE + pieces; turn++) {
+        for (const resume of pending.splice(0)) {
+          const written = writes(h).length
+          if (written > yieldCount && written < pieces) {
+            const i = yieldCount++, ts = `1700000010.${500000 + i}`
+            const event = makeChannelMessage({ channel: C.primary, thread_ts: facts[i]!.root, ts, text: 'reply under sustained intake' })
+            const stored = h.queueIo.hold('fsync', 'alpha', { match: p => p === queuePath(h.stateDir) }); holds.push(stored)
+            const receive = routing.receive(event, () => {
+              expect(h.queue.lookupSlackKey('alpha', { chat_id: C.primary, ts })?.status).toBe('duplicate')
+              expect(h.completed).toEqual([]); acked.push(ts)
+            }, ['alpha'])
+            receives.push(receive)
+            // Enqueue this event before releasing the previous outstanding store.
+            await h.clock.flush(); guard?.release(); await stored.reached
+            expect(h.queue.hasAcceptanceBacklog!('alpha')).toBe(true)
+            unsubscribe ??= h.queue.onAcceptanceBacklogCleared!('alpha', () => { cleared = true })
+            const next = h.queueIo.hold('fsync', 'alpha', { match: p => p === queuePath(h.stateDir) }); holds.push(next)
+            const guardTs = `1700000020.${600000 + i}`
+            guards.push(h.queue.accept('alpha', slackInput({ channel: C.primary, ts: guardTs, key: { chat_id: C.primary, ts: guardTs } })))
+            guard = next
+            stored.release(); await receive; await next.reached
+            expect(acked).toHaveLength(yieldCount)
+            expect(cleared).toBe(false)
+          }
+          resume(); await h.clock.flush()
+        }
+        if (fsHeld) { temp.release(); fsHeld = false; await h.clock.flush() }
+        await h.clock.flush()
+      }
+      expect(h.completed.map(c => c.outcome)).toEqual(['rewritten'])
+      expect(yieldCount).toBe(pieces - 1)
+      expect(decided).toEqual(facts.slice(0, yieldCount).map(f => f.root))
+      expect(acked).toHaveLength(yieldCount)
+      expect(cleared).toBe(false)
+      expect(h.queue.hasAcceptanceBacklog!('alpha')).toBe(true)
+      expect(writes(h)).toHaveLength(pieces)
+      expect(h.bytes().equals(image)).toBe(true)
+    } finally {
+      unsubscribe?.(); immediateSpy.mockRestore()
+      for (const hold of holds) hold.release()
+      for (const resume of pending.splice(0)) setImmediate(resume)
+      await Promise.all([...receives, ...guards]); await h.memory.quiesce()
+      assertNoLeak({ logs, records: existsSync(queuePath(h.stateDir)) ? readFileSync(queuePath(h.stateDir), 'utf8') : '' })
+    }
+  })
 })
 
 describe('Thread Memory compaction in slices', () => {
@@ -3013,6 +3090,7 @@ describe('Thread Memory compaction in slices', () => {
           { type: 'compacted', key: 'alpha', path: threadPath(h.stateDir), outcome: 'skipped' },
         ])
         expect(completed[0]!.startMonoMs).toBeLessThanOrEqual(completed[0]!.endMonoMs)
+        expect(completed[0]).not.toHaveProperty('writeStartMonoMs')
         expect(h.events.filter(e => e.type === 'compaction-failed')).toEqual([])
       },
     }
@@ -3586,7 +3664,10 @@ describe('Thread Memory compaction in slices', () => {
       }
       expect(h.io.calls.filter(c => c.op === 'fsync' && c.path === join(h.stateDir, 'threads'))).toHaveLength(2)
       expect(probe.sealed.map(c => c.key).sort()).toEqual(['alpha', 'beta'])
-      for (const c of probe.completed) expect(c.startMonoMs).toBeLessThanOrEqual(c.endMonoMs)
+      for (const c of probe.completed) {
+        expect(c.startMonoMs).toBeLessThanOrEqual(c.writeStartMonoMs!)
+        expect(c.writeStartMonoMs!).toBeLessThanOrEqual(c.endMonoMs)
+      }
       h.memory.forget('beta'); probe.reset()
       const held = h.io.hold('fsync', 'beta', { match: p => p.startsWith(`${threadPath(h.stateDir, 'beta')}.`) })
       const loading = h.memory.loadKey('beta')
@@ -3595,7 +3676,7 @@ describe('Thread Memory compaction in slices', () => {
         expect(probe.completed).toEqual([])
         now = 100
       } finally { held.release(); await loading }
-      expect(probe.completed).toEqual([{ key: 'beta', startMonoMs: 14, endMonoMs: 100, outcome: 'rewritten' }])
+      expect(probe.completed).toEqual([{ key: 'beta', startMonoMs: 16, writeStartMonoMs: 17, endMonoMs: 100, outcome: 'rewritten' }])
       expect(h.io.calls.filter(c => ['writeSync', 'fsync', 'rename'].includes(c.op)).map(c => c.op))
         .toEqual(['writeSync', 'fsync', 'rename', 'fsync'])
       expect(probe.sealed.map(c => c.key)).toEqual(['beta'])
@@ -3624,6 +3705,29 @@ describe('Thread Memory compaction in slices', () => {
       await h.memory.compact('alpha')
       expect(probe.completed).toEqual([])
       expect(h.events.filter(e => e.type === 'compacted')).toEqual([])
+    })
+
+    test('rewrite write start follows the yielding image build and precedes its first chunk', async () => {
+      let now = 10
+      const { h } = await large('alternate', { monotonicNow: () => now })
+      const probe = observe(h), writeSync = h.io.fs.writeSync.bind(h.io.fs)
+      spies.push(spyOn(h.io.fs, 'writeSync').mockImplementation(((fd: number, bytes: Uint8Array, offset: number, length: number, position?: number | null) => {
+        const written = writeSync(fd, bytes, offset, length, position)
+        if (isTemp(h)(h.io.calls.at(-1)!.path)) now = 30
+        return written
+      }) as typeof h.io.fs.writeSync))
+      // The build must yield before writing even its first piece.
+      setImmediate(() => { now = 20 })
+      await h.memory.compact('alpha')
+      expect(probe.completed).toEqual([{ key: 'alpha', startMonoMs: 10, writeStartMonoMs: 20, endMonoMs: 30, outcome: 'rewritten' }])
+    })
+
+    test('without an observer, rewrites and maintenance skips read no measurement clock', async () => {
+      let reads = 0
+      const { h } = await large('alternate', { monotonicNow: () => { reads++; return reads } })
+      await h.memory.compact('alpha'); await maintenance(h)
+      expect(reads).toBe(0)
+      expect(h.events.filter(e => e.type === 'compacted').slice(-2).map(e => e.outcome)).toEqual(['rewritten', 'skipped'])
     })
 
     test('throwing and unset observers cannot fail completed rewrites or skips', async () => {
