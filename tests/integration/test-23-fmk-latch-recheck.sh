@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # AD outcome and lifecycle regression checks; no startup TUI interpretation.
 # A sweep latch requires list, exactly one server-owned Full Row get, then
-# the latch; every other call of that instance follows the latch. Its round
-# timer still starts at the sweep's list.
+# the latch; every other call of that instance follows the latch. The first
+# cadence reference remains the sweep's list, at or before the latch-set line.
 
 set -euo pipefail
 
@@ -63,9 +63,101 @@ pn_evidence_rows() {
     done
 }
 
-# The EXIT cleanup's failure hook runs even when a command substitution in
-# ad_mark_caller/check_pn_marked exits. No new result files; scratch still exists.
+# Keep the latch life's records before cleanup removes scratch, including
+# failures before the PN clearing event. Values travel to the redactor on stdin.
+latch_failure_evidence() {
+    require_ci_image latch_failure_evidence
+    require_scenario_home latch_failure_evidence
+    [[ -n "${LATCH_LIFE_MARK:-}" ]] || return 0
+    local record_name record_key log_dir log_index=0 shim_lines=()
+    local -A recorded_dirs=()
+    local PN_EVIDENCE_FROM=1 PN_EVIDENCE_TO
+    local LATCH_EVIDENCE_OUTPUT="$1"
+    export LATCH_EVIDENCE_OUTPUT SCENARIO_FIXTURES
+    # shellcheck disable=SC2031 # shared shim path, as in pn_evidence_rows
+    [[ ! -f "${SCENARIO_AD_SHIM_LOG}" ]] || mapfile -t shim_lines < "${SCENARIO_AD_SHIM_LOG}"
+    PN_EVIDENCE_TO="${#shim_lines[@]}"
+    {
+        for record_name in LATCH_MARK LATCH_US LATCH_SET_US PERSONA_ID; do
+            if ! declare -p "${record_name}" > /dev/null 2>&1; then
+                printf '%s\0' unset "${record_name}" "" ""
+                continue
+            fi
+            printf '%s\0' array "${record_name}" "" ""
+            local -n latch_values="${record_name}"
+            for record_key in "${!latch_values[@]}"; do
+                printf '%s\0' entry "${record_name}" "${record_key}" "${latch_values[${record_key}]}"
+            done
+        done
+        printf '%s\0' scalar LATCH_PID "" "${LATCH_PID:-}" scalar LATCH_LIFE_MARK "" "${LATCH_LIFE_MARK}" scalar INTERVAL_US "" "${INTERVAL_US:-}"
+        for log_dir in ${_SCENARIO_STATE_DIRS[@]+"${_SCENARIO_STATE_DIRS[@]}"} "${SLACK_STATE_DIR:-}"; do
+            [[ -n "${log_dir}" && -z "${recorded_dirs[${log_dir}]:-}" ]] || continue
+            recorded_dirs[${log_dir}]=1
+            log_index=$(( log_index + 1 ))
+            printf '%s\0' server "${log_index}" "${log_dir}" ""
+        done
+        printf '%s\0' shim "" "" ""
+        pn_evidence_rows
+    } 2> /dev/null | bun --no-install --eval '
+        try {
+            const { readFileSync, writeFileSync, mkdirSync, readdirSync, realpathSync, statSync } = await import("node:fs");
+            const { join, sep } = await import("node:path");
+            const { fixtureEvidenceRow } = await import(process.env.SCENARIO_FIXTURES + "/stub-submission-audit.ts");
+            const pkg = process.env.CSCB_PKG_DIR ?? "/test-repo/node_modules/claude-slack-channel-bots";
+            const { redactSlackLogText } = await import(pkg + "/src/slack-log-redaction.ts");
+            const rejected = value => fixtureEvidenceRow({ rejected: value }, redactSlackLogText).rejected;
+            const safe = (value, pattern) => value == null || value === "" ? null :
+                pattern.test(value) && redactSlackLogText(value) === value ? value : rejected(value);
+            const words = values => ({ test: value => values.split(" ").includes(value) });
+            const integer = /^[0-9]+$/, stamp = /^[0-9]+\.[0-9]{6}$/, keyPattern = /^[a-z0-9_]{1,59}$/, idPattern = /^cscb_[a-z0-9_]{1,59}$/;
+            const verbs = words("help spawn status get get-many send-keys read-pane kill decide get-permission record-pane-answer resume sweep find-missing expire make-template list list-subagents pause version hook");
+            const output = process.env.LATCH_EVIDENCE_OUTPUT;
+            mkdirSync(output, { recursive: true });
+            const write = (name, text) => { try { writeFileSync(join(output, name), text); } catch { console.error("latch-evidence: write unavailable"); } };
+            const fields = readFileSync(0, "utf8").split("\0"), records = {}, servers = [];
+            let i = 0;
+            for (; i + 3 < fields.length; i += 4) {
+                const [kind, name, key, value] = fields.slice(i, i + 4);
+                if (kind === "shim") { i += 4; break; }
+                if (kind === "server") {
+                    try {
+                        const root = realpathSync(process.env.SCENARIO_ROOT), dir = realpathSync(key);
+                        if (dir !== root && !dir.startsWith(root + sep)) throw new Error();
+                        for (const file of readdirSync(dir).filter(file => /^server\.log(?:\.[0-9]+)?$/.test(file))) {
+                            const path = realpathSync(join(dir, file));
+                            if (!path.startsWith(root + sep) || !statSync(path).isFile()) continue;
+                            const target = "server-" + name + ".log" + file.slice("server.log".length);
+                            write(target, redactSlackLogText(readFileSync(path, "utf8")));
+                            servers.push(target);
+                        }
+                    } catch { console.error("latch-evidence: server log unavailable"); }
+                    continue;
+                }
+                if (!words("LATCH_MARK LATCH_US LATCH_SET_US PERSONA_ID LATCH_PID LATCH_LIFE_MARK INTERVAL_US").test(name)) continue;
+                if (kind === "array") records[name] = {};
+                else if (kind === "unset") records[name] = null;
+                else if (kind === "scalar") records[name] = safe(value, integer);
+                else if (kind === "entry" && records[name]) records[name][safe(key, keyPattern)] = safe(value, name === "PERSONA_ID" ? idPattern : integer);
+            }
+            write("latch-records.json", JSON.stringify(records) + "\n");
+            write("server-logs.json", JSON.stringify(servers) + "\n");
+            const rows = [];
+            for (; i + 8 < fields.length; i += 9) {
+                const [line, time, kind, pid, ppid, verb, id, role, invalid] = fields.slice(i, i + 9);
+                rows.push({ line: safe(line, integer), time: safe(time, stamp), kind: safe(kind, words("call stop")),
+                    pid: safe(pid, integer), ppid: safe(ppid, integer), verb: safe(verb, verbs),
+                    id: safe(id, idPattern), role: safe(role, words("cscb other")), ...(invalid ? { invalid: rejected(invalid) } : {}) });
+            }
+            write("agent-director-shim.jsonl", rows.map(row => JSON.stringify(row) + "\n").join(""));
+        } catch { console.error("latch-evidence: unavailable"); }
+    '
+}
+
+# The EXIT cleanup also keeps the existing PN diagnostic stream when a
+# clearing event exists, including failures within command substitutions.
 pn_failure_evidence() {
+    ( latch_failure_evidence "${LATCH_EVIDENCE_DIR:-/test-results/test-23-latch-evidence}" ) \
+        || echo 'latch-evidence: unavailable' >&2
     [[ -n "${PN_END_MARK:-}" ]] || return 0
     # Eight preceding lines show the adjacent status/probe/list plus other
     # personas' interleaved calls. This context never affects attribution.
@@ -760,7 +852,7 @@ declare -A RETRY_OF=([${OI_KEY}]="${CALL_RESUME}" [${PN_KEY}]="${CALL_RESTART_DE
 # registration count and row read; the last still-latched round's status
 # time; a cleared probe's round line head and the mark taken when it was
 # seen.
-declare -A SEED_SID=() LATCH_MARK=() LATCH_US=() SESSION_OF=() POSTS_BEFORE=() LATCH_STATE=() LATCH_RV=()
+declare -A SEED_SID=() LATCH_MARK=() LATCH_US=() LATCH_SET_US=() SESSION_OF=() POSTS_BEFORE=() LATCH_STATE=() LATCH_RV=()
 declare -A STILL_LINE=() ROUND_HEAD=() FREE_ROUNDS=() FREE_MARK=() FREE_POSTS=() FREE_CONNECTS=() FREE_STATE=() FREE_RV=()
 declare -A PREV_US=()
 declare -A ROUND_END_HEAD=() ROUND_END_MARK=()
@@ -862,7 +954,7 @@ p1_only() {
 }
 
 # skip_early_reads <step> <key>: the persona's CSCB calls after its latch mark
-# that come before one interval from the round timer's starting point
+# that come before one interval from the latch's pre-arm call/list reference
 # (LATCH_US), where no round can be: at most one `get` (the startup
 # JSONL-persistence safeguard's, recorded), and no other call.
 # Sets ROUNDS_FROM to the mark the rounds are read from.
@@ -1543,6 +1635,7 @@ wait_latch_set() {
     fi
     LATCH_MARK[${key}]="$(ad_shim_mark)"
     line="$(_scenario_scan lastline "${SLACK_STATE_DIR}/server.log" "$(matcher "${head}" "${tail}")")"
+    LATCH_SET_US[${key}]="$(log_line_us "${line}")" || exit 1
     rest="${line#*"${head}"}"
     SESSION_OF[${key}]="${rest%%"${tail}"*}"
     [[ -n "${SESSION_OF[${key}]}" ]] || fail "${step}: the latch-set line quotes no session: ${line}"
@@ -1644,9 +1737,11 @@ check_unusable_notice() {
 
 # p2_check_bringup_refusal <step> <key> <rows>: the bring-up's refused call,
 # the bot server's, among the persona's CSCB calls before its latch (<rows>);
-# sets LATCH_US to the last call's time, the round timer's starting point.
+# sets LATCH_US to the last call starting at or before the latch-set line,
+# hence at or before arm. Shim and server use the same container wall clock;
+# the server line's millisecond truncation only makes this bound earlier.
 p2_check_bringup_refusal() {
-    local step="$1" key="$2" rows="$3" id="${PERSONA_ID[$2]}" refused="" pos time ppid verb args n=0
+    local step="$1" key="$2" rows="$3" id="${PERSONA_ID[$2]}" refused="" pos time ppid verb args n=0 anchor_us
     [[ -n "${rows}" ]] || fail "${step}: no CSCB call of ${id} before the latch"
     while IFS=$'\t' read -r pos time ppid verb _ args; do
         [[ -n "${pos}" ]] || continue
@@ -1672,7 +1767,15 @@ p2_check_bringup_refusal() {
         [[ "${ppid}" == "${LATCH_PID}" ]] || fail "${step}: the refused ${verb} of ${id} at shim line ${pos} is not the bot server's (${LATCH_PID})"
         echo "${TEST_NAME}: ${step}: the refused call: ${verb} at shim line ${pos} (${n} such call(s))"
     fi
-    LATCH_US[${key}]="$(us_of "$(tail -n 1 <<< "${rows}" | cut -f 2)")" || exit 1
+    [[ "${LATCH_SET_US[${key}]:-}" =~ ^[0-9]+$ ]] || fail "${step}: missing or malformed latch-set time"
+    LATCH_US[${key}]=""
+    while IFS=$'\t' read -r pos time _; do
+        [[ -n "${pos}" ]] || continue
+        anchor_us="$(us_of "${time}")" || exit 1
+        (( anchor_us <= LATCH_SET_US[${key}] )) || continue
+        LATCH_US[${key}]="${anchor_us}"
+    done <<< "${rows}"
+    [[ -n "${LATCH_US[${key}]}" ]] || fail "${step}: no CSCB call at or before the latch-set line"
 }
 
 # log_line_us <line>: a server.log line's own time (`[<ISO-8601 UTC>] …`) in
@@ -1680,6 +1783,8 @@ p2_check_bringup_refusal() {
 log_line_us() {
     local stamp="${1#\[}" us
     stamp="${stamp%%\]*}"
+    [[ "$1" == \[* && "${stamp}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$ ]] \
+        || fail "log_line_us: latch-set line timestamp is not a time"
     us="$(date -u -d "${stamp}" +%s%6N 2> /dev/null)" || fail "log_line_us: '${stamp}' is not a time"
     [[ "${us}" =~ ^[0-9]+$ ]] || fail "log_line_us: '${stamp}' gave '${us}'"
     echo "$(( 10#${us} ))"
@@ -1689,7 +1794,7 @@ log_line_us() {
 # and its latch-set line, exactly one server-owned get names --instance-id
 # <id>. Every other CSCB call of that id must follow the latch. Both shim
 # position and timestamp must place the get strictly between list and latch.
-# That list's time stays the round timer's starting point (LATCH_US); for
+# That list's time stays the pre-arm cadence reference (LATCH_US); for
 # "launch start not recorded", its row records no launch start in the store.
 check_sweep_latch() {
     local step="$1" key="$2" rows="$3" id="${PERSONA_ID[$2]}" set_line line latch_us lists sweep="" pos p time ppid started us
@@ -1708,6 +1813,8 @@ check_sweep_latch() {
     [[ -n "${sweep}" ]] || fail "${step}: no CSCB list of the bot server's (${LATCH_PID}) in the latch life before ${id}'s latch ($(secs_of "${latch_us}"))"
     read -r pos time <<< "${sweep}"
     LATCH_US[${key}]="$(us_of "${time}")" || exit 1
+    [[ "${LATCH_SET_US[${key}]:-}" =~ ^[0-9]+$ ]] || fail "${step}: missing or malformed latch-set time"
+    (( LATCH_US[${key}] <= LATCH_SET_US[${key}] )) || fail "${step}: the sweep list starts after the latch-set line"
     while IFS=$'\t' read -r p time ppid verb _ args; do
         [[ -n "${p}" ]] || continue
         us="$(us_of "${time}")" || exit 1
@@ -1752,8 +1859,8 @@ p2_check_latch() {
     esac
     [[ "${SESSION_OF[${key}]}" == "${want}" ]] || fail "${step}: the latch quotes session '${SESSION_OF[${key}]}', not ${want}"
 
-    # A sweep latch starts its round timer at list; a bring-up refusal
-    # starts it at the persona's last pre-latch call. Neither permits a kill.
+    # The first cadence reference is list for a sweep, or the last persona
+    # call at or before the latch-set line for bring-up. Neither permits a kill.
     rows="$(ad_cscb_calls "${id}" "${LATCH_LIFE_MARK}" "${LATCH_MARK[${key}]}")" || exit 1
     echo "${TEST_NAME}: ${step}: CSCB calls of ${id} up to the latch (recorded): $(field_of 4 "${rows}" | tr '\n' ' ')"
     if [[ "${REFUSED_OF[${key}]}" == none ]]; then

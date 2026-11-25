@@ -215,7 +215,7 @@ function failureEvidence(calls: string[], trail: unknown[], mode: 'schedule' | '
         '_scenario_eval_words', '_scenario_decode_words', '_scenario_ad_verb', '_scenario_ad_id', '_scenario_us_text',
         '_scenario_mark_list_selects', 'ad_mark_caller', 'ad_missing_tick', 'ad_trail_events', '_scenario_shim_diagnostic',
         '_scenario_cscb_ad_rows', 'ad_cscb_calls'].map(declaration),
-      ...['pn_evidence_rows', 'pn_failure_evidence', 'check_pn_marked', 'us_of', 'state_writes_of', 'pn_attribution_start',
+      ...['pn_evidence_rows', 'latch_failure_evidence', 'pn_failure_evidence', 'check_pn_marked', 'us_of', 'state_writes_of', 'pn_attribution_start',
         'check_latched_rounds', 'latch_rounds', 'rows_count', 'round_call_is'].map(pnDeclaration),
       '_SCENARIO_BEFORE_CLEANUP_HOOKS=(); _SCENARIO_STATE_DIRS=(); _SCENARIO_SERVER_PIDS=(); _SCENARIO_TRACKED_PIDS=(); _SCENARIO_EXIT_HOOKS=(); _SCENARIO_FAILURE_HOOKS=()',
       `SCENARIO_FMK=0; PN_KEY=panegone; ${deriving ? '' : `PN_END_MARK=${mode === 'attribution' ? 0 : 10}; PN_CLEAR_MS=1700000000005; PN_R4_STATUS=1`}`,

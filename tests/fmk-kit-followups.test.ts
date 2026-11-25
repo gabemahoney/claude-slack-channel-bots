@@ -1,13 +1,13 @@
 /** Execute the harness assertions with synthetic observations; no real AD or tmux. */
 import { expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
-import { assertNoLeak } from './test-helpers/credentials.ts'
+import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
 import {
   conflictLatchSetLine, latchRowStateRead, LATCH_CASE_LAUNCH_START_NOT_RECORDED,
-  LATCH_CASE_LEFTOVER, REFUSED_OPERATION_NONE,
+  LATCH_CASE_LEFTOVER, REFUSED_OPERATION_NONE, LATCH_CASE_ANOTHER_STORE, REFUSED_OPERATION_RESUME,
 } from '../src/conflict-latch.ts'
 
 const integration = join(import.meta.dir, 'integration')
@@ -96,7 +96,7 @@ test.each(['latched', 'relatched', 'leftover', 'other-persona'] as const)('test 
   }
 })
 
-type SweepGetFault = 'none' | 'missing' | 'duplicate' | 'before-list' | 'position-before-list' | 'wrong-parent' | 'wrong-id' | 'at-list' | 'at-latch' | 'only-after-latch' | 'other-call-before-latch'
+type SweepGetFault = 'none' | 'missing' | 'duplicate' | 'before-list' | 'position-before-list' | 'wrong-parent' | 'wrong-id' | 'at-list' | 'at-latch' | 'only-after-latch' | 'other-call-before-latch' | 'list-after-latch'
 
 /** Execute only the real ordering assertion over synthetic shim rows; no scenario/AD/tmux execution. */
 function sweepLatchOrdering(key: 'labelnote' | 'nostart', fault: SweepGetFault) {
@@ -114,17 +114,20 @@ function sweepLatchOrdering(key: 'labelnote' | 'nostart', fault: SweepGetFault) 
   ].join('\n')
   return run([
     'TEST_NAME=fixture SLACK_STATE_DIR="$SCENARIO_ROOT" LATCH_PID=42 LATCH_LIFE_MARK=0',
+    'INTERVAL_US=45000000 INTERVAL_S=45 SETTLE_S=30',
     `CASE_LAUNCH_START=${quote(LATCH_CASE_LAUNCH_START_NOT_RECORDED)}`,
     `declare -A PERSONA_ID=([${key}]=${id}) CASE_OF=([${key}]=${key === 'nostart' ? quote(LATCH_CASE_LAUNCH_START_NOT_RECORDED) : 'conflicting-labels'})`,
     `declare -A SESSION_OF=([${key}]=session) OP_OF=([${key}]=none) LATCH_ROW_OF=([${key}]=pending) LATCH_MARK=([${key}]=20) LATCH_US=() PERSONA_NAME=([${key}]=${key})`,
+    `declare -A LATCH_SET_US=([${key}]=${fault === 'list-after-latch' ? 1900000 : 3000000})`,
     'printf "%s\\n" SET-LATCH > "$SLACK_STATE_DIR/server.log"',
     'fmk_text() { printf "%s\\n" SET-LATCH; }',
-    'log_line_us() { echo 3000000; }',
+    `log_line_us() { echo ${fault === 'list-after-latch' ? 1900000 : 3000000}; }`,
     `ad_cscb_verb_between() { printf '%s\\n' ${quote('10\t2.000000\t42\tlist\t-\t--label service=cscb')}; }`,
     '_scenario_store_read() { printf ""; }',
-    ...['us_of', 'secs_of', 'check_sweep_latch'].map(name => declaration(source, name)),
+    ...['us_of', 'secs_of', 'check_sweep_latch', 'check_cadence'].map(name => declaration(source, name)),
     `check_sweep_latch fixture ${key} ${quote(rows)}`,
     `echo "anchor=\${LATCH_US[${key}]}"`,
+    `check_cadence fixture "\${LATCH_US[${key}]}" 47000000 47000000 none`,
   ].join('\n'))
 }
 
@@ -147,6 +150,7 @@ const SWEEP_GET_FAULTS: ReadonlyArray<readonly [SweepGetFault, string]> = [
   ['at-latch', 'not strictly after its sweep list'],
   ['only-after-latch', 'no bot-server Full Row get'],
   ['other-call-before-latch', "not the bot server's one Full Row get"],
+  ['list-after-latch', 'no CSCB list of the bot server'],
 ]
 
 test.each((['labelnote', 'nostart'] as const).flatMap(key => SWEEP_GET_FAULTS.map(([fault, reason]) => [key, fault, reason] as const)))('test 23 %s sweep latch rejects %s', (key, fault, reason) => {
@@ -381,3 +385,183 @@ test.each([
     expect(result.stdout).toContain('read it missing')
   }
 })
+
+// Preserve the cadence fixtures' helper names and contracts in their own scope.
+{
+/** Real test-23 assertions over synthetic records; no AD, server or timers. */
+const integration = join(import.meta.dir, 'integration')
+const script = readFileSync(join(integration, 'test-23-fmk-latch-recheck.sh'), 'utf8')
+const scenario = readFileSync(join(integration, 'lib/scenario.sh'), 'utf8')
+const declaration = (source: string, name: string) => source.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, 'm'))?.[0] ?? ''
+const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
+const shim = (time: string, verb: string) => `call\t${time}\t100\t42\tparent\t${verb} --instance-id cscb_otherstore`
+const decoder = ['_scenario_to_us', '_scenario_record_load', '_scenario_role_at', '_scenario_split_line', '_scenario_eval_words',
+  '_scenario_decode_words', '_scenario_ad_verb', '_scenario_ad_id', '_scenario_us_text', '_scenario_read_log',
+  '_scenario_shim_diagnostic', '_scenario_check_mark', '_scenario_in_window', '_scenario_cscb_ad_rows', 'ad_cscb_calls',
+  '_scenario_log_mark', 'ad_shim_mark'].map(name => declaration(scenario, name))
+
+function run(root: string, body: string[]) {
+  const result = spawnSync('bash', ['-c', [
+    'set -euo pipefail', 'fail() { echo "$*" >&2; exit 23; }',
+    'require_ci_image() { :; }; require_scenario_home() { :; }',
+    ...decoder,
+    '_scenario_query_prep() { _scenario_record_load "$SCENARIO_CSCB_RECORD"; }',
+    ...body,
+  ].join('\n')], {
+    env: hostSafeChildEnv(root, { tools: ['bash', 'awk', 'date', 'tail', 'cut', 'wc', 'tr', 'grep', 'sed', 'head', 'bun', 'rm'], extras: {
+      SCENARIO_ROOT: join(root, 'scenario'), SCENARIO_AD_SHIM_LOG: join(root, 'scenario', 'shim'),
+      SCENARIO_CSCB_RECORD: join(root, 'scenario', 'roles'), SCENARIO_FMK: '0',
+      SCENARIO_FIXTURES: join(integration, 'fixtures'), CSCB_PKG_DIR: join(import.meta.dir, '..'),
+      LATCH_EVIDENCE_DIR: join(root, 'results'),
+    } }), encoding: 'utf8', timeout: 10000,
+  })
+  expect(result.error).toBeUndefined()
+  expect(result.signal).toBeNull()
+  assertNoLeak([result.stdout, result.stderr])
+  return result
+}
+
+function fixture() {
+  const root = mkdtempSync('/tmp/fmk-latch-cadence-')
+  mkdirSync(join(root, 'scenario'))
+  writeFileSync(join(root, 'scenario', 'roles'), 'proc\tserver\t42\t1\t0.000000\n')
+  return root
+}
+
+const latch = (session: string) => conflictLatchSetLine('otherstore', {
+  sessionName: session, latchCase: LATCH_CASE_ANOTHER_STORE,
+  refusedOperation: REFUSED_OPERATION_RESUME, rowState: latchRowStateRead('ended'),
+})
+
+function bringup({ late = false, read = '145.000000', noAnchor = false, stamp = '1970-01-01T00:01:40.000Z', mode = 'rounds' }: {
+  late?: boolean, read?: string, noAnchor?: boolean, stamp?: string, mode?: 'rounds' | 'startup',
+} = {}) {
+  const root = fixture()
+  try {
+    const before = [shim(noAnchor ? '100.010000' : '99.990000', 'resume'), ...(late ? [shim('100.016000', 'get')] : [])]
+    writeFileSync(join(root, 'scenario', 'shim'), before.join('\n') + '\n')
+    writeFileSync(join(root, 'scenario', 'server.log'), `[${stamp}] ${latch('session')}\n`)
+    return run(root, [
+      'TEST_NAME=fixture LATCH_PID=42 LATCH_LIFE_MARK=0 START_WAIT_S=1 INTERVAL_US=45000000 INTERVAL_S=45 SETTLE_S=30',
+      'SLACK_STATE_DIR="$SCENARIO_ROOT" SCENARIO_SEP=$\'\\034\' OI_KEY=ownid PN_KEY=panegone MIN_LATCHED_ROUNDS=2 CALL_NONE=none',
+      'CALL_RESUME=resume CALL_PLAIN_SPAWN=plain-spawn CALL_REUSE_SPAWN=reuse-spawn CALL_PROBE=probe CALL_PENDING_READ=pending-read',
+      'declare -A PERSONA_ID=([otherstore]=cscb_otherstore) CASE_OF=([otherstore]=another-store) OP_OF=([otherstore]=resume)',
+      'declare -A LATCH_ROW_OF=([otherstore]=ended) REFUSED_OF=([otherstore]=resume) LATCH_MARK=() LATCH_US=() LATCH_SET_US=() SESSION_OF=() ROUNDS_FROM=()',
+      'declare -A FREE_ROUNDS=([otherstore]=2) FREE_MARK=([otherstore]=99) FREE_POSTS=([otherstore]=1) POSTS_BEFORE=([otherstore]=0)',
+      'declare -A CALL_OF=([otherstore]=none) READ_OF=() PREV_US=()',
+      ...['matcher', '_scenario_scan'].map(name => declaration(scenario, name)),
+      ...['us_of', 'secs_of', 'rows_count', 'check_cadence', 'round_call_is', 'latch_rounds', 'wait_latch_set',
+        'log_line_us', 'p2_check_bringup_refusal', 'check_latched_rounds', 'skip_early_reads'].map(name => declaration(script, name)),
+      `_scenario_poll_until() { return 0; }; fmk_text() { printf '%s\\n' ${quote(latch('SESSIONSLOT'))}; }`,
+      'latch_lines_of() { :; }; calls_of() { :; }',
+      'SCENARIO_FMK=1; wait_latch_set otherstore',
+      'rows="$(ad_cscb_calls cscb_otherstore 0 "${LATCH_MARK[otherstore]}")"',
+      'p2_check_bringup_refusal fixture otherstore "$rows"',
+      'echo "anchor=${LATCH_US[otherstore]}"',
+      ...(mode === 'startup' ? [
+        `printf '%s\\n' ${quote(shim('101.000000', 'get'))} ${quote(shim('145.000000', 'status'))} >> "$SCENARIO_AD_SHIM_LOG"`,
+        'skip_early_reads fixture otherstore',
+        'echo "from=${ROUNDS_FROM[otherstore]}"',
+      ] : [
+        `printf '%s\\n' ${quote(shim(read, 'status'))} ${quote(shim((Number(read) + 45).toFixed(6), 'status'))} >> "$SCENARIO_AD_SHIM_LOG"`,
+        'check_latched_rounds otherstore',
+      ]),
+    ])
+  } finally { rmSync(root, { recursive: true, force: true }) }
+}
+
+test('test 23 on-time round ignores a post-arm pre-mark get as an anchor', () => {
+  const result = bringup({ late: true })
+  expect(result.status, result.stderr).toBe(0)
+  expect(result.stdout).toContain('anchor=99990000')
+  expect(result.stdout).toContain('round 1: read 45.010 s')
+})
+
+test('test 23 no late call retains the original anchor and cadence margin', () => {
+  const result = bringup()
+  expect(result.status).toBe(0)
+  expect(result.stdout).toContain('anchor=99990000')
+  expect(result.stdout).toContain('round 1: read 45.010 s')
+})
+
+test.each([
+  ['144.500000', 'less than the 45 s interval'],
+  ['174.990001', 'more than the 45 s interval plus the 30 s settle'],
+] as const)('test 23 first round at %s still fails its unchanged bound', (read, error) => {
+  const result = bringup({ read })
+  expect(result.status).toBe(23)
+  expect(result.stderr).toContain(error)
+})
+
+test('test 23 first round just inside the original upper bound passes that round', () => {
+  const result = bringup({ read: '174.989999' })
+  expect(result.status).toBe(0)
+  expect(result.stdout).toContain('round 1: read 74.999 s')
+})
+
+test.each([
+  [{ noAnchor: true }, 'no CSCB call at or before the latch-set line'],
+  [{ stamp: 'not-a-time' }, 'is not a time'],
+] as const)('test 23 rejects missing pre-latch call or malformed latch time: %j', (options, error) => {
+  const result = bringup(options)
+  expect(result.status).not.toBe(0)
+  expect(result.stderr).toContain(error)
+})
+
+test('test 23 startup exemption retains its boundary on a valid anchor', () => {
+  const result = bringup({ mode: 'startup' })
+  expect(result.status).toBe(0)
+  expect(result.stdout).toContain('anchor=99990000')
+  expect(result.stdout).toContain('from=2')
+})
+
+test.each(['failure', 'pass', 'missing-shim'] as const)('test 23 Part 2 %s keeps only redacted failure artifacts outside cleanup', mode => {
+  const root = fixture()
+  const results = join(root, 'results')
+  const secret = fakeToken(BOT_TOKEN_PREFIX, 'latch-evidence')
+  try {
+    writeFileSync(join(root, 'scenario', 'shim'), [shim('99.990000', 'resume'), shim('100.016000', 'get'), secret,
+      `call\t100.020000\t100\t42\tparent\tget --instance-id ${secret}`].join('\n') + '\n')
+    writeFileSync(join(root, 'scenario', 'server.log'), `first ${sentinelInMessage('latch-evidence')}\n`)
+    writeFileSync(join(root, 'scenario', 'server.log.1'), 'rotated latch line\n')
+    mkdirSync(join(root, 'scenario', 'second'))
+    writeFileSync(join(root, 'scenario', 'second', 'server.log'), 'second latch line\n')
+    if (mode === 'missing-shim') rmSync(join(root, 'scenario', 'shim'))
+    const result = run(root, [
+      ...['_scenario_cleanup', 'on_failure'].map(name => declaration(scenario, name)),
+      ...['pn_evidence_rows', 'latch_failure_evidence', 'pn_failure_evidence'].map(name => declaration(script, name)),
+      'TEST_NAME=fixture SCENARIO_LOG_TAIL_LINES=0 LATCH_LIFE_MARK=0 LATCH_PID=42 INTERVAL_US=45000000',
+      'SLACK_STATE_DIR="$SCENARIO_ROOT"; _scenario_stop_dir() { :; }',
+      '_SCENARIO_BEFORE_CLEANUP_HOOKS=(); _SCENARIO_SERVER_PIDS=(); _SCENARIO_TRACKED_PIDS=(); _SCENARIO_EXIT_HOOKS=(); _SCENARIO_FAILURE_HOOKS=()',
+      '_SCENARIO_STATE_DIRS=("$SCENARIO_ROOT" "$SCENARIO_ROOT/second")',
+      'declare -A LATCH_MARK=([otherstore]=2) LATCH_US=([otherstore]=99990000) LATCH_SET_US=([otherstore]=100000000)',
+      'declare -A PERSONA_ID=([otherstore]=cscb_otherstore)',
+      `LATCH_US[unsafe]=${quote(secret)}; LATCH_MARK[${quote(secret)}]=3; PERSONA_ID[unsafe]=${quote(sentinelInMessage('latch-id'))}`,
+      script.match(/^on_failure pn_failure_evidence$/m)?.[0] ?? 'false',
+      'trap _scenario_cleanup EXIT',
+      mode === 'pass' ? 'exit 0' : 'fail "part 2 cadence failed"',
+    ])
+    expect(result.status).toBe(mode === 'pass' ? 0 : 23)
+    expect(existsSync(join(root, 'scenario'))).toBe(false)
+    if (mode === 'pass') expect(existsSync(results)).toBe(false)
+    else {
+      expect(existsSync(join(results, 'latch-records.json'))).toBe(true)
+      const records = JSON.parse(readFileSync(join(results, 'latch-records.json'), 'utf8'))
+      expect(records).toMatchObject({ LATCH_MARK: { otherstore: '2' }, LATCH_US: { otherstore: '99990000' }, LATCH_SET_US: { otherstore: '100000000' } })
+      expect(records.LATCH_US.unsafe).toMatch(/^invalid:sha256:[a-f0-9]{64}:bytes:[0-9]+$/)
+      expect(records.PERSONA_ID.unsafe).toMatch(/^invalid:sha256:[a-f0-9]{64}:bytes:[0-9]+$/)
+      expect(readFileSync(join(results, 'server-1.log'), 'utf8')).toContain('<redacted-token> <redacted-url>')
+      expect(readFileSync(join(results, 'server-1.log.1'), 'utf8')).toBe('rotated latch line\n')
+      expect(readFileSync(join(results, 'server-2.log'), 'utf8')).toBe('second latch line\n')
+      const rows = readFileSync(join(results, 'agent-director-shim.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+      if (mode === 'failure') {
+        expect(rows[1]).toMatchObject({ line: '2', time: '100.016000', verb: 'get', id: 'cscb_otherstore', ppid: '42', role: 'cscb' })
+        expect(rows[2].invalid).toMatch(/^invalid:sha256:[a-f0-9]{64}:bytes:[0-9]+$/)
+        expect(rows[3].id).toMatch(/^invalid:sha256:[a-f0-9]{64}:bytes:[0-9]+$/)
+      } else expect(rows).toEqual([])
+      assertNoLeak(writtenFile(results))
+    }
+    expect(result.stderr).not.toContain('panegone-evidence:')
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+}
