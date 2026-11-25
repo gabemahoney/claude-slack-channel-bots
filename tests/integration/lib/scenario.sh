@@ -1210,8 +1210,16 @@
 #                                      Pass as <by> the time an observation of the mark had ended (a
 #                                      read that returned missing): a call started after it cannot
 #                                      have made the mark. List filters must admit the tick's prior
-#                                      state and the row's current labels. No call-end times or
-#                                      historical labels are logged, so candidates may overlap: fail
+#                                      state and the row's current labels. The optional sidecar
+#                                      <shim-log>.ends pairs end upper bounds to original call byte
+#                                      offsets, PID, PPID and start. Drop only a valid end strictly
+#                                      before the START of the tick's millisecond: E < tick_ms * 1000,
+#                                      both in integer epoch microseconds. Equal, same-ms, later,
+#                                      missing or unusable ends retain the call. Read complete
+#                                      snapshots without waiting for observers. These comparisons
+#                                      assume one continuous shared kernel CLOCK_REALTIME, with no
+#                                      scenario clock steps. Historical labels remain unavailable,
+#                                      and remaining candidates may overlap: fail
 #                                      ambiguous when they have different parents and any is not
 #                                      CSCB's. List limits/display filters cannot be reconstructed.
 #   tmux_shim_targets <session-name|session-id|window-id|pane-id> [<from-mark> [<to-mark>]]
@@ -5656,8 +5664,9 @@ _scenario_mark_list_selects() {
 
 ad_mark_caller() {
     local tick="${1:-}" from="${2:--}" by="${3:--}" step="ad_mark_caller" id source ts prior tick_ms by_us="" lines=() i role
-    local found=() other=""
-    local -A parents=()
+    local found=() other="" offsets=() offset=0 end_lines=() end_line end_text end_us end_key ended
+    local LC_ALL=C # byte offsets, including multibyte argv, not character counts
+    local -A parents=() call_keys=() end_bounds=() end_seen=()
     require_ci_image "${step}"
     require_scenario_home "${step}"
     _scenario_check_mark "${step}" "<from-mark>" "${from}"
@@ -5676,12 +5685,52 @@ ad_mark_caller() {
         || fail "${step}: the tick's ts '${ts}' does not read as a time"
     _scenario_query_prep "${step}"
     _scenario_read_log "${step}" "${SCENARIO_AD_SHIM_LOG}" lines
+    # Index the ORIGINAL complete prefix, not a window or call-only rows.
+    # Main-log consumers and their physical marks never read the sidecar.
+    for i in "${!lines[@]}"; do
+        offset=$(( offset + ${#lines[i]} + 1 ))
+        offsets[i]="${offset}"
+        _scenario_split_line "${lines[i]}"
+        [[ "${_L_KIND}" == call ]] || continue
+        call_keys["${offset}"]="${_L_PID}"$'\t'"${_L_PPID}"$'\t'"${_L_US}"
+    done
+    # shellcheck disable=SC2031 # the caller-selected log, as in the main read above
+    if { mapfile end_lines < "${SCENARIO_AD_SHIM_LOG}.ends"; } 2> /dev/null; then
+        for end_line in "${end_lines[@]}"; do
+            [[ "${end_line}" == *$'\n' ]] || continue # append still in flight
+            end_line="${end_line%$'\n'}"
+            end_text="${end_line#*$'\t'}"; end_text="${end_text%%$'\t'*}"
+            # Bound decimal sizes before arithmetic; corrupted metadata must
+            # not overflow into an apparently early end. No sidecar eval.
+            if [[ ! "${end_text}" =~ ^[0-9]{1,12}\.[0-9]{6}$ ]] \
+                || ! _scenario_split_line "${end_line}" \
+                || [[ "${_L_KIND}" != end-v1 || ! "${_L_PID}" =~ ^[1-9][0-9]{0,17}$ \
+                    || ! "${_L_PPID}" =~ ^[1-9][0-9]{0,9}$ || ! "${_L_PARENT}" =~ ^[0-9]{1,10}$ \
+                    || ! "${_L_RAW_WORDS}" =~ ^[0-9]{1,12}\.[0-9]{6}$ ]]; then
+                end_bounds=() # unusable complete snapshot: retain every call
+                break
+            fi
+            offset="${_L_PID}"; end_us="${_L_US}"
+            _scenario_to_us "${_L_RAW_WORDS}"
+            end_key="${_L_PPID}"$'\t'"${_L_PARENT}"$'\t'"${_SCENARIO_US}"
+            [[ "${call_keys[${offset}]:-}" == "${end_key}" ]] || continue
+            (( end_us >= _SCENARIO_US )) || continue
+            if [[ -n "${end_seen[${offset}]:-}" ]]; then
+                unset "end_bounds[${offset}]" # duplicate completion is not proof
+            else
+                end_bounds["${offset}"]="${end_us}"
+            fi
+            end_seen["${offset}"]=1
+        done
+    fi
     for i in "${!lines[@]}"; do
         _scenario_in_window "$(( i + 1 ))" "${from}" - || continue
         _scenario_split_line "${lines[i]}"
         [[ "${_L_KIND}" == call ]] || continue
         (( _L_US < (tick_ms + 1) * 1000 )) || continue
         [[ -z "${by_us}" ]] || (( _L_US <= by_us )) || continue
+        ended="${end_bounds[${offsets[i]}]:-}"
+        [[ -z "${ended}" ]] || (( ended >= tick_ms * 1000 )) || continue
         _scenario_decode_words
         _scenario_ad_verb
         _scenario_ad_id
@@ -5699,7 +5748,7 @@ ad_mark_caller() {
     done
     (( ${#found[@]} > 0 )) || return 1
     if [[ -n "${other}" ]] && (( ${#parents[@]} > 1 )); then
-        fail "${step}: ambiguous mark of ${id}: eligible calls from parents ${!parents[*]}, ${other} not CSCB's, may overlap (no call-end timestamps)"
+        fail "${step}: ambiguous mark of ${id}: eligible calls from parents ${!parents[*]}, ${other} not CSCB's, may overlap (end records do not exclude them)"
     fi
     printf '%s\n' "${found[@]}"
 }

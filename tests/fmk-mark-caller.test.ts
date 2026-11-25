@@ -1,7 +1,7 @@
 /** Attribution returns every call that could have made a mark, never one picked call. */
 import { expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { readFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { readFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import { assertNoLeak, fakeToken, BOT_TOKEN_PREFIX, sentinelInMessage } from './test-helpers/credentials.ts'
@@ -20,8 +20,13 @@ const pnClearingEvent = () => pnDeclaration('p2_clearing_schedule').split('ROUND
 
 // 42 is the bot server and 43 another CSCB process; any other parent is not CSCB's.
 function probe(calls: string[], labels: Record<string, string> = { service: 'cscb' }, extra: string[] = [], tickSource = 'ad_recovery', panegone = false,
-  pn: { sameMs?: boolean, validateRound?: boolean, reference?: number, roundEnd?: number } = {}) {
+  pn: { sameMs?: boolean, validateRound?: boolean, reference?: number, roundEnd?: number,
+    ends?: (calls: string[]) => string, from?: number, check?: string, unreadableEnds?: boolean } = {}) {
   const root = mkdtempSync('/tmp/fmk-mark-caller-')
+  const log = join(root, 'shim')
+  writeFileSync(log, calls.join('\n') + '\n')
+  if (pn.ends) writeFileSync(log + '.ends', pn.ends(calls))
+  if (pn.unreadableEnds) mkdirSync(log + '.ends') // cannot be read as completion records
   // Execute the real clearing-event block with only native scheduling stubbed.
   // Lines 1/2 are R4's completed status/probe; the pre-end reference includes
   // every line except the clearing status. The old pre-wait mark would be 0.
@@ -31,12 +36,11 @@ function probe(calls: string[], labels: Record<string, string> = { service: 'csc
     'require_ci_image() { :; }',
     'require_scenario_home() { :; }',
     '_scenario_query_prep() { :; }',
-    '_scenario_read_log() { local -n out="$3"; out=("${fixture_lines[@]}"); }',
     '_scenario_role_at() { [[ "$1" == 42 || "$1" == 43 ]]; }',
     `ad_store_peek() { printf '%s\\n' ${quote(JSON.stringify({ labels }))}; }`,
-    'SCENARIO_AD_SHIM_LOG=fixture',
-    `fixture_lines=(${calls.map(quote).join(' ')})`,
+    `SCENARIO_AD_SHIM_LOG=${quote(log)}`,
     ...['_scenario_check_mark', '_scenario_in_window', '_scenario_to_us', '_scenario_split_line',
+      '_scenario_read_log', '_scenario_shim_diagnostic',
       '_scenario_eval_words', '_scenario_decode_words', '_scenario_ad_verb', '_scenario_ad_id',
       '_scenario_us_text', '_scenario_mark_list_selects', 'ad_mark_caller', '_scenario_cscb_ad_rows', 'ad_cscb_calls'].map(declaration),
     ...(panegone ? [
@@ -60,11 +64,14 @@ function probe(calls: string[], labels: Record<string, string> = { service: 'csc
       ] : []),
       'PN_CLEAR_MS=1700000000005',
       `check_pn_marked "part 2: panegone clear" row ${calls.length} ${pn.sameMs ? '1700000000.020200' : '1700000000.020000'} 1700000000.021000`,
-    ] : [`ad_mark_caller ${[tickOf(tickSource), '0', ...extra].map(quote).join(' ')}`]),
+    ] : pn.check ? [pn.check] : [
+      `candidates="$(ad_mark_caller ${[tickOf(tickSource), String(pn.from ?? 0), ...extra].map(quote).join(' ')})" || exit $?`,
+      'printf "%s\\n" "$candidates"',
+    ]),
   ].join('\n')
   try {
     const result = spawnSync('bash', ['-c', script], {
-      env: hostSafeChildEnv(root, { tools: ['bash', 'jq', 'date', 'wc', 'tr'] }), encoding: 'utf8', timeout: 10000,
+      env: hostSafeChildEnv(root, { tools: ['bash', 'jq', 'date', 'wc', 'tr', 'awk'] }), encoding: 'utf8', timeout: 10000,
     })
     expect(result.error).toBeUndefined()
     expect(result.signal).toBeNull()
@@ -194,6 +201,215 @@ test('test-23 residual: an unproven selecting list in the gap still defeats the 
   { sameMs: true, validateRound: true })
   expect(result.status).toBe(1)
   expect(result.stderr).toContain('shim line 3 (list at 1700000000.006000) could have made it beside the status')
+})
+
+// The sidecar keys the byte after the original call's newline, not its PID
+// alone or its position among calls. Calculate that independently of bash.
+const endOf = (calls: string[], index: number, us: number) => {
+  const fields = calls[index]!.split('\t')
+  return ['end-v1', `1700000000.${String(us).padStart(6, '0')}`,
+    Buffer.byteLength(calls.slice(0, index + 1).join('\n') + '\n'), fields[2], fields[3], fields[1]].join('\t') + '\n'
+}
+const pnEndCalls = (parent = 42) => [call(1000, 42, 'status --instance-id row'),
+  call(2000, 42, 'read-pane --instance-id row --n-lines 1'), call(6000, parent, 'list --state waiting'),
+  call(20200, 42, 'status --instance-id row')]
+
+test('call ends regression: a selecting list proven ended before the tick permits the real PN sole-status branch', () => {
+  const result = probe(pnEndCalls(), undefined, [], undefined, true,
+    { sameMs: true, validateRound: true, ends: calls => endOf(calls, 2, 19999) })
+  // On the old helper this reports the real conservative attribution failure.
+  expect(result.stderr).toBe('')
+  expect(result.status).toBe(0)
+  expect(result.stdout).toContain('status at shim line 4 marked row missing')
+  expect(result.stdout).not.toContain('list at shim line 3 marked')
+})
+
+test.each([20000, 20001, 20999, 21000])('call ends control: upper end %i retains the PN list at/after the tick boundary', end => {
+  const result = probe(pnEndCalls(), undefined, [], undefined, true,
+    { sameMs: true, validateRound: true, ends: calls => endOf(calls, 2, end) })
+  expect(result.status).toBe(1)
+  expect(result.stderr).toContain('shim line 3 (list at 1700000000.006000) could have made it beside the status')
+})
+
+test.each([undefined, 20000, 21000])('call ends control: non-CSCB pre-R4 list stays ambiguous with end %s', end => {
+  const calls = [call(500, 99, 'list --state waiting'), ...pnEndCalls()]
+  const result = probe(calls, undefined, [], undefined, true, { sameMs: true, validateRound: true, roundEnd: 3,
+    ...(end === undefined ? {} : { ends: (lines: string[]) => endOf(lines, 0, end) }) })
+  expect(result.status).toBe(1)
+  expect(result.stderr).toContain('ambiguous')
+})
+
+test('call ends regression: a proven pre-tick non-CSCB read no longer causes ambiguity', () => {
+  const result = probe([call(1000, 99, 'get --instance-id row'), M], undefined, [], undefined, false,
+    { ends: calls => endOf(calls, 0, 9999) })
+  expect(result.stderr).toBe('')
+  expect(result.status).toBe(0)
+  expect(rows(result.stdout)).toEqual([['2', ...MROW.slice(1)]])
+})
+
+test('call ends regression: offsets distinguish reused PID calls and out-of-order completions', () => {
+  const result = probe([call(1000, 42, 'list --state waiting'), call(2000, 43, 'status --instance-id row'), M],
+    undefined, [], undefined, false,
+    { ends: calls => endOf(calls, 1, 21000) + endOf(calls, 0, 9999) + endOf(calls, 2, 22000) })
+  expect(result.status).toBe(0)
+  expect(rows(result.stdout).map(row => [row[0], row[2]])).toEqual([['2', '43'], ['3', '42']])
+})
+
+test('call ends regression: byte offsets include Unicode, stop and fault records without changing physical marks', () => {
+  const calls = [call(100, 42, 'get --instance-id other --label note=🙂'),
+    'stop\t1700000000.000200\t200\t42\tparent\tstub-claude stopped',
+    'fault\t1700000000.000300\t100\t42\tparent\tget * swallow 1',
+    call(1000, 42, 'get --instance-id row'), M]
+  const result = probe(calls, undefined, [MISSING_TE], undefined, false,
+    { from: 3, ends: lines => endOf(lines, 3, 9999) })
+  expect(result.status).toBe(0)
+  expect(rows(result.stdout)).toEqual([['5', ...MROW.slice(1)]])
+})
+
+test('call ends regression: a sole proven-ended call leaves no candidate', () => {
+  const result = probe([call(1000, 42, 'get --instance-id row')], undefined, [], undefined, false,
+    { ends: calls => endOf(calls, 0, 9999) })
+  expect(result.status).toBe(1)
+  expect(result.stdout).toBe('')
+  expect(result.stderr).toBe('')
+})
+
+test.each(['ad_find_missing', 'ad_recovery'])('call ends regression: source %s keeps only an in-flight fitting verb', source => {
+  const verbs = source === 'ad_find_missing' ? ['sweep', 'find-missing'] : ['pause --instance-id row', 'get --instance-id row']
+  const result = probe([call(1000, 42, verbs[0]!), call(10200, 43, verbs[1]!)], undefined, [], source, false,
+    { ends: calls => endOf(calls, 0, 9999) })
+  expect(result.status).toBe(0)
+  expect(rows(result.stdout).map(row => [row[0], row[2], row[3]])).toEqual([['2', '43', verbs[1]!.split(' ')[0]]])
+})
+
+test('call ends control: by is still a bound on starts, even when the later call has ended', () => {
+  const result = probe([M, call(10800, 99, 'get --instance-id row')], undefined, [MISSING_TE], undefined, false,
+    { ends: calls => endOf(calls, 1, 22000) })
+  expect(result.status).toBe(0)
+  expect(rows(result.stdout)).toEqual([MROW])
+})
+
+test('call ends control: an in-flight list keeps the real list-first PN pass and R4 exclusion', () => {
+  const calls = [call(1000, 42, 'status --instance-id row'), call(2000, 42, 'read-pane --instance-id row --n-lines 1'),
+    call(6000, 42, 'list --state waiting'), call(20000, 42, 'status --instance-id row')]
+  const result = probe(calls, undefined, [], undefined, true,
+    { validateRound: true, ends: lines => endOf(lines, 0, 11000) + endOf(lines, 2, 12000) })
+  expect(result.status).toBe(0)
+  expect(result.stdout).toContain('list at shim line 3 marked row missing')
+})
+
+const unusableEnds: Array<[string, (calls: string[]) => string]> = [
+  ['empty', () => ''],
+  ['unterminated', calls => endOf(calls, 2, 19999).trimEnd()],
+  ['malformed complete record', () => 'end-v1\tinvalid\n'],
+  ['overflowing end', calls => endOf(calls, 2, 19999).replace('1700000000.019999', '9999999999999999999999.019999')],
+  ...([2, 3, 4, 5] as const).map(index => [`wrong pairing field ${index}`, (calls: string[]) => {
+    const fields = endOf(calls, 2, 19999).trimEnd().split('\t')
+    fields[index] = index === 5 ? '1700000000.005000' : '999'
+    return fields.join('\t') + '\n'
+  }] as [string, (calls: string[]) => string]),
+  ['end before start', calls => endOf(calls, 2, 5000)],
+  ['duplicate conflicting ends', calls => endOf(calls, 2, 19999) + endOf(calls, 2, 21000)],
+  ['duplicate earlier end', calls => endOf(calls, 2, 21000) + endOf(calls, 2, 19999)],
+]
+test.each(unusableEnds)('call ends control: %s supplies no PN completion proof', (_, ends) => {
+  const result = probe(pnEndCalls(), undefined, [], undefined, true, { sameMs: true, validateRound: true, ends })
+  expect(result.status).toBe(1)
+  expect(result.stderr).toContain('could have made it beside the status')
+})
+
+test('call ends control: an unreadable sidecar retains every candidate', () => {
+  const result = probe(pnEndCalls(), undefined, [], undefined, true,
+    { sameMs: true, validateRound: true, unreadableEnds: true })
+  expect(result.status).toBe(1)
+  expect(result.stderr).toContain('could have made it beside the status')
+})
+
+test('end sidecars do not change main-log physical marks, call counters or row projections', () => {
+  const calls = [call(1000, 42, 'list --state waiting'),
+    'fault\t1700000000.001100\t100\t42\tparent\tlist * swallow 1',
+    'stop\t1700000000.001200\t200\t42\tparent\tstub-claude stopped', M]
+  const check = [
+    ...['_scenario_cscb_ad_scan', 'cscb_ad_count', '_scenario_log_mark', 'ad_shim_mark'].map(declaration),
+    'SCENARIO_FMK=1', 'ad_shim_mark', 'cscb_ad_count ""', 'ad_cscb_calls row',
+  ].join('\n')
+  const without = probe(calls, undefined, [], undefined, false, { check })
+  const withEnds = probe(calls, undefined, [], undefined, false, { check, ends: lines => endOf(lines, 0, 9999) })
+  expect(without.status).toBe(0)
+  expect(withEnds.status).toBe(0)
+  expect(without.stdout).toStartWith('4\n2\n4\t1700000000.010200\t42\tstatus\trow\t')
+  expect(withEnds.stdout).toBe(without.stdout)
+  expect(withEnds.stderr).toBe('')
+})
+
+function consumerCheck(name: string) {
+  const path = name === '17' ? 'test-17-fmk-launch-pending.sh' : name === '21' ? 'test-21-fmk-teardown.sh'
+    : name === '28' ? 'test-28-fmk-provenance.sh' : 'test-23-fmk-latch-recheck.sh'
+  const script = readFileSync(join(import.meta.dir, 'integration', path), 'utf8')
+  const fn = (name: string) => script.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, 'm'))![0]
+  const setup = [
+    `ad_missing_tick() { printf '%s\\n' ${quote(tickOf('ad_recovery'))}; }`,
+    'ad_release_at_least() { return 0; }', 'TEST_NAME=fixture SERVER_PID=42',
+  ]
+  if (name === '17') return [...setup, 'F_ID=row G_S=0 FC_POLL_S=1', fn('seconds_between'), fn('fc_marked_by_server'),
+    'fc_marked_by_server fixture 1700000000000 1700000000 1700000000 1700000001 0 42 ""'].join('\n')
+  if (name === '21') return [...setup, 'D_ID=row', fn('t21_check_missing_mark'),
+    't21_check_missing_mark fixture 1700000000 0'].join('\n')
+  if (name === '28') {
+    const start = script.lastIndexOf('if ad_release_at_least 0.18.0; then', script.indexOf('tick="$(ad_missing_tick "${ID_B}"'))
+    return [...setup, 'ID_B=row EDIT_MS_P=1700000000000 MARK_P=0 STEP=fixture',
+      script.slice(start, script.indexOf('\n    sleep "${SETTLE_S}"', start)), 'fi'].join('\n')
+  }
+  return [...setup, 'RELABEL_EVENTS_MS=1700000000000 RELABEL_EVENTS_MARK=0 FIND_MISSING_LOOP_PID=99',
+    'declare -A PERSONA_ID=([fixture]=row)', fn('check_relabel_marked'), 'check_relabel_marked fixture'].join('\n')
+}
+
+test.each(['17', '21', '28', 'relabel'].flatMap(name => [42, 43, 99, 98].map(parent => [name, parent] as const)))(
+  'real consumer %s retains its owner rule for sole eligible parent %i beside a proven-finished read', (name, parent) => {
+    const result = probe([call(1000, 42, 'get --instance-id row'), call(10200, parent, 'get --instance-id row')],
+      undefined, [], undefined, false, { check: consumerCheck(name), ends: calls => endOf(calls, 0, 9999) })
+    const passes = name === 'relabel' ? [42, 43, 99].includes(parent) : parent === 42
+    expect(result.status).toBe(passes ? 0 : 1)
+    if (passes) expect(result.stderr).toBe('')
+    else expect(result.stderr).toMatch(/not the bot server|belongs to neither/)
+  })
+
+const shimSource = readFileSync(join(import.meta.dir, 'integration/fixtures/agent-director-shim.sh'), 'utf8')
+const admittedVerbs = ['list', 'status', 'get', 'pause', 'sweep', 'find-missing']
+const skippedVerbs = ['version', 'spawn', 'resume', 'send-keys', 'read-pane', 'hook', 'serve', 'kill', 'get-many', 'delete', 'kill-finished']
+const selectorCases: Array<[string[], string, boolean]> = [
+  ...admittedVerbs.map(verb => [[verb], verb, true] as [string[], string, boolean]),
+  ...skippedVerbs.map(verb => [[verb], verb, false] as [string[], string, boolean]),
+  [['--store-path', '/inert', 'list', '--home=/inert', '--tmux-command', '/inert'], 'list', true],
+  [['--home=/inert', 'status', '--store-path', '/inert'], 'status', true],
+  [['--store-path', 'list', 'version'], 'version', false],
+  [['send-keys', '--text', 'list'], 'send-keys', false],
+  [['--home', '/inert', 'spawn', '--label', 'get'], 'spawn', false],
+  [['version', '--home'], 'version', true],
+  [['--home=', 'version'], 'version', true],
+  [['--create-if-missing', 'true', 'get'], '--create-if-missing', true],
+  [['--unknown', 'list'], '--unknown', true],
+  [['', 'version'], '', true],
+  [[], '', true],
+]
+test.each(selectorCases)('observer selector %j agrees with decoder verb %s (observe %s)', (args, verb, observed) => {
+  const root = mkdtempSync('/tmp/fmk-end-selector-')
+  try {
+    const selector = shimSource.match(/^call_needs_end\(\) \{[\s\S]*?^\}/m)?.[0]
+    expect(selector).toBeDefined()
+    const script = ['set -euo pipefail', selector!, declaration('_scenario_ad_verb'),
+      `_L_WORDS=(${args.map(quote).join(' ')})`, '_scenario_ad_verb',
+      'observed=0; if call_needs_end "${_L_WORDS[@]}"; then observed=1; fi',
+      'printf "%s\\t%s\\n" "$_L_VERB" "$observed"'].join('\n')
+    const result = spawnSync('bash', ['-c', script], {
+      env: hostSafeChildEnv(root, { tools: ['bash'] }), encoding: 'utf8', timeout: 5000,
+    })
+    expect(result.error).toBeUndefined()
+    expect(result.status).toBe(0)
+    expect(result.stderr).toBe('')
+    expect(result.stdout).toBe(`${verb}\t${Number(observed)}\n`)
+    assertNoLeak([result.stdout, result.stderr])
+  } finally { rmSync(root, { recursive: true, force: true }) }
 })
 
 // Run the real EXIT cleanup and its failure registration, including nested

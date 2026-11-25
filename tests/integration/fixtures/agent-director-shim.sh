@@ -30,9 +30,10 @@
 #
 # It reads no environment variable, since the client's version probe runs it
 # with cwd / and a scrubbed environment: it finds the real binary and its log
-# from its own path ($0) alone, calls its one external tool by absolute path,
+# from its own path ($0) alone, calls external tools by absolute path,
 # and runs under `bash -p`, so bash itself skips BASH_ENV, ENV and exported
-# functions.
+# functions. Eligible exec-path calls also fork an asynchronous isolated
+# Python exit observer; the caller never waits for its startup or completion.
 #
 # THE LOG
 # -------
@@ -51,6 +52,7 @@
 #   <kind> TAB <time> TAB <pid> TAB <ppid> TAB <parent> TAB <words>
 #
 #   kind    `call`: one agent-director invocation; written only by this shim.
+#           `fault`: a counted synthetic fault consumed by this shim.
 #           `stop`: stub-claude.sh's line saying it stopped re-firing
 #           SessionStart, and why; written only by stub-claude.sh.
 #           A reader that counts or checks invocations takes only the lines
@@ -69,7 +71,9 @@
 #           it could not be read (the parent had already exited, say).
 #   words   `printf %q`-quoted words joined by single spaces. For `call`:
 #           argv[1] onwards, the field empty when agent-director ran with no
-#           argument. For `stop`: `stub-claude`, then the reason's words.
+#           argument. For `fault`: verb, matcher, action, remaining count
+#           before consumption, and an optional instance:message-id target.
+#           For `stop`: `stub-claude`, then the reason's words.
 #
 # `printf %q` never writes a TAB or a newline (it spells them $'\t' and
 # $'\n'), so no field holds a TAB and every line is one record. A field of
@@ -80,6 +84,91 @@
 # (`/usr/bin/flock -x` on the open log file), so lines that concurrent
 # processes write never interleave.
 # Readers ignore an unterminated last line, which may still be being written.
+#
+# CALL ENDS (separate file; never a new main-log line kind)
+# ---------
+# <log>.ends holds optional asynchronous process-exit upper bounds:
+#   end-v1 TAB <end-upper> TAB <call-end-byte-offset> TAB <pid> TAB <ppid> TAB <call-start>
+# The offset is the byte immediately after the original call's newline in
+# the append-only main log; pid, ppid and call-start must match that call.
+# Times are epoch seconds with six decimals. end-upper is sampled AFTER
+# kernel-confirmed death and rounded upward to microseconds, never backdated.
+# Observers cover list/status/get/pause/sweep/find-missing and uncertain verbs
+# on the final exec path; early synthetic returns can lack ends. Missing,
+# partial, unusable or late ends retain candidates. A killed AD process can
+# have a true end; a killed observer can leave none. Only ad_mark_caller reads
+# this file. Its comparisons assume a continuous shared CLOCK_REALTIME.
+# Each observer adds one temporary child, execs /usr/bin/python3 -I -S,
+# blocks on a pidfd without periodic polling, and appends under the sidecar's
+# own exclusive lock. It opens the sidecar before waiting, closes inherited
+# caller descriptors, and never reopens/recreates the pathname after waiting.
+
+# Match scenario.sh's log decoder: globals can occur anywhere. The fault
+# selector below deliberately keeps its separate existing prefix semantics.
+call_needs_end() {
+    local arg skip=0 verb='' have_verb=0
+    for arg in "$@"; do
+        if (( skip )); then
+            [[ -n "${arg}" ]] || return 0
+            skip=0
+            continue
+        fi
+        case "${arg}" in
+            --store-path|--home|--tmux-command) skip=1; continue ;;
+            --store-path=|--home=|--tmux-command=) return 0 ;;
+            --store-path=*|--home=*|--tmux-command=*) continue ;;
+        esac
+        if (( ! have_verb )); then verb="${arg}"; have_verb=1; fi
+    done
+    (( skip )) && return 0
+    case "${verb}" in
+        list|status|get|pause|sweep|find-missing) return 0 ;;
+        help|version|spawn|resume|send-keys|read-pane|hook|serve|kill|expire|make-template|\
+        get-many|list-subagents|decide|get-permission|record-pane-answer|trail-emit|cursor-host|\
+        delete|kill-finished) return 1 ;;
+        *) return 0 ;; # uncertain syntax supplies no reason to skip observation
+    esac
+}
+
+# Fork only: no registration acknowledgement, interpreter startup or death
+# wait in the calling shell. All observer failures leave completion unknown.
+observe_call_end() {
+    local target="$$" caller="${PPID}"
+    (
+        umask 077
+        exec 3>> "${log}.ends" || exit 0
+        # The caller's pipes and locks must not survive into the interpreter.
+        # FD 3 is this child's newly opened sidecar, not an inherited caller FD.
+        for descriptor in /proc/self/fd/*; do
+            descriptor="${descriptor##*/}"
+            [[ "${descriptor}" =~ ^[0-9]+$ ]] || continue
+            (( descriptor <= 3 )) || exec {descriptor}>&-
+        done
+        exec /usr/bin/python3 -I -S -c '
+import fcntl, os, select, sys, time
+try:
+    target, parent, offset, started = sys.argv[1:]
+    dead = False
+    try:
+        pidfd = os.pidfd_open(int(target), 0)
+    except ProcessLookupError:
+        dead = True
+    else:
+        poller = select.poll()
+        poller.register(pidfd, select.POLLIN)
+        dead = any(events & (select.POLLIN | select.POLLHUP) for _, events in poller.poll())
+        os.close(pidfd)
+    if dead:
+        upper = time.time_ns() // 1000 + 1
+        stamp = f"{upper // 1000000}.{upper % 1000000:06d}"
+        record = "\t".join(("end-v1", stamp, offset, target, parent, started)) + "\n"
+        fcntl.flock(3, fcntl.LOCK_EX)
+        os.write(3, record.encode("ascii"))
+except (OSError, ValueError, AttributeError):
+    pass
+' "${target}" "${caller}" "${call_offset}" "${call_start}"
+    ) < /dev/null > /dev/null 2>&1 &
+}
 
 self="$0"
 [[ "${self}" == /* ]] || self="$(pwd -P)/${self}"
@@ -106,10 +195,22 @@ if mapfile -d '' -t parent_argv 2> /dev/null < "/proc/${PPID}/cmdline" \
     parent="${parent% }"
 fi
 
+call_start="${EPOCHREALTIME/,/.}"
+call_offset=''
 printf -v line 'call\t%s\t%s\t%s\t%s\t%s' \
-    "${EPOCHREALTIME/,/.}" "$$" "${PPID}" "${parent}" "${words}"
+    "${call_start}" "$$" "${PPID}" "${parent}" "${words}"
 
-if ! { /usr/bin/flock -x 9 && printf '%s\n' "${line}" >&9; } 9>> "${log}"; then
+if ! {
+    /usr/bin/flock -x 9 && printf '%s\n' "${line}" >&9 && {
+        # The append descriptor's kernel position, while its lock is held.
+        # Losing optional completion metadata must not change a logged call.
+        { while read -r fd_label fd_value _; do
+            if [[ "${fd_label}" == pos: && "${fd_value}" =~ ^[1-9][0-9]{0,17}$ ]]; then
+                call_offset="${fd_value}"
+            fi
+        done < "/proc/$$/fdinfo/9"; } 2> /dev/null || true
+    }
+} 9>> "${log}"; then
     printf 'agent-director-shim: could not append to %s; agent-director was not run\n' "${log}" >&2
     exit 70
 fi
@@ -255,5 +356,8 @@ esac
 if [[ "${action}" == unknown-typed || "${action}" == unknown-untyped ]]; then
     /usr/bin/cat "${log%/*}/agent-director-unresponsive.json" >&2 || exit 70
     exit 1
+fi
+if call_needs_end "$@" && [[ "${call_offset}" =~ ^[1-9][0-9]{0,17}$ ]]; then
+    observe_call_end 2> /dev/null || true
 fi
 exec -a "$0" "${real}" "$@"

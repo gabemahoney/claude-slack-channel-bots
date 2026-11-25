@@ -2797,8 +2797,9 @@ The agent-director shim (`fixtures/agent-director-shim.sh`):
   (`SCENARIO_AD_SHIM_LOG`; run as agent-director-admin it logs to that same
   file, so one log holds every call of either binary), in one line format of six TAB-separated fields,
   stated in the shim's header and nowhere else. A reader of invocations takes
-  only the lines whose first field is `call`; the format's other kind, `stop`,
-  is reserved for `stub-claude.sh`. Every install, re-shim, swap, hide and
+  only the lines whose first field is `call`; the other kinds are `fault` and
+  `stop` (reserved for `stub-claude.sh`). Optional call ends use the separate
+  `.ends` sidecar. Every install, re-shim, swap, hide and
   restore moves only the shim and the binary, so the log keeps every line;
 - carries a marker line. `check_ad_shim` fails unless the standard path holds
   a regular, executable file (not a symlink) carrying it, with an executable
@@ -3162,10 +3163,13 @@ written; complete malformed lines still fail.
   picked line. Pass as `<by>` the time a read that returned the row missing
   had ended; a call started after it cannot have made the mark.
   A list must admit the tick's prior state and match every label filter against
-  the passive store row. Call ends and historical labels are unavailable: all
-  candidates may overlap, so candidates from different parents fail as
-  ambiguous when any is not CSCB's. List limits and display filters remain an
-  approximation.
+  the passive store row. Only a valid paired sidecar end strictly before the
+  tick's millisecond excludes a call; missing or unusable ends retain it.
+  This assumes a continuous shared wall clock (see the
+  [helper contract](../docs/testing-guide.md#asynchronous-ad-recovery-assertions)).
+  Historical labels are unavailable, and candidates may overlap, so candidates
+  from different parents fail as ambiguous when any is not CSCB's. List limits
+  and display filters remain an approximation.
 
 Call windows (fmk mode; scenario 10; each a harness addition). The marks are `ad_shim_mark`'s (above).
 `cscb_ad_calls_between <from-mark> <to-mark|-> <verb> [<fragment>...]` and

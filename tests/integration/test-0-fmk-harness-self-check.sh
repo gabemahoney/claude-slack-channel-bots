@@ -3721,6 +3721,320 @@ REAL
     echo "recorded: fault effects/concurrency passed; delay_ms=${elapsed}"
 }
 
+# Native process controls belong in this marked container, not the unit suite.
+# The real shim execs an inert interpreter; no AD store or agent is involved.
+leg_ad_call_ends() {
+    python3 -I -S - "${SCENARIO_ROOT}/ad-call-ends" "${SCENARIO_FIXTURES}/agent-director-shim.sh" <<'CALL_ENDS'
+import contextlib, ctypes, json, os, pathlib, re, select, shlex, shutil, signal, subprocess, sys, time
+
+root, fixture = map(pathlib.Path, sys.argv[1:])
+root.mkdir()
+# Adopt and reap only this driver's orphaned observers, including on failure.
+assert ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0, 'subreaper setup failed'
+BOUND = 15
+INPUT = b'input\x00\t\n' + 'caf\u00e9'.encode()
+OUT, ERR = b'out\x00\n' + INPUT, b'err\xff\n'
+TARGET = r'''
+import json, os, pathlib, sys
+ready, release, inherited, status = map(int, sys.argv[1:])
+data = sys.stdin.buffer.read()
+os.write(1, b'out\x00\n' + data)
+os.write(2, b'err\xff\n')
+os.close(inherited)
+info = {'pid': os.getpid(), 'ppid': os.getppid(),
+        'argv0': pathlib.Path('/proc/self/cmdline').read_bytes().split(b'\0')[0].decode()}
+for fd in (0, 1, 2): os.close(fd)
+os.write(ready, json.dumps(info).encode() + b'\n')
+os.close(ready)
+assert os.read(release, 1) == b'x'
+os.close(release)
+os._exit(status)
+'''
+
+def until(check, message):
+    deadline = time.monotonic() + BOUND
+    while time.monotonic() < deadline:
+        result = check()
+        if result: return result
+        time.sleep(.02)
+    raise AssertionError(message)
+
+def eof(fd):
+    data = b''
+    deadline = time.monotonic() + BOUND
+    while True:
+        assert select.select([fd], [], [], max(0, deadline - time.monotonic()))[0], 'inherited pipe withheld EOF'
+        chunk = os.read(fd, 65536)
+        if not chunk: return data
+        data += chunk
+
+def ends(directory):
+    path = directory / 'agent-director-shim.log.ends'
+    if not path.exists(): return []
+    data = path.read_bytes()
+    assert not data or data.endswith(b'\n'), 'torn end append'
+    lines = data.decode('ascii').splitlines()
+    assert all(re.fullmatch(r'end-v1\t[0-9]+\.[0-9]{6}\t[1-9][0-9]*\t[1-9][0-9]*\t[1-9][0-9]*\t[0-9]+\.[0-9]{6}', line) for line in lines), 'end schema/interleaved bytes'
+    return [line.split('\t') for line in lines]
+
+def calls(directory):
+    result, offset = {}, 0
+    for line in (directory / 'agent-director-shim.log').read_bytes().splitlines(keepends=True):
+        offset += len(line)
+        fields = line[:-1].decode().split('\t')
+        assert line.endswith(b'\n') and len(fields) == 6, 'main log lost six-field lines'
+        assert fields[0] in ('call', 'fault', 'stop'), 'main log gained a line kind'
+        if fields[0] == 'call':
+            assert fields[2] not in result, 'test unexpectedly reused a live call PID'
+            result[fields[2]] = [str(offset), fields[2], fields[3], fields[1]]
+    return result
+
+def micros(stamp):
+    sec, frac = stamp.split('.')
+    return int(sec) * 1000000 + int(frac)
+
+def paired(case, lower):
+    rows = until(lambda: [r for r in ends(case.directory) if r[3] == str(case.process.pid)],
+                 'post-death sidecar record missing')
+    assert len(rows) == 1 and rows[0][2:] == calls(case.directory)[str(case.process.pid)], 'wrong offset/PID/PPID/start pairing'
+    assert micros(rows[0][1]) * 1000 >= lower, 'end predates proven death/release'
+    return rows[0]
+
+class Cases:
+    def __init__(self, directory):
+        self.directory, self.running, self.fds = directory, [], []
+        directory.mkdir()
+        self.shim = directory / 'agent-director'
+        shutil.copyfile(fixture, self.shim)
+        self.shim.chmod(0o700)
+        (directory / 'agent-director.real').symlink_to('/usr/bin/python3')
+        (directory / 'input').write_bytes(INPUT)
+        for verb in ('list', 'status', 'get', 'pause', 'sweep', 'find-missing', 'version', 'send-keys'):
+            (directory / verb).write_text(TARGET)
+
+    def pipe(self):
+        pair = os.pipe()
+        self.fds.extend(pair)
+        return pair
+
+    def close(self, fd):
+        os.close(fd)
+        self.fds.remove(fd)
+
+    def launch(self, verb='list', status=0, gate=False):
+        ready_r, ready_w = self.pipe()
+        release_r, release_w = self.pipe()
+        caller_r, caller_w = self.pipe()
+        extra, command = (), [str(self.shim)]
+        if gate:
+            gate_r, gate_w = self.pipe()
+            opened_r, opened_w = self.pipe()
+            # DEBUG stops the *unmodified* sourced shim exactly before its
+            # observer's initial open. No gate is installed in ordinary calls.
+            trap = (f'if [[ $BASHPID != $$ && $BASH_COMMAND == \'exec 3>> "${{log}}.ends"\' ]]; then '
+                    f'printf r >&{opened_w}; read -r -n 1 <&{gate_r}; fi')
+            bootstrap = 'set -T\ntrap ' + shlex.quote(trap) + ' DEBUG\nsource "$1" "${@:2}"'
+            command = ['/bin/bash', '-c', bootstrap, str(self.shim), str(self.shim)]
+            extra = (gate_r, opened_w)
+        command += [verb, str(ready_w), str(release_r), str(caller_w), str(status)]
+        with (self.directory / 'input').open('rb') as source:
+            process = subprocess.Popen(command, cwd=self.directory, stdin=source,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       pass_fds=(ready_w, release_r, caller_w) + extra,
+                                       start_new_session=True,
+                                       env={'PATH': '/usr/bin:/bin', 'HOME': str(self.directory)})
+        self.running.append(process)
+        for fd in (ready_w, release_r, caller_w) + extra: self.close(fd)
+        case = type('Call', (), {})()
+        case.process, case.directory = process, self.directory
+        case.ready, case.release, case.caller = ready_r, release_w, caller_r
+        if gate: case.gate, case.opened = gate_w, opened_r
+        return case
+
+    def ready(self, case):
+        # A gated observer intentionally holds inherited pipes until released.
+        data = b''
+        while not data.endswith(b'\n'):
+            assert select.select([case.ready], [], [], BOUND)[0], 'target did not become ready'
+            chunk = os.read(case.ready, 4096)
+            assert chunk, 'target exited before readiness'
+            data += chunk
+        info = json.loads(data)
+        assert info == {'pid': case.process.pid, 'ppid': os.getpid(), 'argv0': str(self.shim)}, 'exec changed PID/PPID/native argv[0]'
+        assert case.process.poll() is None, 'ready target already died'
+
+    def streams(self, case):
+        assert eof(case.process.stdout.fileno()) == OUT, 'stdin/stdout bytes changed'
+        assert eof(case.process.stderr.fileno()) == ERR, 'stderr bytes changed'
+        assert eof(case.caller) == b'', 'caller pipe was not closed'
+
+    def release(self, case, status):
+        lower = time.time_ns()
+        os.write(case.release, b'x')
+        assert case.process.wait(timeout=BOUND) == status, 'native exit status changed'
+        return lower
+
+    def cleanup(self):
+        for process in self.running:
+            with contextlib.suppress(ProcessLookupError): os.killpg(process.pid, signal.SIGKILL)
+        for process in self.running:
+            process.wait(timeout=BOUND)
+            process.stdout.close()
+            process.stderr.close()
+        for fd in self.fds: os.close(fd)
+        self.fds.clear()
+        def reaped():
+            try:
+                while os.waitpid(-1, os.WNOHANG)[0]: pass
+            except ChildProcessError: return True
+            return False
+        until(reaped, 'inert target/observer survived cleanup')
+
+@contextlib.contextmanager
+def cases(name):
+    group = Cases(root / name)
+    try: yield group
+    finally: group.cleanup()
+
+def observer(case):
+    def find():
+        children = pathlib.Path(f'/proc/{case.process.pid}/task/{case.process.pid}/children').read_text().split()
+        for child in children:
+            try:
+                command = pathlib.Path(f'/proc/{child}/cmdline').read_bytes()
+                descriptors = {int(p.name): os.readlink(p) for p in pathlib.Path(f'/proc/{child}/fd').iterdir()}
+            except FileNotFoundError: continue
+            if b'-I\0-S\0-c\0' in command and 'anon_inode:[pidfd]' in descriptors.values():
+                return int(child), descriptors
+    return until(find, 'live pidfd observer not found')
+
+def stopped(pid):
+    os.kill(pid, signal.SIGSTOP)
+    until(lambda: pathlib.Path(f'/proc/{pid}/stat').read_text().split(') ', 1)[1][0] == 'T', 'observer did not stop')
+
+def zombie(case):
+    result = until(lambda: os.waitid(os.P_PID, case.process.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG), 'target did not terminate')
+    assert result.si_pid == case.process.pid
+    assert pathlib.Path(f'/proc/{case.process.pid}/stat').read_text().split(') ', 1)[1][0] == 'Z', 'target was reaped before zombie control'
+    return time.time_ns()
+
+# These preserved controls must pass even with the old shim. The first red
+# assertion is paired() below, after BOTH exit-status/stream/identity controls.
+with cases('preserved') as group:
+    first = []
+    for status in (0, 23):
+        case = group.launch(status=status)
+        group.ready(case)
+        group.streams(case)
+        assert not [r for r in ends(group.directory) if r[3] == str(case.process.pid)], 'end while target lives'
+        first.append((case, group.release(case, status)))
+    print('CHECK: ad_call_ends preserved zero/nonzero status, exact bytes, PID, PPID and native argv[0]', flush=True)
+    for case, lower in first: paired(case, lower)
+
+with cases('lifetime') as group:
+    for killed in (False, True):
+        case = group.launch('status', 23)
+        group.ready(case)
+        pid, descriptors = observer(case)
+        assert descriptors[3] == str(group.directory / 'agent-director-shim.log.ends'), 'observer lost its own sidecar'
+        assert all(value == '/dev/null' for fd, value in descriptors.items() if fd <= 2), 'observer retained standard streams'
+        assert all(value in ('/dev/null', 'anon_inode:[pidfd]', descriptors[3]) for value in descriptors.values()), 'observer retained a caller/main-log descriptor'
+        group.streams(case)  # EOF while BOTH the target and its observer live.
+        stopped(pid)
+        assert not [r for r in ends(group.directory) if r[3] == str(case.process.pid)], 'end while synchronized target lives'
+        if killed: os.kill(case.process.pid, signal.SIGKILL)
+        else: os.write(case.release, b'x')
+        proof = zombie(case)  # pidfd must wake without the caller reaping.
+        os.kill(pid, signal.SIGCONT)
+        paired(case, proof)
+        assert case.process.wait(timeout=BOUND) == (-signal.SIGKILL if killed else 23), 'signal/exit status changed'
+    # A stopped observer cannot hold up its caller's wait. Losing the
+    # observer gives no completion evidence, even when the target dies.
+    case = group.launch('get')
+    group.ready(case)
+    pid, _ = observer(case)
+    stopped(pid)
+    group.release(case, 0)
+    assert not [r for r in ends(group.directory) if r[3] == str(case.process.pid)], 'stopped observer published an end'
+    os.kill(pid, signal.SIGKILL)
+    case = group.launch('pause')
+    group.ready(case)
+    pid, _ = observer(case)
+    stopped(pid)
+    os.killpg(case.process.pid, signal.SIGKILL)
+    assert case.process.wait(timeout=BOUND) == -signal.SIGKILL, 'group kill changed target status'
+    assert not [r for r in ends(group.directory) if r[3] == str(case.process.pid)], 'killed observer invented an end'
+
+with cases('concurrent') as group:
+    live = [group.launch(verb) for verb in ('list', 'status', 'get', 'pause', 'sweep', 'find-missing')]
+    for case in live:
+        group.ready(case)
+        observer(case)
+    assert not ends(group.directory), 'concurrent end while targets live'
+    lower = time.time_ns()
+    for case in reversed(live): os.write(case.release, b'x')
+    for case in live:
+        assert case.process.wait(timeout=BOUND) == 0
+        group.streams(case)
+        paired(case, lower)
+    assert len(ends(group.directory)) == len(calls(group.directory)) == len(live), 'concurrent end/call counts changed'
+    # The existing counted fault still writes only a call and a fault.
+    (group.directory / 'agent-director-shim.faults').write_text('send-keys * swallow 1\n')
+    result = subprocess.run([str(group.shim), 'send-keys'], cwd=group.directory,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=BOUND,
+                            env={'PATH': '/usr/bin:/bin', 'HOME': str(group.directory)})
+    assert result.returncode == 0 and result.stdout == b'{}\n' and result.stderr == b'', 'fault contract changed'
+    assert len(calls(group.directory)) == len(live) + 1 and len(ends(group.directory)) == len(live)
+    assert (group.directory / 'agent-director-shim.log').read_bytes().count(b'fault\t') == 1
+
+with cases('unlink') as group:
+    case = group.launch()
+    group.ready(case)
+    pid, _ = observer(case)
+    sidecar = group.directory / 'agent-director-shim.log.ends'
+    sidecar.unlink()
+    group.release(case, 0)
+    until(lambda: not pathlib.Path(f'/proc/{pid}').exists() or pathlib.Path(f'/proc/{pid}/stat').read_text().split(') ', 1)[1][0] == 'Z', 'unlinked observer did not finish')
+    assert not sidecar.exists(), 'observer recreated unlinked sidecar'
+
+with cases('removed-before-open') as group:
+    case = group.launch(gate=True)
+    group.ready(case)
+    assert select.select([case.opened], [], [], BOUND)[0] and os.read(case.opened, 1) == b'r', 'initial-open gate did not stop observer'
+    shutil.rmtree(group.directory)
+    os.write(case.gate, b'x')
+    group.release(case, 0)
+    group.streams(case)
+    # cleanup below waits for the observer, so a late mkdir/open cannot hide.
+assert not (root / 'removed-before-open').exists(), 'late observer recreated removed root'
+
+with cases('not-admitted') as group:
+    for verb in ('version', 'send-keys'):
+        case = group.launch(verb)
+        group.ready(case)
+        group.streams(case)
+        children = pathlib.Path(f'/proc/{case.process.pid}/task/{case.process.pid}/children').read_text()
+        assert not children.strip() and not ends(group.directory), 'non-admitted verb launched observer'
+        group.release(case, 0)
+    assert not (group.directory / 'agent-director-shim.log.ends').exists(), 'non-admitted verb created sidecar'
+
+# Exercise the same cleanup on an intentional assertion failure with a live,
+# stopped observer. The failure must propagate and every child must be reaped.
+try:
+    with cases('failure-cleanup') as group:
+        case = group.launch()
+        group.ready(case)
+        pid, _ = observer(case)
+        stopped(pid)
+        raise AssertionError('intentional cleanup control')
+except AssertionError as error:
+    assert str(error) == 'intentional cleanup control'
+assert not pathlib.Path('/proc/self/task/' + str(os.getpid()) + '/children').read_text().strip(), 'cleanup left child processes'
+coreutils = subprocess.check_output(['/usr/bin/tail', '--version'], text=True).splitlines()[0]
+print('recorded: ad_call_ends bytes/status/identity, live/dead/zombie/SIGKILL, concurrent pairing, fd/EOF, unlink/no-recreation, no-wait/selector and success/failure cleanup passed; python=' + sys.version.split()[0] + '; kernel=' + os.uname().release + '; ' + coreutils)
+CALL_ENDS
+}
+
 leg_real_receipt_controls() {
     bun "${SCENARIO_FIXTURES}/real-case-assertions.ts" selfcheck "${SCENARIO_ROOT}"
 }
@@ -3802,6 +4116,7 @@ CHECK_USAGE
 
 LEGS=(
     real_fault_contract
+    ad_call_ends
     real_receipt_controls
     real_idle_diagnostic_controls
     real_usage_controls

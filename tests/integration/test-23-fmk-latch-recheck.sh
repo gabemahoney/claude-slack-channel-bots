@@ -2072,11 +2072,10 @@ p2_clearing_schedule() {
         pn_end_reference="$(ad_shim_mark)"
         # R4's sequential probe follows its answered status; the completed
         # round line above proves that status finished before end_session.
-        # Skip only that validated call; every unproven call stays eligible.
-        # Many selecting CSCB poller lists fall in the wide window, so
-        # before=0 sole-status runs fail conservatively in practice. HEAD has
-        # the same exposure; list-first (before=1) passes still hold.
-        # Owed follow-up: shim call-end records to identify in-flight calls.
+        # Keep that independent proof: ad_mark_caller drops other calls only
+        # when a paired sidecar end upper bound is strictly before the tick
+        # millisecond. Missing, late or same-ms ends stay conservative and
+        # can still defeat a sole-status proof. Keep the wide pre-wait mark.
         PN_R4_STATUS="$(pn_attribution_start "${pn_end_reference}")" || exit 1
         PN_CLEAR_MS="$(date +%s%3N)"
     fi
@@ -2345,8 +2344,9 @@ state_writes_of() {
 # clearing round's `status` reads it `missing`:
 #   - the first missing tick after the session's end is an active read's
 #     (`ad_recovery`); every call that could have made it (`ad_mark_caller`,
-#     in the wide pre-wait window) is a CSCB `list`, `status` or `get`, except
-#     the one validated R4 status proven finished before end and skipped;
+#     in the wide pre-wait window, excluding only proven pre-tick ends) is a
+#     CSCB `list`, `status` or `get`, except the one validated R4 status
+#     independently proven finished before end_session and skipped;
 #   - the mark was written before the status began (the tick's millisecond
 #     ends by the status's start, and every candidate comes before it in the
 #     shim log), or the status is the only candidate; and no other write of
