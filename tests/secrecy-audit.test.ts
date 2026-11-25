@@ -113,6 +113,113 @@ import { ackVerdict, storeVerdict, postHoldVerdict, n2Verdict, lookupFaultVerdic
 import { percentile } from './integration/fixtures/transcript-receipts.ts'
 import { balancedAfter, callArguments, callsOf, splitTopLevel, stripComments } from './test-helpers/source-audit.ts'
 
+const LATEST_CHECK_LIBRARY = 'scripts/lib/ad-latest.ts'
+const LATEST_CHECK_FILES = [LATEST_CHECK_LIBRARY, 'scripts/ci-run.ts', 'scripts/ad-latest-check.ts']
+
+/** Inspect constructions, not comments or diagnostic strings. No caller owns a header boundary. */
+function latestCheckBoundaries(file: string, source: string) {
+  const sf = ts.createSourceFile(file, stripComments(source), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+  const violations: string[] = [], headers: ts.Node[] = []
+  const parseErrors = (sf as ts.SourceFile & { parseDiagnostics: readonly ts.Diagnostic[] }).parseDiagnostics
+  if (parseErrors.length) violations.push(`${file}: unparseable source`)
+  const name = (node: ts.Node | undefined): string | undefined => !node ? undefined
+    : ts.isIdentifier(node) || ts.isStringLiteralLike(node) ? node.text
+    : ts.isComputedPropertyName(node) ? name(node.expression) : undefined
+  const member = (node: ts.Node): string | undefined => ts.isPropertyAccessExpression(node) ? node.name.text
+    : ts.isElementAccessExpression(node) ? name(node.argumentExpression) : undefined
+  const auth = (value: string | undefined) => value?.toLowerCase() === 'authorization'
+  const envOwners = new Set(['process', 'Bun', 'globalThis.process', 'globalThis.Bun', 'import.meta'])
+  let transport: ts.Node | undefined
+  for (const statement of sf.statements) {
+    if (ts.isVariableStatement(statement) && statement.modifiers?.some(m => m.kind === ts.SyntaxKind.ExportKeyword)) {
+      for (const declaration of statement.declarationList.declarations) {
+        if (name(declaration.name) === 'fetchReleasedAd' && declaration.initializer && ts.isArrowFunction(declaration.initializer)) transport = declaration.initializer.body
+      }
+    }
+    if (file === LATEST_CHECK_LIBRARY && ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier)
+      && /^(?:node:)?(?:process|bun)$/.test(statement.moduleSpecifier.text) && !statement.importClause?.isTypeOnly) {
+      const clause = statement.importClause, bindings = clause?.namedBindings
+      if (clause?.name) envOwners.add(clause.name.text)
+      if (bindings && ts.isNamespaceImport(bindings)) envOwners.add(bindings.name.text)
+      if (bindings && ts.isNamedImports(bindings) && bindings.elements.some(e => !e.isTypeOnly && (e.propertyName ?? e.name).text === 'env')) {
+        violations.push(`${file}: environment access`)
+      }
+    }
+  }
+  function visit(node: ts.Node) {
+    const assignment = ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && node.operatorToken.kind <= ts.SyntaxKind.LastAssignment
+    const construction = (ts.isPropertyAssignment(node) || ts.isShorthandPropertyAssignment(node)) && auth(name(node.name))
+      || assignment && auth(member(node.left))
+      || ts.isCallExpression(node) && ['set', 'append', 'defineProperty'].includes(member(node.expression) ?? '')
+        && auth(name(node.arguments[member(node.expression) === 'defineProperty' ? 1 : 0]))
+      || ts.isArrayLiteralExpression(node) && node.elements.length === 2 && auth(name(node.elements[0]))
+    if (construction) {
+      headers.push(node)
+      if (file !== LATEST_CHECK_LIBRARY || !transport || node.pos < transport.pos || node.end > transport.end) {
+        violations.push(`${file}: Authorization outside fetchReleasedAd`)
+      }
+    }
+    if (file === LATEST_CHECK_LIBRARY) {
+      if ((ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) && member(node) === 'env' && envOwners.has(node.expression.getText(sf))) {
+        violations.push(`${file}: environment access`)
+      }
+      if (ts.isVariableDeclaration(node) && node.initializer && envOwners.has(node.initializer.getText(sf))) {
+        if (ts.isIdentifier(node.name)) envOwners.add(node.name.text)
+        if (ts.isObjectBindingPattern(node.name) && node.name.elements.some(e => name(e.propertyName ?? e.name) === 'env')) violations.push(`${file}: environment access`)
+      }
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(sf)
+  return { violations, headerCount: headers.length }
+}
+
+describe('Latest-Version Check credential boundaries (SR-8.5)', () => {
+  test.each(LATEST_CHECK_FILES)('%s keeps Authorization in the transport and environment out of the library', file => {
+    const audited = latestCheckBoundaries(file, codeOf(file))
+    expect(audited).toEqual({ violations: [], headerCount: file === LATEST_CHECK_LIBRARY ? 1 : 0 })
+    assertNoLeak(audited)
+  })
+
+  test.each([
+    'headers.Authorization = credential;',
+    'headers["authorization"] = credential;',
+    'const headers = { Authorization: credential };',
+    'const headers = { ["Authorization"]: credential };',
+    'headers.set("Authorization", credential);',
+    'headers.append("authorization", credential);',
+    'Object.defineProperty(headers, "Authorization", {value: credential});',
+    'const headers = new Headers([["Authorization", credential]]);',
+  ])('rejects planted header construction %# in each actual source', planted => {
+    for (const file of LATEST_CHECK_FILES) {
+      expect(latestCheckBoundaries(file, `${codeOf(file)}\n${planted}`).violations).toContain(`${file}: Authorization outside fetchReleasedAd`)
+    }
+  })
+
+  test.each([
+    'const token = process.env.GH_TOKEN;', 'const token = process["env"]["GH_TOKEN"];',
+    'const token = Bun.env.GH_TOKEN;', 'const token = import.meta.env.GH_TOKEN;',
+    'const {env: environment} = process;', 'const runtime = process; const token = runtime.env.GH_TOKEN;',
+    'const token = globalThis.process.env.GH_TOKEN;',
+    'import {env as environment} from "node:process";',
+    'import runtime from "node:process"; const token = runtime.env.GH_TOKEN;',
+  ])('rejects planted library environment read %#', planted => {
+    expect(latestCheckBoundaries(LATEST_CHECK_LIBRARY, `${codeOf(LATEST_CHECK_LIBRARY)}\n${planted}`).violations)
+      .toContain(`${LATEST_CHECK_LIBRARY}: environment access`)
+  })
+
+  test('comments and strings neither construct a header nor authorize a caller to do so', () => {
+    const harmless = '// headers.Authorization = process.env.GH_TOKEN;\n/* Bun.env.GH_TOKEN */\nconst prose = "Authorization = process.env";'
+    expect(latestCheckBoundaries(LATEST_CHECK_LIBRARY, harmless)).toEqual({ violations: [], headerCount: 0 })
+    const transport = 'export const fetchReleasedAd = async () => { const headers = {Authorization: credential}; };'
+    expect(latestCheckBoundaries(LATEST_CHECK_LIBRARY, `${harmless}\n${transport}`)).toEqual({ violations: [], headerCount: 1 })
+    expect(latestCheckBoundaries(LATEST_CHECK_FILES[1]!, transport).violations).toContain(`${LATEST_CHECK_FILES[1]}: Authorization outside fetchReleasedAd`)
+    expect(latestCheckBoundaries(LATEST_CHECK_LIBRARY, '/* export const fetchReleasedAd = async () => { */ headers.Authorization = credential; /* }; */').violations)
+      .toContain(`${LATEST_CHECK_LIBRARY}: Authorization outside fetchReleasedAd`)
+    expect(latestCheckBoundaries(LATEST_CHECK_LIBRARY, `${transport}\nconst broken = (`).violations).toContain(`${LATEST_CHECK_LIBRARY}: unparseable source`)
+  })
+})
+
 /** b.c13: process starts use the shared filter; entries scrub before dispatch.
  * Follow the two CLI adapters as well as direct starts. Adapter parameters are
  * accepted only at their named boundary; every deps call is audited separately.

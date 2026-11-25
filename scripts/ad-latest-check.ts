@@ -1,11 +1,16 @@
 import { readFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
-import { parseAdPins, checkLatestAd, compareBaseAdRecord, formatAdCheckError, type AdFetch, type AdLatestClock, type AdCheckError, type AdBaseRecordRead } from './lib/ad-latest.ts'
+import { parseAdPins, checkLatestAd, compareBaseAdRecord, formatAdCheckError, adCredentialFailureReason, type AdCredentialProvider, type AdFetch, type AdLatestClock, type AdCheckError, type AdBaseRecordRead } from './lib/ad-latest.ts'
+import { lookUpBaseBuildToken, type SpawnFn, type ChildEnvironmentSource } from './ci-run.ts'
 export type { AdBaseRecordRead } from './lib/ad-latest.ts'
 export interface AdLatestCliDeps {
   readonly worktreeRoot: string
   readonly fetchAd: AdFetch
   readonly clock: AdLatestClock
+  /** Tests may supply a provider directly or exercise the host lookup with spawn/env. */
+  readonly getGitHubCredential?: AdCredentialProvider
+  readonly spawn?: SpawnFn
+  readonly env?: ChildEnvironmentSource
   readText(path: string): string
   readBaseRecord(image: string): Promise<AdBaseRecordRead>
   writeStdout(text: string): void
@@ -14,7 +19,8 @@ export interface AdLatestCliDeps {
 export const AD_LATEST_CHECK_EXIT = 16
 export const AD_LATEST_CHECK_SR = 'SR-2.8 (latest agent-director)'
 export function adLatestFailureLine(error: AdCheckError): string {
-  return `${AD_LATEST_CHECK_SR}: ${formatAdCheckError(error)}; update and commit pins or restore lookup access, rebuild the base when appropriate, and rerun the entire /ci/prepare path`
+  const recovery = adCredentialFailureReason(error.code) ?? 'update and commit pins or restore lookup access, rebuild the base when appropriate, and rerun the entire /ci/prepare path'
+  return `${AD_LATEST_CHECK_SR}: ${formatAdCheckError(error)}; ${recovery}`
 }
 export async function runAdLatestCheck(deps: AdLatestCliDeps): Promise<0 | 16> {
   const fail = (error: AdCheckError): 16 => { deps.writeStderr(adLatestFailureLine(error) + '\n'); return AD_LATEST_CHECK_EXIT }
@@ -23,7 +29,11 @@ export async function runAdLatestCheck(deps: AdLatestCliDeps): Promise<0 | 16> {
   catch { return fail({ code: 'PINS_UNREADABLE', source: 'pins' }) }
   const pins = parseAdPins(sources)
   if (!pins.ok) return fail(pins.error)
-  const latest = await checkLatestAd(pins.value, deps)
+  const { spawn, env } = deps
+  const getGitHubCredential = deps.getGitHubCredential ?? (spawn && env
+    ? (remainingMs: number) => lookUpBaseBuildToken(spawn, env, deps.worktreeRoot, { timeoutMs: remainingMs, clock: deps.clock })
+    : undefined)
+  const latest = await checkLatestAd(pins.value, { fetchAd: deps.fetchAd, clock: deps.clock, getGitHubCredential })
   if (!latest.ok) return fail(latest.error)
   try {
     const image = /^FROM\s+(cscb-ci-base:v[0-9]+)\s*$/m.exec(deps.readText(join(deps.worktreeRoot, 'docker/Dockerfile.test')))?.[1]

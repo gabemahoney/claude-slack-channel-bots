@@ -12,19 +12,25 @@ export type AdCheckCode = 'PINS_UNREADABLE' | 'PINS_INVALID' | 'PACKAGE_PIN_MISM
   | 'RUNTIME_NOT_LATEST' | 'CLIENT_NOT_LATEST' | 'COMMIT_MISMATCH' | 'RELEASE_DIGEST_MISMATCH'
   | 'INSTALLER_DIGEST_MISMATCH' | 'CLIENT_INTEGRITY_MISMATCH' | 'CLIENT_DIGEST_MISMATCH'
   | 'BASE_RECORD_READ_FAILED' | 'BASE_RECORD_INVALID' | 'BASE_RECORD_MISMATCH'
+  | 'GITHUB_CREDENTIAL_MISSING' | 'GITHUB_CREDENTIAL_INVALID' | 'GITHUB_CREDENTIAL_REJECTED'
 export type AdCheckSource = 'pins' | 'github-release' | 'github-tag' | 'installer' | 'npm-metadata' | 'npm-tarball' | 'base'
 export interface AdCheckError {
   readonly code: AdCheckCode; readonly source: AdCheckSource; readonly field?: string
   readonly expected?: string; readonly actual?: string; readonly status?: number
+  readonly access?: 'signed-in'
 }
 export type AdCheckResult<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: AdCheckError }
 export interface AdLatestClock {
   now(): number; setTimeout(callback: () => void, delayMs: number): unknown; clearTimeout(handle: unknown): void
 }
-export interface AdHttpOptions { readonly signal: AbortSignal; readonly maxBytes: number }
+export interface AdHttpOptions { readonly signal: AbortSignal; readonly maxBytes: number; readonly githubCredential?: string }
 export interface AdHttpResponse { readonly status: number; readonly body: Uint8Array }
 export type AdFetch = (url: string, options: AdHttpOptions) => Promise<AdHttpResponse>
-export interface AdLatestDeps { readonly fetchAd: AdFetch; readonly clock: AdLatestClock }
+export type AdCredentialProvider = (remainingMs: number) => Promise<string | null>
+export interface AdLatestDeps {
+  readonly fetchAd: AdFetch; readonly clock: AdLatestClock
+  readonly getGitHubCredential?: AdCredentialProvider
+}
 export interface LatestAdEvidence {
   readonly runtimeVersion: string; readonly runtimeCommit: string; readonly clientVersion: string
   readonly binarySha256: string; readonly adminSha256: string; readonly installerSha256: string
@@ -43,6 +49,8 @@ export const AD_METADATA_MAX_BYTES = 1_048_576
 export const AD_INSTALLER_MAX_BYTES = 1_048_576
 export const AD_CLIENT_MAX_BYTES = 8_388_608
 export const AD_BASE_RECORD_MAX_BYTES = 16_384
+/** Shared with the CI runner's credential validation and output scans. */
+export const SECRET_MIN_LENGTH = 8
 const API = 'https://api.github.com/repos/gabemahoney/agent-director'
 export const AD_GITHUB_LATEST_URL = `${API}/releases/latest`
 export const AD_NPM_LATEST_URL = 'https://registry.npmjs.org/agent-director/latest'
@@ -83,20 +91,44 @@ export function parseAdPins(sources: AdPinSources): AdCheckResult<AdPins> {
 }
 
 /** One deadline also bounds transports which ignore AbortSignal. */
-async function request(url: string, source: AdCheckSource, maxBytes: number, deadline: number, deps: AdLatestDeps): Promise<AdCheckResult<Uint8Array>> {
+async function request(url: string, source: AdCheckSource, maxBytes: number, deadline: number, deps: AdLatestDeps, githubCredential?: string): Promise<AdCheckResult<Uint8Array>> {
   const controller = new AbortController()
-  const wait = Math.min(AD_HTTP_TIMEOUT_MS, deadline - deps.clock.now())
+  const requestDeadline = Math.min(deps.clock.now() + AD_HTTP_TIMEOUT_MS, deadline)
+  const wait = requestDeadline - deps.clock.now()
   if (wait <= 0) return fail('HTTP_TIMEOUT', source)
   let timer: unknown
   const timeout = new Promise<AdCheckResult<Uint8Array>>(resolve => {
     timer = deps.clock.setTimeout(() => { controller.abort(); resolve(fail('HTTP_TIMEOUT', source)) }, wait)
   })
-  const work = Promise.resolve().then(() => deps.fetchAd(url, { signal: controller.signal, maxBytes })).then((r): AdCheckResult<Uint8Array> => {
-    if (r.status < 200 || r.status >= 300) return { ok: false, error: { code: 'HTTP_STATUS', source, status: r.status } }
+  const work = Promise.resolve().then(() => {
+    if (controller.signal.aborted || deps.clock.now() >= requestDeadline) return undefined
+    return deps.fetchAd(url, { signal: controller.signal, maxBytes, ...(githubCredential === undefined ? {} : { githubCredential }) })
+  }).then((r): AdCheckResult<Uint8Array> => {
+    if (!r || controller.signal.aborted || deps.clock.now() >= requestDeadline) return fail('HTTP_TIMEOUT', source)
+    if (r.status < 200 || r.status >= 300) return { ok: false, error: {
+      code: githubCredential !== undefined && r.status === 401 ? 'GITHUB_CREDENTIAL_REJECTED' : 'HTTP_STATUS', source, status: r.status,
+    } }
     if (r.body.byteLength > maxBytes) return fail('HTTP_BODY_TOO_LARGE', source)
     return { ok: true, value: r.body }
-  }, () => fail<Uint8Array>('HTTP_FAILED', source))
+  }, () => fail<Uint8Array>(controller.signal.aborted || deps.clock.now() >= requestDeadline ? 'HTTP_TIMEOUT' : 'HTTP_FAILED', source))
   try { return await Promise.race([work, timeout]) } finally { deps.clock.clearTimeout(timer) }
+}
+
+/** Late or failed lookup results never escape the check's original deadline. */
+async function lookupCredential(deadline: number, deps: AdLatestDeps): Promise<string | null> {
+  const remainingMs = deadline - deps.clock.now()
+  if (remainingMs <= 0 || !deps.getGitHubCredential) return null
+  let timer: unknown
+  const timeout = new Promise<null>(resolve => { timer = deps.clock.setTimeout(() => resolve(null), remainingMs) })
+  const work = Promise.resolve().then(() => {
+    const remaining = deadline - deps.clock.now()
+    return remaining > 0 ? deps.getGitHubCredential!(remaining) : null
+  }).then(value => deps.clock.now() < deadline ? value : null, () => null)
+  try { return await Promise.race([work, timeout]) } finally { deps.clock.clearTimeout(timer) }
+}
+
+function usableCredential(value: unknown): value is string {
+  return typeof value === 'string' && value.length >= SECRET_MIN_LENGTH && !/[^\x21-\x7e]/.test(value)
 }
 
 function json(bytes: Uint8Array): Record<string, any> | undefined {
@@ -106,9 +138,21 @@ class CheckFailure { constructor(readonly error: AdCheckError) {} }
 
 export async function checkLatestAd(pins: AdPins, deps: AdLatestDeps): Promise<AdCheckResult<LatestAdEvidence>> {
   const deadline = deps.clock.now() + AD_LATEST_DEADLINE_MS
+  let githubCredential: string | undefined
   const refuse = (code: AdCheckCode, source: AdCheckSource, field?: string): never => { throw new CheckFailure({ code, source, ...(field ? { field } : {}) }) }
   const bytes = async (url: string, source: AdCheckSource, max = AD_METADATA_MAX_BYTES): Promise<Uint8Array> => {
-    const result = await request(url, source, max, deadline, deps)
+    const github = source === 'github-release' || source === 'github-tag' || source === 'installer'
+    let result = await request(url, source, max, deadline, deps, github ? githubCredential : undefined)
+    if (github && githubCredential === undefined && !result.ok && result.error.code === 'HTTP_STATUS' &&
+      (result.error.status === 403 || result.error.status === 429)) {
+      const credential = await lookupCredential(deadline, deps)
+      if (credential === null || credential === undefined || credential === '' || deps.clock.now() >= deadline) throw new CheckFailure({
+        code: 'GITHUB_CREDENTIAL_MISSING', source, status: result.error.status,
+      })
+      if (!usableCredential(credential)) throw new CheckFailure({ code: 'GITHUB_CREDENTIAL_INVALID', source, status: result.error.status })
+      githubCredential = credential
+      result = await request(url, source, max, deadline, deps, githubCredential)
+    }
     if (!result.ok) throw new CheckFailure(result.error)
     return result.value
   }
@@ -151,7 +195,10 @@ export async function checkLatestAd(pins: AdPins, deps: AdLatestDeps): Promise<A
     return { ok: true, value: { runtimeVersion: pins.version, runtimeCommit: pins.commit, clientVersion: pins.clientVersion,
       binarySha256: pins.binarySha256, adminSha256: pins.adminSha256, installerSha256: pins.installerSha256,
       clientTarballSha256: pins.clientTarballSha256, clientIntegrity: pins.clientIntegrity } }
-  } catch (error) { return { ok: false, error: error instanceof CheckFailure ? error.error : { code: 'METADATA_INVALID', source: 'github-release' } } }
+  } catch (error) { return { ok: false, error: {
+    ...(error instanceof CheckFailure ? error.error : { code: 'METADATA_INVALID' as const, source: 'github-release' as const }),
+    ...(githubCredential === undefined ? {} : { access: 'signed-in' as const }),
+  } } }
 }
 
 export function compareBaseAdRecord(pins: AdPins, bytes: Uint8Array): AdCheckResult<AdBaseReleaseRecord> {
@@ -176,6 +223,7 @@ export function formatAdCheckError(error: AdCheckError): string {
   const parts: string[] = [error.code, error.source]
   if (error.field && /^[A-Za-z0-9_]+$/.test(error.field)) parts.push(error.field)
   if (error.status !== undefined && Number.isInteger(error.status)) parts.push(`HTTP ${error.status}`)
+  if (error.access === 'signed-in') parts.push('signed-in')
   for (const field of ['expected', 'actual'] as const) {
     const v = error[field]
     if (v && (VERSION.test(v) || COMMIT.test(v) || SHA256.test(v) || INTEGRITY.test(v))) parts.push(`${field}=${v}`)
@@ -183,11 +231,30 @@ export function formatAdCheckError(error: AdCheckError): string {
   return parts.join(': ')
 }
 
-/** The public, bounded HTTP binding. No auth or environment lookup. */
+export const AD_GITHUB_CREDENTIAL_MISSING_REASON = 'the latest agent-director release could not be confirmed: GitHub refused anonymous access and no gh sign-in was found; sign gh in to GitHub as described in docker/README.md and check gh auth status, or retry after the anonymous allowance resets'
+export const AD_GITHUB_CREDENTIAL_INVALID_REASON = 'the latest agent-director release could not be confirmed: the gh sign-in gave an unusable credential; sign gh in to GitHub again'
+export const AD_GITHUB_CREDENTIAL_REJECTED_REASON = 'the latest agent-director release could not be confirmed: GitHub refused the gh sign-in; sign gh in to GitHub again and check gh auth status'
+
+/** Shared cause and recovery text; no external values enter these instructions. */
+export function adCredentialFailureReason(code: AdCheckCode): string | undefined {
+  switch (code) {
+    case 'GITHUB_CREDENTIAL_MISSING': return AD_GITHUB_CREDENTIAL_MISSING_REASON
+    case 'GITHUB_CREDENTIAL_INVALID': return AD_GITHUB_CREDENTIAL_INVALID_REASON
+    case 'GITHUB_CREDENTIAL_REJECTED': return AD_GITHUB_CREDENTIAL_REJECTED_REASON
+    default: return undefined
+  }
+}
+
+/** Bounded HTTP binding; only GitHub receives an injected credential. No environment lookup. */
 export const fetchReleasedAd: AdFetch = async (url, options) => {
   const target = new URL(url)
   if (target.username || target.password || !['https://api.github.com', 'https://raw.githubusercontent.com', 'https://registry.npmjs.org'].includes(target.origin)) throw new Error('Unsupported release origin')
-  const response = await fetch(url, { signal: options.signal, redirect: 'error', headers: { Accept: 'application/json', 'User-Agent': 'cscb-ad-release-check' } })
+  const headers: Record<string, string> = { Accept: 'application/json', 'User-Agent': 'cscb-ad-release-check', 'Cache-Control': 'no-cache' }
+  if (options.githubCredential !== undefined) {
+    if (!['https://api.github.com', 'https://raw.githubusercontent.com'].includes(target.origin) || !usableCredential(options.githubCredential)) throw new Error('Unsupported release credential')
+    headers.Authorization = `token ${options.githubCredential}`
+  }
+  const response = await fetch(url, { signal: options.signal, redirect: 'error', headers })
   const reader = response.body?.getReader(), chunks: Uint8Array[] = []
   let size = 0
   if (reader) try {

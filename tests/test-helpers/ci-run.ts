@@ -323,6 +323,8 @@ export interface RecordedSpawn {
   readonly env: Readonly<Record<string, string>>
   readonly cwd: string
   readonly ownProcessGroup: boolean
+  /** The requested process timeout; absent for an unbounded spawn. */
+  readonly timeoutMs?: number
   /** The text written to its standard input; null when none. */
   readonly stdin: string | null
   /** The fake-clock time of its spawn. */
@@ -498,6 +500,7 @@ export function createSpawnRecorder(options: SpawnRecorderOptions): SpawnRecorde
       env: Object.freeze({ ...request.env }),
       cwd: request.cwd,
       ownProcessGroup: request.ownProcessGroup,
+      timeoutMs: request.timeoutMs,
       stdin: request.stdin ?? null,
       atMs,
       pid,
@@ -1531,11 +1534,12 @@ function matchBuildForm(request: SpawnRequest, rest: readonly string[], heads: D
   if (!request.ownProcessGroup) return null
   if (rest[0] === heads.fileFlag && rest.length >= 2) {
     const dockerfilePath = rest[1]!
-    const { labels, next } = labelPairs(rest, 2, heads.labelFlag)
+    const adCandidateDist = rest[2] === '--build-context' && rest[3]?.startsWith('ad-candidate=') ? rest[3].slice('ad-candidate='.length) : undefined
+    const { labels, next } = labelPairs(rest, adCandidateDist === undefined ? 2 : 4, heads.labelFlag)
     if (rest[next] !== heads.tagFlag || next + 3 !== rest.length) return null
     const tag = rest[next + 1]!
     const contextDir = rest[next + 2]!
-    if (!exactly(() => testImageBuildArgs({ dockerfilePath, contextDir, labels, tag }))) return null
+    if (!exactly(() => testImageBuildArgs({ dockerfilePath, contextDir, labels, tag, adCandidateDist }))) return null
     return { kind: 'image-build', tag, labels, dockerfilePath, contextDir, from: null }
   }
   const { labels, next } = labelPairs(rest, 0, heads.labelFlag)

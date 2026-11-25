@@ -194,6 +194,7 @@ import {
   type SpawnFn,
 } from '../scripts/ci-run.ts'
 import { assertNoLeak, fakeToken } from './test-helpers/credentials.ts'
+import { AD_LATEST_DEADLINE_MS, SECRET_MIN_LENGTH as AD_SECRET_MIN_LENGTH } from '../scripts/lib/ad-latest.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import {
   buildTarArchive,
@@ -832,10 +833,12 @@ function scriptLookups(recorder: SpawnRecorder, first: SpawnAnswer, second?: Spa
 describe('child process environments, the secret set and the token lookup', () => {
   let root: string
   let recorder: SpawnRecorder
+  let lookupClock: ReturnType<typeof createFakeClock>
 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), 'ci-run-interface-'))
-    recorder = createSpawnRecorder({ clock: createFakeClock() })
+    lookupClock = createFakeClock()
+    recorder = createSpawnRecorder({ clock: lookupClock })
   })
 
   afterEach(() => {
@@ -935,6 +938,7 @@ describe('child process environments, the secret set and the token lookup', () =
     const token = await lookUpBaseBuildToken(recorder.spawn, env, root)
 
     expect(token).toBe(c.baseBuildToken)
+    expect(recorder.spawns().map(spawn => spawn.timeoutMs)).toEqual([undefined])
     expect(recorder.spawns().map((spawn) => ({ argv: spawn.argv, env: spawn.env, cwd: spawn.cwd, ownProcessGroup: spawn.ownProcessGroup }))).toStrictEqual([
       { argv: [...GH_AUTH_TOKEN_ARGV], env: { ...setEntries(env), GH_CONFIG_DIR: `${env.HOME}/${GH_PERSONAL_CONFIG_SUBPATH}` }, cwd: root, ownProcessGroup: false },
     ])
@@ -999,6 +1003,78 @@ describe('child process environments, the secret set and the token lookup', () =
 
     expect(await lookUpBaseBuildToken(recorder.spawn, runnerEnvironment(), root)).toBe(c.baseBuildToken)
     expect(recorder.spawns().length).toBe(1)
+  })
+
+  test('bounded lookup shares its remaining time between gh-personal and plain gh in the supplied checkout', async () => {
+    const clock = lookupClock, env = { HOME: join(root, 'home'), LANG: 'C' }
+    const token = credentials().baseBuildToken
+    const firstMs = AD_LATEST_DEADLINE_MS / 3
+    scriptLookups(recorder, { ...lookupAnswer('', 1), delayMs: firstMs }, lookupAnswer(`${token}\n`))
+    const lookup = lookUpBaseBuildToken(recorder.spawn, env, root, { timeoutMs: AD_LATEST_DEADLINE_MS, clock })
+    await clock.advance(firstMs)
+    expect(await lookup).toBe(token)
+    expect(recorder.spawns().map(({ argv, env, cwd, timeoutMs, atMs }) => ({ argv, env, cwd, timeoutMs, atMs }))).toEqual([
+      { argv: GH_AUTH_TOKEN_ARGV, env: { ...env, GH_CONFIG_DIR: `${env.HOME}/${GH_PERSONAL_CONFIG_SUBPATH}` }, cwd: root, timeoutMs: AD_LATEST_DEADLINE_MS, atMs: 0 },
+      { argv: GH_AUTH_TOKEN_ARGV, env, cwd: root, timeoutMs: AD_LATEST_DEADLINE_MS - firstMs, atMs: firstMs },
+    ])
+    expect(clock.pendingCount()).toBe(0)
+    assertNoLeak(recorder.spawns().map(({ argv, env, cwd }) => ({ argv, env, cwd })))
+  })
+
+  test.each([0, -1])('an exhausted initial lookup budget (%i ms) starts no gh process', async timeoutMs => {
+    expect(await lookUpBaseBuildToken(recorder.spawn, {}, root, { timeoutMs, clock: lookupClock })).toBeNull()
+    expect(recorder.spawns()).toEqual([])
+    expect(lookupClock.pendingCount()).toBe(0)
+  })
+
+  test.each([
+    ['first success at expiry', false, 0, true],
+    ['first failure at expiry', false, 0, false],
+    ['first success after expiry', false, 1, true],
+    ['plain success after expiry', true, 1, true],
+  ] as const)('%s cannot supply a credential or start another lookup', async (_label, plain, lateMs, success) => {
+    const clock = lookupClock, token = credentials().baseBuildToken
+    const firstMs = AD_LATEST_DEADLINE_MS / 3
+    const late = { ...lookupAnswer(success ? token : '', success ? 0 : 1), delayMs: AD_LATEST_DEADLINE_MS - (plain ? firstMs : 0) + lateMs }
+    scriptLookups(recorder, plain ? { ...lookupAnswer('', 1), delayMs: firstMs } : late, plain ? late : undefined)
+    const lookup = lookUpBaseBuildToken(recorder.spawn, {}, root, { timeoutMs: AD_LATEST_DEADLINE_MS, clock })
+    await clock.advance(AD_LATEST_DEADLINE_MS)
+    expect(await lookup).toBeNull()
+    expect(recorder.spawns().map(spawn => spawn.timeoutMs)).toEqual(plain ? [AD_LATEST_DEADLINE_MS, AD_LATEST_DEADLINE_MS - firstMs] : [AD_LATEST_DEADLINE_MS])
+    await clock.advance(lateMs)
+    expect(await lookup).toBeNull()
+    expect(recorder.spawns()).toHaveLength(plain ? 2 : 1)
+    expect(clock.pendingCount()).toBe(0)
+    assertNoLeak(recorder.argvs())
+  })
+
+  test('the existing three-argument base-build lookup stays unbounded beyond the latest-check deadline', async () => {
+    const token = credentials().baseBuildToken, clock = lookupClock
+    scriptLookups(recorder, { ...lookupAnswer('', 1), delayMs: AD_LATEST_DEADLINE_MS + 1 }, lookupAnswer(token))
+    const lookup = lookUpBaseBuildToken(recorder.spawn, {}, root)
+    await clock.advance(AD_LATEST_DEADLINE_MS + 1)
+    expect(await lookup).toBe(token)
+    expect(recorder.spawns().map(spawn => spawn.timeoutMs)).toEqual([undefined, undefined])
+    expect(clock.pendingCount()).toBe(0)
+    assertNoLeak(recorder.argvs())
+  })
+
+  test.each([
+    ['absent', (): undefined => undefined, false],
+    ['null', (): null => null, false],
+    ['empty', (): string => '', false],
+    ['short', () => fakeToken('', 'latest').slice(-(SECRET_MIN_LENGTH - 1)), false],
+    ['exact threshold', () => fakeToken('', 'latest').slice(0, SECRET_MIN_LENGTH), true],
+    ['long', () => fakeToken('', 'latest'), true],
+    ['whitespace', () => `${fakeToken('', 'latest')} bad`, true],
+    ['control character', () => `${fakeToken('', 'latest')}\r`, true],
+  ] as const)('latest-check %s scan membership preserves the other secret sources', (_label, value, included) => {
+    const c = credentials(), credential = value()
+    const env = { ANTHROPIC_API_KEY: c.rawKey, GH_TOKEN: c.tooShort }
+    const extras = { baseBuildToken: c.tooShort.slice(1), shardVariables: { SHARD_API_KEY: c.shardKey }, latestCheckCredential: credential }
+    const expected = new Set([c.rawKey, c.tooShort, c.tooShort.slice(1), c.shardKey, ...(included ? [credential as string] : [])])
+    expect(secretCredentialSet(env, extras)).toEqual(expected)
+    expect(new Set(scannedSecretValues(env, extras))).toEqual(expected)
   })
 
   test.each([
@@ -1170,14 +1246,21 @@ const CONSTANT_PINS: readonly (readonly [string, unknown, unknown])[] = [
 /** The banner that opens the runner's section 3; every constant this block pins is exported above it. */
 const DATA_MODEL_BANNER = /^\/\/ 3\. Data model$/m
 
-/** The names of the `export const` declarations above section 3 of the runner (sections 1 and 2). */
+/** Runner declarations and the threshold shared with ad-latest. Other modules' re-exports keep their own pin suites. */
 function exportedConstantsAboveDataModel(source: string): string[] {
   const end = source.search(DATA_MODEL_BANNER)
   if (end < 0) throw new Error('the runner has no section 3 banner')
   const file = ts.createSourceFile('ci-run.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
   const names: string[] = []
   for (const statement of file.statements) {
-    if (statement.getStart(file) >= end || !ts.isVariableStatement(statement)) continue
+    if (statement.getStart(file) >= end) continue
+    if (ts.isExportDeclaration(statement) && !statement.isTypeOnly && statement.moduleSpecifier && ts.isStringLiteral(statement.moduleSpecifier)
+      && statement.moduleSpecifier.text === './lib/ad-latest.ts' && statement.exportClause && ts.isNamedExports(statement.exportClause)) {
+      for (const entry of statement.exportClause.elements) {
+        if (!entry.isTypeOnly && /^[A-Z][A-Z0-9_]*$/.test(entry.name.text)) names.push(entry.name.text)
+      }
+    }
+    if (!ts.isVariableStatement(statement)) continue
     const exported = (ts.getModifiers(statement) ?? []).some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)
     if (!exported || (statement.declarationList.flags & ts.NodeFlags.Const) === 0) continue
     for (const declaration of statement.declarationList.declarations) {
@@ -1198,6 +1281,7 @@ describe('constants', () => {
 
     expect(new Set(pinned).size).toBe(pinned.length)
     expect([...exported].sort()).toEqual([...pinned].sort())
+    expect(SECRET_MIN_LENGTH).toBe(AD_SECRET_MIN_LENGTH)
   })
 })
 

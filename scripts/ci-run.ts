@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
-import { parseAdPins, checkLatestAd, compareBaseAdRecord, formatAdCheckError, fetchReleasedAd, AD_BASE_RECORD_MAX_BYTES, AD_BASE_RECORD_PATH, type AdPins, type AdCheckError, type AdFetch, type AdBaseRecordRead } from './lib/ad-latest.ts'
+import { parseAdPins, checkLatestAd, compareBaseAdRecord, formatAdCheckError, adCredentialFailureReason, fetchReleasedAd, SECRET_MIN_LENGTH, AD_BASE_RECORD_MAX_BYTES, AD_BASE_RECORD_PATH, type AdPins, type AdCheckError, type AdFetch, type AdBaseRecordRead } from './lib/ad-latest.ts'
 export type { AdBaseRecordRead } from './lib/ad-latest.ts'
+export { SECRET_MIN_LENGTH } from './lib/ad-latest.ts'
 /**
  * scripts/ci-run.ts — the `/ci` host runner: it runs the integration scripts
  * in up to six capped, isolated shards from one pinned image, admitted under
@@ -717,8 +718,6 @@ export const MERGE_ALLOWANCE_MINUTES = 15
 
 // --- Shard figures ---
 
-/** A secret credential shorter than this is a bad credential. */
-export const SECRET_MIN_LENGTH = 8
 /** Each shard's `--pids-limit`. */
 export const SHARD_PIDS_LIMIT = 2048
 /** A shard canary's length in lowercase hexadecimal characters. */
@@ -1451,6 +1450,8 @@ export interface RunState {
   baseImage: BaseImageCheck | null
   /** The base-build token step 4 found (), a secret credential; null when step 4 looked none up (the base present) or found none. */
   baseBuildToken: string | null
+  /** Latest-check credential, retained only in memory for output scans; never a build input. */
+  latestCheckCredential: string | null
   /** The clock moment packing started (), where the build time starts; null until step 5 starts. */
   packingStartedAtMs: number | null
   /** The tarball's path in `package/` (); null when nothing was packed. */
@@ -2244,18 +2245,32 @@ export function firstTokenLookupEnvironment(env: ChildEnvironmentSource): Record
   return { ...childEnvironment(env), GH_CONFIG_DIR: ghPersonalConfigDir(env) }
 }
 
-/** One `gh auth token` run: its output without trailing line feeds, or null when it fails or gives nothing. */
-async function runTokenLookup(spawn: SpawnFn, env: Record<string, string>, cwd: string): Promise<string | null> {
-  let result: SpawnResult
+/** Optional overall budget shared by both credential lookup attempts. */
+export interface TokenLookupLimit {
+  readonly timeoutMs: number
+  readonly clock: RunnerClock
+}
+interface TokenLookupDeadline { readonly atMs: number; readonly clock: RunnerClock }
+
+/** One `gh auth token` run, ignoring output that arrives after the optional deadline. */
+async function runTokenLookup(spawn: SpawnFn, env: Record<string, string>, cwd: string, deadline?: TokenLookupDeadline): Promise<string | null> {
+  let timer: unknown
   try {
-    result = await spawn({ argv: [...GH_AUTH_TOKEN_ARGV], env, cwd, ownProcessGroup: false }).result
+    const timeoutMs = deadline ? deadline.atMs - deadline.clock.now() : undefined
+    if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) return null
+    const work = spawn({ argv: [...GH_AUTH_TOKEN_ARGV], env, cwd, ownProcessGroup: false, ...(timeoutMs === undefined ? {} : { timeoutMs }) }).result
+    const result = deadline ? await Promise.race([work, new Promise<null>(resolve => {
+      timer = deadline.clock.setTimeout(() => resolve(null), Math.max(0, deadline.atMs - deadline.clock.now()))
+    })]) : await work
+    if (!result || (deadline && deadline.clock.now() >= deadline.atMs) || result.exitCode !== 0) return null
+    const token = new TextDecoder().decode(result.stdout).replace(/\n+$/, '')
+    return token === '' ? null : token
   } catch {
     // A spawn that throws is a failing gh: no credential.
     return null
+  } finally {
+    if (timer !== undefined) deadline!.clock.clearTimeout(timer)
   }
-  if (result.exitCode !== 0) return null
-  const token = new TextDecoder().decode(result.stdout).replace(/\n+$/, '')
-  return token === '' ? null : token
 }
 
 /**
@@ -2263,6 +2278,9 @@ async function runTokenLookup(spawn: SpawnFn, env: Record<string, string>, cwd: 
  * then, only when that fails or gives nothing, plain `gh auth token`. Each
  * runs through the given spawn function with the environment derived from
  * `env`, in `cwd`; null when neither gives a credential.
+ * With a limit, both attempts share its clock deadline; each process is
+ * killed by the spawn's timeout and late output is ignored. Existing callers
+ * without a limit retain the unbounded base-build lookup.
  *
  * `cwd` is the worktree root the base-build step runs in, because `gh` may
  * pick its token from the working directory (a `gh` wrapper that routes by
@@ -2270,24 +2288,28 @@ async function runTokenLookup(spawn: SpawnFn, env: Record<string, string>, cwd: 
  * the step finds. The runner passes `RunnerDeps.worktreeRoot`; the reader
  * passes its own worktree root and runs it through its own spawn seam.
  */
-export async function lookUpBaseBuildToken(spawn: SpawnFn, env: ChildEnvironmentSource, cwd: string): Promise<string | null> {
-  const first = await runTokenLookup(spawn, firstTokenLookupEnvironment(env), cwd)
+export async function lookUpBaseBuildToken(spawn: SpawnFn, env: ChildEnvironmentSource, cwd: string, limit?: TokenLookupLimit): Promise<string | null> {
+  const deadline = limit ? { atMs: limit.clock.now() + limit.timeoutMs, clock: limit.clock } : undefined
+  const first = await runTokenLookup(spawn, firstTokenLookupEnvironment(env), cwd, deadline)
   if (first !== null) return first
-  return runTokenLookup(spawn, childEnvironment(env), cwd)
+  return runTokenLookup(spawn, childEnvironment(env), cwd, deadline)
 }
 
 /** What joins the secret set beside the environment's own credentials. */
 export interface SecretSetExtras {
   /** The base-build token, when step 4 looked one up; null or absent otherwise. */
   readonly baseBuildToken?: string | null
+  /** Latest-check lookup value, including unusable values, only at the minimum scan length. */
+  readonly latestCheckCredential?: string | null
   /** Variables later passed to a shard that hold a key or token, by name; `ANTHROPIC_BASE_URL` and `ANTHROPIC_MODEL` are skipped. */
   readonly shardVariables?: Readonly<Record<string, string | undefined>>
 }
 
 /**
  * The secret credentials' values: `ANTHROPIC_API_KEY`;
- * `GH_TOKEN` when set; the base-build token when one was looked up; and the
- * extra shard variables' values. Never an empty string, and never the value
+ * `GH_TOKEN` when set; the base-build token when one was looked up; a latest-check
+ * value at least SECRET_MIN_LENGTH characters long; and the extra shard
+ * variables' values. Never an empty string, and never the value
  * of `ANTHROPIC_BASE_URL` or `ANTHROPIC_MODEL` as such.
  */
 export function secretCredentialSet(env: ChildEnvironmentSource, extras: SecretSetExtras = {}): ReadonlySet<string> {
@@ -2299,6 +2321,7 @@ export function secretCredentialSet(env: ChildEnvironmentSource, extras: SecretS
   add(env.CI_ANTHROPIC_API_KEY)
   add(env.GH_TOKEN)
   add(extras.baseBuildToken)
+  if (extras.latestCheckCredential != null && !isShortBaseBuildToken(extras.latestCheckCredential)) add(extras.latestCheckCredential)
   for (const [name, value] of Object.entries(extras.shardVariables ?? {})) {
     if (!NON_SECRET_VARIABLES.includes(name)) add(value)
   }
@@ -10063,7 +10086,7 @@ export type BaseImageStage =
       readonly check: BaseImageCheck
       /** The base-build token found; null when the base is present (no lookup) or none was found. */
       readonly baseBuildToken: string | null
-      /** The run's secret credentials so far: the environment's, plus the token when one was found (`secretCredentialSet`). */
+      /** The run's secret credentials so far, including both lookups (`secretCredentialSet`). */
       readonly secrets: ReadonlySet<string>
     }
   | {
@@ -10078,7 +10101,7 @@ export type BaseImageStage =
 export type BaseImageDeps = Pick<RunnerDeps, 'spawn' | 'env' | 'worktreeRoot' | 'clock' | 'fetchAd' | 'readAdBaseRecord'>
 
 /** The run-state fields step 4 records. */
-export type BaseImageRunState = Pick<RunState, 'baseImage' | 'baseBuildToken'>
+export type BaseImageRunState = Pick<RunState, 'baseImage' | 'baseBuildToken' | 'latestCheckCredential'>
 
 /** The docker context of steps 4 and 12: the spawn dependency, the runner's environment as children get it, the worktree root. */
 function baseImageDockerContext(deps: Pick<RunnerDeps, 'spawn' | 'env' | 'worktreeRoot'>): DockerContext {
@@ -10130,18 +10153,9 @@ async function checkBaseBuildPrerequisites(deps: BaseImageDeps, state: BaseImage
   return { ok: true, token }
 }
 
-/**
- * Step 4 of the run sequence: reads the base image's
- * name from `docker/Dockerfile.test`, queries its existence (one image
- * inspect of that name) and records the outcome in `state.baseImage`, with
- * the clock moment when it is missing. With the base present it spawns
- * nothing more: no git, no gh, no token lookup. With it missing it checks the
- * base build's prerequisites read-only and records a found base-build token
- * in `state.baseBuildToken`. A failed check is a refusal with no kind, its
- * one reason naming the check; records it. Never throws.
- */
 export function adLatestRefusalReason(error: AdCheckError): string {
-  return `latest agent-director: ${formatAdCheckError(error)}; update and commit pins or restore lookup access, rebuild the base and rerun /ci/prepare`
+  const recovery = adCredentialFailureReason(error.code) ?? 'update and commit pins or restore lookup access, rebuild the base and rerun /ci/prepare'
+  return `latest agent-director: ${formatAdCheckError(error)}; ${recovery}`
 }
 function readAdPins(root: string) {
   try { return parseAdPins({ dockerfile: readFileSync(join(root, 'docker/Dockerfile.test.base'), 'utf8'), packageJson: readFileSync(join(root, 'package.json'), 'utf8'), lockfile: readFileSync(join(root, 'bun.lock'), 'utf8') }) }
@@ -10155,12 +10169,24 @@ async function validateAdBase(deps: BaseImageDeps, imageId: string, pins: AdPins
     return compared.ok ? undefined : compared.error
   } catch { return { code: 'BASE_RECORD_READ_FAILED', source: 'base' } }
 }
+/**
+ * Step 4 first confirms latest AD, looking up a credential only on refused
+ * anonymous GitHub access. It then inspects and validates the base, recording
+ * its state and the clock moment when missing. A missing base checks its
+ * prerequisites separately and retains its own base-build token.
+ */
 export async function checkBaseImage(deps: BaseImageDeps, state: BaseImageRunState): Promise<BaseImageStage> {
   const refused = (reason: string): BaseImageStage => ({ ok: false, refusal: buildRefusal(null, reason) })
   const adFailed = (error: AdCheckError): BaseImageStage => ({ ok: false, refusal: buildRefusal(null, adLatestRefusalReason(error)), adFailure: error })
   const pins = readAdPins(deps.worktreeRoot)
   if (!pins.ok) return adFailed(pins.error)
-  const latest = await checkLatestAd(pins.value, { fetchAd: deps.fetchAd, clock: deps.clock })
+  const latest = await checkLatestAd(pins.value, { fetchAd: deps.fetchAd, clock: deps.clock,
+    getGitHubCredential: async remainingMs => {
+      const credential = await lookUpBaseBuildToken(deps.spawn, deps.env, deps.worktreeRoot, { timeoutMs: remainingMs, clock: deps.clock })
+      state.latestCheckCredential = credential !== null && !isShortBaseBuildToken(credential) ? credential : null
+      return credential
+    },
+  })
   if (!latest.ok) return adFailed(latest.error)
   const name = readBaseImageName(deps.worktreeRoot)
   if (!name.ok) return refused(name.reason)
@@ -10173,14 +10199,14 @@ export async function checkBaseImage(deps: BaseImageDeps, state: BaseImageRunSta
     if (error) return adFailed(error)
     const check: BaseImageCheck = { kind: 'present', image }
     state.baseImage = check
-    return { ok: true, check, baseBuildToken: null, secrets: secretCredentialSet(deps.env) }
+    return { ok: true, check, baseBuildToken: null, secrets: secretCredentialSet(deps.env, { latestCheckCredential: state.latestCheckCredential }) }
   }
   const check: BaseImageCheck = { kind: 'missing', image, missingAtMs: deps.clock.now() }
   state.baseImage = check
 
   const prerequisites = await checkBaseBuildPrerequisites(deps, state, image)
   if (!prerequisites.ok) return refused(prerequisites.reason)
-  return { ok: true, check, baseBuildToken: prerequisites.token, secrets: secretCredentialSet(deps.env, { baseBuildToken: prerequisites.token }) }
+  return { ok: true, check, baseBuildToken: prerequisites.token, secrets: secretCredentialSet(deps.env, { baseBuildToken: prerequisites.token, latestCheckCredential: state.latestCheckCredential }) }
 }
 
 // Step 5: the package.
@@ -11995,7 +12021,7 @@ export interface ShardStartInput {
   readonly driftImageId: string | null
   /** The run's tarball, an absolute path in `package/`. */
   readonly tarballPath: string
-  /** The run's secret credential values (`secretCredentialSet(env, { baseBuildToken })`), for the list check. */
+  /** The run's secret credential values, including both lookups, for the list check. */
   readonly secretValues: Iterable<string>
   /** The run's one canary source (`createShardCanaryDrawer(deps.randomBytes)`). */
   readonly canaries: ShardCanaryDrawer
@@ -15795,6 +15821,7 @@ export function createInitialRunState(): RunState {
     firstStop: null,
     baseImage: null,
     baseBuildToken: null,
+    latestCheckCredential: null,
     packingStartedAtMs: null,
     tarballPath: null,
     packageSha256: null,
@@ -16002,6 +16029,8 @@ function writeRunPhase(seq: RunSequence, phase: 'shards' | 'merge'): void {
 export async function recordRunRefusal(seq: RunSequence, refusal: Refusal): Promise<number> {
   seq.refusalBeingRecorded = true
   seq.step = 'refusal'
+  const latestValues = scannedSecretValues({}, { latestCheckCredential: seq.state.latestCheckCredential })
+  if (latestValues.length) switchOnRunnerLogRedaction(seq.run.log, latestValues)
   await guardedStep(seq, 'cancelling the limit timers', () => cancelFollowTimers(seq))
   await guardedStep(seq, 'releasing the admission lock', () => releaseAdmissionLock(seq))
   releasePerformanceBuildLock(seq)
@@ -16022,11 +16051,29 @@ export async function recordRunRefusal(seq: RunSequence, refusal: Refusal): Prom
     })
   }
   postcheckCodex(seq)
+  let finalRefusal = refusal
   if (seq.codexLogin) {
     const leaks = secretScan(seq.run.runDir, seq.codexLogin.secretValues(), seq.state.tarballPath, seq.run.log)
-    if (seq.internalErrorLine || leaks.length) return recordRefusal(seq.run, buildRefusal(null, seq.internalErrorLine ?? 'Codex login secret scan failed'))
+    if (seq.internalErrorLine || leaks.length) finalRefusal = buildRefusal(null, seq.internalErrorLine ?? 'Codex login secret scan failed')
   }
-  return recordRefusal(seq.run, refusal)
+  return recordRefusal(seq.run, scanLatestCheckRefusal(seq, finalRefusal, latestValues))
+}
+
+/** Refusals never reach endOfRun: scan existing artifacts and mask their final records here. */
+function scanLatestCheckRefusal(seq: RunSequence, refusal: Refusal, values: readonly string[]): Refusal {
+  if (!values.length) return refusal
+  const mask = scannedValueMasker(values)
+  let failures: readonly Failure[]
+  try {
+    failures = secretScan(seq.run.runDir, values, seq.state.tarballPath, seq.run.log)
+  } catch (err) {
+    failures = [integrityFailure('secret-scan', `the integrity checks could not run: ${dependencyErrorText(err)}`, null)]
+  }
+  return {
+    ...refusal,
+    summary: mask(refusal.summary),
+    details: [...refusal.details, ...failures.map(failure => failure.line)].map(mask),
+  }
 }
 
 /** One guarded step of the refusal path, `finishRun` or the end of run: a throw is logged and changes nothing, so the next step and the refusal or the verdict still come. */
@@ -16134,7 +16181,12 @@ async function admitRun(seq: RunSequence): Promise<SequencePartOutcome> {
   if (!answer.ok) return refuseUnlessStopped(seq, dockerDownRefusal(answer.error))
   // Step 4: the base image, and its build's prerequisites when it is missing.
   if (enterStep(seq, 'base-image-check')) return TO_END_OF_RUN
-  const base = await checkBaseImage(deps, seq.state)
+  const base = await checkBaseImage(deps, seq.state).finally(() => {
+    // Protect all later diagnostics, including a thrown base check and cleanup
+    // before an ordinary refusal. Other credential sources keep their policy.
+    const values = scannedSecretValues({}, { latestCheckCredential: seq.state.latestCheckCredential })
+    if (values.length) switchOnRunnerLogRedaction(run.log, values)
+  })
   if (!base.ok) {
     if (base.adFailure) {
       seq.adAdmissionFailed = true
@@ -16409,7 +16461,7 @@ async function buildAndStartShards(seq: RunSequence): Promise<SequencePartOutcom
   const tarballPath = seq.state.tarballPath
   if (tarballPath === null) throw new Error('step 12 reached with no tarball')
   releasePerformanceBuildLock(seq)
-  const secretValues = secretCredentialSet(deps.env, { baseBuildToken: seq.state.baseBuildToken })
+  const secretValues = secretCredentialSet(deps.env, { baseBuildToken: seq.state.baseBuildToken, latestCheckCredential: seq.state.latestCheckCredential })
   const ordinary = async (): Promise<void> => {
     for (const shard of seq.shards.filter(shard => !shard.assignment.assigned.some(isCodexScript))) {
       if (runStopRecorded(seq)) break
@@ -17029,7 +17081,7 @@ async function endOfRun(seq: RunSequence): Promise<number> {
   await verifyCodexRetirement(seq)
   postcheckCodex(seq)
   if (seq.codexLogin && seq.shards.some(shard => shard.assignment.assigned.some(isCodexScript) && shard.retirement?.kind === 'retired' && (shard.retirement.removal.kind === 'failed' || shard.retirement.logSave.kind !== 'saved' || shard.retirement.kill.kind === 'failed'))) seq.internalErrorLine = internalErrorFailureLine('Codex shard retirement failed')
-  const values = [...scannedSecretValues(deps.env, { baseBuildToken: state.baseBuildToken }), ...seq.codexSecrets, ...(seq.codexLoginReleased ? [] : seq.codexLogin?.secretValues() ?? [])]
+  const values = [...scannedSecretValues(deps.env, { baseBuildToken: state.baseBuildToken, latestCheckCredential: state.latestCheckCredential }), ...seq.codexSecrets, ...(seq.codexLoginReleased ? [] : seq.codexLogin?.secretValues() ?? [])]
   const integrity = runEndOfRunIntegrity(seq, firingRecords, values)
 
   // Step 3: the reservation, then the run's images.

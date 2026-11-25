@@ -1664,6 +1664,7 @@ describe('image preparation: the run\'s images and tags', () => {
       firstStop: null,
       baseImage: null,
       baseBuildToken: null,
+      latestCheckCredential: null,
       packingStartedAtMs: null,
       tarballPath: null,
       packageSha256: null,
@@ -5462,6 +5463,7 @@ import * as e13 from '../scripts/ci-run.ts'
 import * as lifecycleHelper from './test-helpers/ci-run.ts'
 import * as lifecycleCredentials from './test-helpers/credentials.ts'
 import * as lifecycleClock from './test-helpers/fake-clock.ts'
+import * as latestAd from '../scripts/lib/ad-latest.ts'
 import { treeSnapshot as lifecycleTreeSnapshot } from './test-helpers/tree-snapshot.ts'
 
 describe('the run lifecycle: the composed run (to)', () => {
@@ -6081,6 +6083,280 @@ describe('the run lifecycle: the composed run (to)', () => {
   }
 
   describe('b.bvq strict AD admission verdict', () => {
+    test('existing latest-check failures retain their /ci recovery text', () => {
+      const error: latestAd.AdCheckError = { code: 'HTTP_STATUS', source: 'github-release', status: 503 }
+      const line = e13.adLatestRefusalReason(error)
+      expect(line).toBe(`latest agent-director: ${latestAd.formatAdCheckError(error)}; update and commit pins or restore lookup access, rebuild the base and rerun /ci/prepare`)
+      lifecycleCredentials.assertNoLeak({ line })
+    })
+
+    /** Exercise the real provider binding; only the HTTP refusal and gh subprocess answers are canned. */
+    function fallbackRun(host: LifecycleHost, credential: string | null, options: LifecycleRunOptions = {}, status: 403 | 429 = 403, signedInStatus?: number): LifecycleRun {
+      const run = host.run({ ...options, deps: { ...options.deps, fetchAd: async (url, request) => {
+        if (url === run.ad.urls.release && (!request.githubCredential || signedInStatus !== undefined)) {
+          run.ad.requests.push({ url, options: request })
+          // Consume real virtual time before lookup, so caller tests catch a fresh-budget binding.
+          await new Promise<void>(resolve => host.clock.setTimeout(resolve, 5))
+          return { status: request.githubCredential ? signedInStatus! : status, body: adBytes(lifecycleCredentials.fakeToken('', 'refused-body')) }
+        }
+        return run.ad.fetchAd(url, request)
+      } } })
+      const gh = (request: e13.SpawnRequest) => request.cwd === run.worktree.root && request.argv.join('\0') === e13.GH_AUTH_TOKEN_ARGV.join('\0')
+      host.recorder.answerWhen(request => gh(request) && request.env.GH_CONFIG_DIR === undefined,
+        credential === null ? { exitCode: 1, stderr: lifecycleCredentials.fakeToken('', 'lookup-error') } : { stdout: `${credential}\n` }, { times: 1 })
+      host.recorder.answerWhen(request => gh(request) && request.env.GH_CONFIG_DIR === e13.ghPersonalConfigDir(run.deps.env),
+        { exitCode: 1, delayMs: 7 }, { times: 1 })
+      return run
+    }
+
+    /** Public records only: scan controls deliberately put a fake credential in an input artifact. */
+    function fallbackRecords(host: LifecycleHost, run: LifecycleRun) {
+      return { files: [e13.STATUS_FILE_NAME, e13.RESULTS_FILE_NAME, e13.SUMMARY_FILE_NAME, e13.VERDICT_FILE_NAME, e13.RUNNER_LOG_FILE_NAME]
+        .map(name => lifecycleCredentials.writtenFile(lifecyclePath.join(run.runDir, name))), stderr: run.stderr, statuses: run.statuses, timeline: host.timeline }
+    }
+
+    /** Host inheritance is separate from argv and the variables Docker forwards into a container/build. */
+    function expectCredentialSpawns(host: LifecycleHost, credential: string, inherited = false): void {
+      for (const spawn of host.recorder.spawns()) {
+        expect(spawn.argv.some(value => value.includes(credential))).toBe(false)
+        for (const [name, value] of Object.entries(spawn.env)) {
+          if (inherited && name === 'GH_TOKEN') expect(value).toBe(credential)
+          else expect(value.includes(credential)).toBe(false)
+        }
+        if (spawn.argv[0] !== e13.DOCKER_PROGRAM) continue
+        expect(spawn.argv).not.toContain('--env-file')
+        const forwarded = spawn.argv.flatMap((arg, i) => {
+          const value = ['--env', '-e', '--build-arg', '--secret'].includes(arg) ? spawn.argv[i + 1] : arg.startsWith('--env=') ? arg.slice('--env='.length) : undefined
+          if (value === undefined) return []
+          const secretEnv = /(?:^|,)env=([^,]+)/.exec(value)?.[1]
+          return [secretEnv ? spawn.env[secretEnv] : value.includes('=') ? value.slice(value.indexOf('=') + 1) : spawn.env[value]]
+        })
+        expect(forwarded.some(value => value?.includes(credential))).toBe(false)
+      }
+    }
+
+    function expectCredentialSinks(host: LifecycleHost, run: LifecycleRun, credential: string, inherited = false): void {
+      expectCredentialSpawns(host, credential, inherited)
+      lifecycleCredentials.assertNoLeak(fallbackRecords(host, run))
+    }
+
+    /** Ordinary refusals write status/log only; end-of-run results and verdicts must remain absent. */
+    async function expectOrdinaryRefusal(host: LifecycleHost, run: LifecycleRun, refusal: e13.Refusal): Promise<void> {
+      expect(run.status()?.phase).toBe('refused')
+      expect(run.status()?.refusal).toEqual({ kind: refusal.kind, summary: refusal.summary, details: refusal.details })
+      expect(run.logLines().slice(-1 - refusal.details.length)).toEqual([e13.refusalLine(refusal), ...refusal.details])
+      expect(run.results()).toBeNull()
+      expect(run.verdict()).toBeNull()
+      expect(lifecycleFs.existsSync(lifecyclePath.join(run.runDir, e13.SUMMARY_FILE_NAME))).toBe(false)
+      expect(run.shardStarts.size).toBe(0)
+      expect(lifecycleLockState(host)).toMatchObject({ lockHeld: false, reservations: [], reservedCpus: 0 })
+      lifecycleCredentials.assertNoLeak({
+        files: [e13.STATUS_FILE_NAME, e13.RUNNER_LOG_FILE_NAME].map(name => lifecycleCredentials.writtenFile(lifecyclePath.join(run.runDir, name))),
+        statuses: run.statuses, stderr: run.stderr, timeline: host.timeline,
+      })
+      await lifecycleExpectNothingAfter(host, run)
+    }
+
+    test.each(['npm-pack summary', 'password-read details', 'base-inspection summary'] as const)('successful fallback masks an ordinary %s refusal in status and log', async failure => {
+      const host = lifecycleHost(), token = lifecycleCredentials.fakeToken('', 'ordinary-refusal')
+      const run = fallbackRun(host, token, {
+        env: { GH_TOKEN: undefined },
+        npmPack: failure === 'npm-pack summary' ? { exitCode: 1, stderr: token } : undefined,
+        deps: failure === 'password-read details' ? { readPasswordFile: () => ({ ok: false, error: token }) } : {},
+      })
+      const image = e13.readBaseImageName(run.worktree.root)
+      if (!image.ok) throw new Error('the lifecycle fixture must name its base image')
+      if (failure === 'base-inspection summary') host.docker.fail('image-inspect', { stderr: token })
+      const redacted = e13.REDACTION_PLACEHOLDER
+      const expected = failure === 'npm-pack summary'
+        ? e13.buildRefusal(null, e13.npmPackFailedReason(1, redacted))
+        : failure === 'password-read details'
+          ? e13.accountHomeRefusal(UID, { kind: 'unreadable', error: redacted })
+          : e13.buildRefusal(null, e13.baseImageCheckFailedReason(image.name, redacted))
+
+      expect(await lifecycleRunToEnd(host, run)).toBe(e13.REFUSAL_EXIT_STATUS)
+      expect(run.ad.requests.filter(request => request.url === run.ad.urls.release).map(request => request.options.githubCredential)).toEqual([undefined, token])
+      expect(run.adRecordReads).toHaveLength(failure === 'base-inspection summary' ? 0 : 1)
+      expect(host.recorder.argvs().filter(argv => argv[0] === e13.NPM_PROGRAM)).toHaveLength(failure === 'base-inspection summary' ? 0 : 1)
+      expect(host.docker.operations().filter(op => op.kind === 'container-run' || op.kind === 'image-build')).toEqual([])
+      expectCredentialSpawns(host, token)
+      await expectOrdinaryRefusal(host, run, expected)
+      lifecycleCredentials.assertNoLeak(lifecycleOutputs(host, run))
+    })
+
+    test('successful fallback masks read-back cleanup before the ordinary refusal and preserves cleanup order', async () => {
+      const host = lifecycleHost(), token = lifecycleCredentials.fakeToken('', 'read-back-refusal')
+      const run = fallbackRun(host, token, { env: { GH_TOKEN: undefined } })
+      const name = e13.readContainerName(run.owner)
+      host.docker.fail('container-copy', { stderr: token })
+      host.docker.fail('container-remove', { stderr: token, when: argv => argv.at(-1) === name })
+
+      expect(await lifecycleRunToEnd(host, run)).toBe(e13.REFUSAL_EXIT_STATUS)
+      const events = lifecycleEventsOf(host, run), copy = lifecycleIndexOf(events, 'container-copy')
+      expect(events.slice(copy + 1).map(event => event.what)).toEqual(['container-remove', 'container-remove', 'image-remove', 'image-list'])
+      expect(events[copy + 1]!.reservations).toContain(e13.reservationFileName(run.owner))
+      expect(events.slice(copy + 2).every(event => event.reservations.length === 0 && !event.lockHeld)).toBe(true)
+      expect(host.docker.containers().some(container => container.name === name)).toBe(false)
+      expect(host.docker.images().some(image => image.labels[e13.OWNER_LABEL] === e13.formatOwner(run.owner))).toBe(false)
+      // The first removal logs before recordRunRefusal starts. A final-record-only mask leaves that log leaking.
+      expect(run.logLines().slice(0, -1)).toContain(e13.readContainerRemovalFailedText(name, e13.REDACTION_PLACEHOLDER))
+      expectCredentialSpawns(host, token)
+      await expectOrdinaryRefusal(host, run, e13.buildRefusal(null,
+        e13.readBackFailedReason(e13.readContainerCopyFailedText(name, e13.REDACTION_PLACEHOLDER))))
+      lifecycleCredentials.assertNoLeak(lifecycleOutputs(host, run))
+    })
+
+    test('ordinary refusal scans existing artifacts and masks the appended path without rewriting the evidence', async () => {
+      const host = lifecycleHost(), token = lifecycleCredentials.fakeToken('', 'refusal-artifact')
+      const failure = 'synthetic npm pack failure'
+      const run = fallbackRun(host, token, { env: { GH_TOKEN: undefined }, npmPack: { exitCode: 1, stderr: failure } })
+      const artifactName = `refusal-input-${token}.log`, artifact = lifecyclePath.join(run.runDir, artifactName)
+      const [exit] = await lifecycleSettle(host, [run], [run.sequence({ onStep: (_seq, step) => {
+        if (step === 'packing') lifecycleFs.writeFileSync(artifact, token)
+      } })])
+
+      expect(exit).toBe(e13.REFUSAL_EXIT_STATUS)
+      expect(lifecycleFs.readFileSync(artifact, 'utf8')).toBe(token)
+      expect(lifecycleFs.readdirSync(run.runDir).sort()).toEqual([artifactName, e13.PACKAGE_DIR_NAME, e13.RUNNER_LOG_FILE_NAME, e13.STATUS_FILE_NAME].sort())
+      expectCredentialSpawns(host, token)
+      // The deliberate input artifact is the only excluded leak sink; public records must all be safe.
+      await expectOrdinaryRefusal(host, run, e13.buildRefusal(null, e13.npmPackFailedReason(1, failure), [
+        e13.integrityFailure('secret-scan', `refusal-input-${e13.REDACTION_PLACEHOLDER}.log`, null).line,
+      ]))
+    })
+
+    test('anonymous latest success keeps the ordinary npm-pack refusal unchanged without any credential lookup', async () => {
+      const host = lifecycleHost(), failure = 'synthetic npm pack failure'
+      const run = host.run({ env: { GH_TOKEN: undefined }, npmPack: { exitCode: 1, stderr: failure } })
+      expect(await lifecycleRunToEnd(host, run)).toBe(e13.REFUSAL_EXIT_STATUS)
+      expect(run.ad.requests.filter(request => request.url === run.ad.urls.release).map(request => request.options.githubCredential)).toEqual([undefined])
+      expect(host.recorder.argvs().filter(argv => argv[0] === 'gh')).toEqual([])
+      expect(run.adRecordReads).toHaveLength(1)
+      expect(host.docker.operations().filter(op => op.kind === 'container-run' || op.kind === 'image-build')).toEqual([])
+      await expectOrdinaryRefusal(host, run, e13.buildRefusal(null, e13.npmPackFailedReason(1, failure)))
+      lifecycleCredentials.assertNoLeak(lifecycleOutputs(host, run))
+    })
+
+    test.each([
+      ['full', 403], ['selective', 429], ['injected', 403], ['candidate', 429],
+    ] as const)('%s checks once at step 4: fallback reaches packing and missing sign-in stops before admission', async (kind, status) => {
+      for (const available of [true, false]) {
+        const host = lifecycleHost(), token = lifecycleCredentials.fakeToken('', `latest-${kind}`)
+        const candidate = lifecyclePath.join(host.root, 'candidate')
+        const args = kind === 'selective' ? ['test-2'] : kind === 'injected' ? ['--inject', 'fail:test-2'] : kind === 'candidate' ? ['--ad-candidate-dist', candidate] : []
+        if (kind === 'candidate') {
+          lifecycleFs.mkdirSync(candidate)
+          for (const name of ['agent-director', 'client.tgz']) lifecycleFs.writeFileSync(lifecyclePath.join(candidate, name), 'inert candidate fixture\n')
+        }
+        const run = fallbackRun(host, available ? token : null, { args, env: { GH_TOKEN: undefined } }, status)
+        const steps: e13.RunSequenceStep[] = []
+        const retained: { credential: string | null } = { credential: null }
+        await lifecycleSettle(host, [run], [run.sequence({ onStep: (_seq, step) => { steps.push(step) }, onSequenceEnd: seq => { retained.credential = seq.state.latestCheckCredential } })])
+        expect(steps.filter(step => step === 'base-image-check')).toHaveLength(1)
+        expect(steps.includes('packing')).toBe(available)
+        expect(steps.includes('lock')).toBe(available)
+        expect(retained.credential).toBe(available ? token : null)
+        expect(run.ad.requests.map(request => request.url)).toEqual(available
+          ? [run.ad.urls.release, run.ad.urls.release, run.ad.urls.npm, run.ad.urls.ref, run.ad.urls.tag, run.ad.urls.installer, run.ad.urls.tarball]
+          : [run.ad.urls.release])
+        const lookups = host.recorder.spawns().filter(spawn => spawn.argv[0] === 'gh')
+        expect(lookups.map(({ argv, env, cwd, timeoutMs, atMs }) => ({ argv, env, cwd, timeoutMs, atMs }))).toEqual([
+          { argv: e13.GH_AUTH_TOKEN_ARGV, env: e13.firstTokenLookupEnvironment(run.deps.env), cwd: run.worktree.root, timeoutMs: latestAd.AD_LATEST_DEADLINE_MS - 5, atMs: START_MS + 5 },
+          { argv: e13.GH_AUTH_TOKEN_ARGV, env: e13.childEnvironment(run.deps.env), cwd: run.worktree.root, timeoutMs: latestAd.AD_LATEST_DEADLINE_MS - 12, atMs: START_MS + 12 },
+        ])
+        if (available) {
+          expect(run.shardStarts.size).toBeGreaterThan(0)
+          expect(host.recorder.argvs().filter(argv => argv[0] === e13.NPM_PROGRAM)).toHaveLength(1)
+          expect(run.adRecordReads).toHaveLength(1)
+        } else {
+          const reason = e13.adLatestRefusalReason({ code: 'GITHUB_CREDENTIAL_MISSING', source: 'github-release', status })
+          expect(run.verdict()).toContain(reason)
+          expect(reason).toContain(latestAd.AD_GITHUB_CREDENTIAL_MISSING_REASON)
+          expect(host.recorder.argvs().some(argv => argv[0] === e13.NPM_PROGRAM)).toBe(false)
+          expect(host.docker.operations().filter(op => op.kind === 'container-run' || op.kind === 'image-build')).toEqual([])
+          expect(run.shardStarts.size).toBe(0)
+          expect(lifecycleLockState(host)).toMatchObject({ lockHeld: false, lockRecord: null, reservations: [] })
+        }
+        expectCredentialSinks(host, run, token)
+        lifecycleCredentials.assertNoLeak(lifecycleOutputs(host, run))
+        await lifecycleExpectNothingAfter(host, run)
+      }
+    })
+
+    test.each(['cached-base', 'rejected-sign-in'] as const)('fallback still refuses %s with the exact failure before packing', async failure => {
+      const host = lifecycleHost(), token = lifecycleCredentials.fakeToken('', 'latest-refusal')
+      const run = fallbackRun(host, token, { env: { GH_TOKEN: undefined } }, 403, failure === 'rejected-sign-in' ? 401 : undefined)
+      if (failure === 'cached-base') run.ad.recordBytes = adJson({ ...run.ad.record, commit: AD_FIXTURE_OTHER_COMMIT })
+      const error: latestAd.AdCheckError = failure === 'cached-base'
+        ? { code: 'BASE_RECORD_MISMATCH', source: 'base', field: 'commit', expected: run.ad.pins.commit, actual: AD_FIXTURE_OTHER_COMMIT }
+        : { code: 'GITHUB_CREDENTIAL_REJECTED', source: 'github-release', status: 401, access: 'signed-in' }
+      await lifecycleRunToEnd(host, run)
+      expect(run.verdict()).toContain(e13.adLatestRefusalReason(error))
+      if (failure === 'rejected-sign-in') expect(run.verdict()).toContain(latestAd.AD_GITHUB_CREDENTIAL_REJECTED_REASON)
+      expect(host.recorder.argvs().some(argv => argv[0] === e13.NPM_PROGRAM)).toBe(false)
+      expect(host.docker.operations().filter(op => op.kind === 'container-run' || op.kind === 'image-build')).toEqual([])
+      expectCredentialSinks(host, run, token)
+      lifecycleCredentials.assertNoLeak(lifecycleOutputs(host, run))
+    })
+
+    test.each([false, true])('a missing base keeps its separate unbounded lookup and build route (host inherits latest credential=%s)', async inherited => {
+      const host = lifecycleHost(), token = lifecycleCredentials.fakeToken('', 'latest-versus-base')
+      const run = fallbackRun(host, token, { baseMissing: true, env: { GH_TOKEN: inherited ? token : undefined } })
+      const retained: Pick<e13.RunState, 'latestCheckCredential' | 'baseBuildToken'> = { latestCheckCredential: null, baseBuildToken: null }
+      await lifecycleSettle(host, [run], [run.sequence({ onSequenceEnd: seq => { retained.latestCheckCredential = seq.state.latestCheckCredential; retained.baseBuildToken = seq.state.baseBuildToken } })])
+      expect(retained.latestCheckCredential).toBe(token)
+      expect(retained.baseBuildToken).toBe(SECRETS.baseBuildToken)
+      expect(run.verdict()).toBe(e13.PASS_VERDICT)
+      expect(host.recorder.spawns().filter(spawn => spawn.argv[0] === 'gh').map(spawn => spawn.timeoutMs)).toEqual([
+        latestAd.AD_LATEST_DEADLINE_MS - 5, latestAd.AD_LATEST_DEADLINE_MS - 12, undefined,
+      ])
+      const build = host.recorder.spawns().filter(spawn => spawn.argv.join('\0') === e13.baseBuildStepArgs(run.worktree.root).join('\0'))
+      expect(build).toHaveLength(1)
+      expect(build[0]!.env).toEqual(e13.childEnvironment(run.deps.env))
+      // ci-base-build.sh's existing shell cases below protect its own gh lookup and gh_token BuildKit secret.
+      expectCredentialSinks(host, run, token, inherited)
+      lifecycleCredentials.assertNoLeak(lifecycleOutputs(host, run))
+    })
+
+    test.each(['shard-output', 'late-output', 'invalid', 'short', 'later-failure'] as const)('latest-check credential scanning covers %s through final records', async mode => {
+      const host = lifecycleHost(), token = lifecycleCredentials.fakeToken('', `latest-scan-${mode}`)
+      const credential = mode === 'invalid' ? `${token}\r` : mode === 'short' ? token.slice(-(e13.SECRET_MIN_LENGTH - 1)) : token
+      const run = fallbackRun(host, credential, {
+        env: { GH_TOKEN: undefined },
+        shard: k => mode === 'shard-output' && k === 1 ? { scriptLog: () => credential } : {},
+        deps: mode === 'later-failure' ? { readVolume: () => { throw new Error('synthetic later failure') } } : {},
+      })
+      const artifact = lifecyclePath.join(run.runDir, 'scan-control.log')
+      const retained: { credential: string | null } = { credential: null }
+      await lifecycleSettle(host, [run], [run.sequence({
+        onEndOfRunStep: (seq, step) => {
+          if ((['invalid', 'short', 'later-failure'].includes(mode) && step === 'integrity') || (mode === 'late-output' && step === 'verdict')) {
+            lifecycleFs.writeFileSync(artifact, credential)
+            // Also exercise record redaction after the early-invalid path or after initial results were written.
+            seq.state.cleanupFailures.push(`synthetic cleanup detail: ${credential}`)
+          }
+        },
+        onSequenceEnd: seq => { retained.credential = seq.state.latestCheckCredential },
+      })])
+      expect(retained.credential).toBe(mode === 'short' ? null : credential)
+      const scans = run.results()!.failures.filter(failure => failure.line.includes(e13.integrityFailure('secret-scan', '', null).line))
+      expect(scans.length > 0).toBe(mode !== 'short')
+      if (mode === 'invalid' || mode === 'short') {
+        expect(run.verdict()).toContain(e13.adLatestRefusalReason({ code: 'GITHUB_CREDENTIAL_INVALID', source: 'github-release', status: 403 }))
+        expect(run.verdict()).toContain(latestAd.AD_GITHUB_CREDENTIAL_INVALID_REASON)
+        expect(run.shardStarts.size).toBe(0)
+        expect(host.recorder.argvs().some(argv => argv[0] === e13.NPM_PROGRAM)).toBe(false)
+      }
+      if (mode === 'late-output') expect(scans.some(failure => failure.line.includes('scan-control.log'))).toBe(true)
+      if (mode === 'short') {
+        expect(lifecycleFs.readFileSync(artifact, 'utf8')).toBe(credential)
+        expect(run.results()!.cleanupFailures.some(line => line.includes(credential))).toBe(true)
+        lifecycleCredentials.assertNoLeak({ artifact: lifecycleCredentials.writtenFile(artifact) })
+      }
+      // Raw scan-control artifacts are deliberate inputs. Standard records, diagnostics and every spawn are leak-checked.
+      expectCredentialSinks(host, run, credential)
+    })
+
     test.each([
       ['stale', true, 'RUNTIME_NOT_LATEST'], ['stale', false, 'RUNTIME_NOT_LATEST'],
       ['lookup', true, 'HTTP_STATUS'], ['lookup', false, 'HTTP_STATUS'],
