@@ -4942,10 +4942,44 @@ AD 0.12 compatibility: `recogniseConflictCase` maps the native “this id's own 
 
 `scripts/lib/ad-latest.ts` provides the shared effect-free pin parser,
 bounded GitHub/npm latest/provenance check, base-record comparison and safe
-failure formatting. `scripts/ci-run.ts` injects HTTP and base-reader effects;
-admission checks latest even when the base exists, and reads provenance by
+failure formatting. It remains import-safe, with no environment, process or
+file reads. `AdLatestDeps` injects HTTP, clock and the optional
+`getGitHubCredential(remainingMs)` provider.
+
+Both `scripts/ci-run.ts` and
+`scripts/ad-latest-check.ts` bind that provider to `lookUpBaseBuildToken` in
+their checkout: gh-personal, then plain gh, sharing the check's remaining
+deadline through spawn timeouts and ignoring late results. The base build's
+separate lookup without that optional limit is unchanged.
+
+Each invocation starts anonymous. Only GitHub 403/429 invokes the provider;
+a usable credential retries that request once and stays on later GitHub
+requests. Signed-in failures do not retry or revert to anonymous.
+
+npm stays
+anonymous. Only `fetchReleasedAd` constructs Authorization, restricted to
+the exact HTTPS origins api.github.com and raw.githubusercontent.com; it
+refuses redirects and sends `Cache-Control: no-cache` on every request.
+No result or credential is shared across invocations.
+
+The looked-up value stays in memory, with no forwarding into child
+environments, Docker arguments/secrets, workers or containers. The runner
+retains values at or above `SECRET_MIN_LENGTH` (including unusable values)
+for output masking and final artifact scans; short values do not enter that
+set.
+
+Masking starts after the base check, including when it throws. Ordinary
+refusals after successful fallback also mask their summary/details and scan
+existing artifacts before recording status, preserving the refusal kind
+and exit semantics. Scans detect leaks without rewriting input artifacts.
+
+The base build's own `gh_token` BuildKit route, inherited host environment
+and gh store retain their existing policy.
+
+Admission checks latest even when the base exists, and reads provenance by
 the inspected immutable ID for cached, appearing and just-built bases before
 test image construction. Strict failures end the run with FAIL.
+
 `scripts/ad-latest-check.ts` adapts the same check for `publish-prepare.sh`,
 after preflight and before version mutation, with SR-2.8/exit 16. No warning,
 offline cache or override bypasses validation. See [codes and recovery](../docker/README.md#strict-latest-agent-director-check).

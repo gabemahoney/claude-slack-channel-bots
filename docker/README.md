@@ -330,14 +330,57 @@ against Anthropic's direct endpoint.
 ## Strict latest agent-director check
 
 Every `/ci` admission validates the tree's literal runtime and client pins,
-even with a cached base, for full, selective and candidate runs. It compares
+even with a cached base, for full, selective, injected and candidate runs. It compares
 `AD_VERSION` with GitHub Latest and `AD_CLIENT_VERSION` with npm `latest`,
 peels the release tag to `AD_COMMIT`, compares the binary/admin asset digests,
 hashes the installer at that commit, and verifies the npm tarball's registry
-and lockfile integrity and pinned SHA-256. The seven Docker ARGs, exact
-`package.json` dependency and `bun.lock` must agree. These unauthenticated
-public lookups have bounded requests; no cross-run cache, warning, offline
-path or override can turn failure into PASS.
+and lockfile integrity and pinned SHA-256.
+
+The seven Docker ARGs, exact
+`package.json` dependency and `bun.lock` must agree. No warning, offline
+path or override can turn unresolved failure into PASS.
+
+Each check starts anonymous. Only an anonymous GitHub HTTP 403/429 triggers
+the sign-in fallback: one credential lookup, then one retry of that request
+with a usable credential. Later GitHub requests stay signed in.
+
+Other anonymous failures do not trigger lookup; signed-in failures get no further
+retry and never revert to anonymous. npm requests always remain anonymous.
+
+Successful anonymous checks need no new setup. At the anonymous limit, use
+the same GitHub `gh` sign-in as the base build: the check tries
+`~/.config/gh-personal` first, then plain `gh` only if the first lookup fails
+or returns nothing. Both run from the checkout being tested or released.
+From that checkout, check status without displaying a credential:
+
+```sh
+GH_CONFIG_DIR="$HOME/.config/gh-personal" gh auth status --hostname github.com
+gh auth status --hostname github.com
+```
+
+To sign in or sign in again, run `GH_CONFIG_DIR="$HOME/.config/gh-personal" gh auth login --hostname github.com`
+for the preferred configuration, or `gh auth login --hostname github.com`
+for the default fallback, then repeat its status check. Complete sign-in in
+your own terminal; do not display, copy or paste a token into chat.
+
+Each successful check requests the latest release, npm metadata, tag ref,
+each annotated-tag level, installer and npm tarball. Fallback adds at most
+one repeated GitHub request and one provider invocation (which may try both
+`gh` configurations); anonymous success makes only the original requests.
+
+Requests and lookup share the original overall deadline; each lookup
+process gets only the remaining time, no second lookup process starts after
+expiry, and late results are ignored. Every request sends
+`Cache-Control: no-cache`; no answer, confirmation or credential is reused
+across runs, including between `/ci` and release preparation.
+
+The check holds its looked-up credential only in memory and sends it only
+in GitHub request headers to `https://api.github.com` and
+`https://raw.githubusercontent.com`. It does not print or store that value,
+or forward it into child environments, Docker arguments/secrets, run
+records, logs, workers or containers. The base build's separate `gh_token`
+BuildKit path, inherited host environment and `gh` credential store are
+unchanged.
 
 A present base must also match every identity field in
 `/opt/agent-director/client/release.json`. The runner reads it in an isolated,
@@ -358,8 +401,16 @@ preflight and before any version change, pack, commit, tag or manifest.
 | `COMMIT_MISMATCH` | The peeled release tag differs from `AD_COMMIT`. | Verify the release tag's commit and update the complete pin set before rebuilding. |
 | `RELEASE_DIGEST_MISMATCH`, `INSTALLER_DIGEST_MISMATCH` | Release asset metadata or installer bytes disagree with a runtime pin. | Verify provenance and update the affected pins together; rebuild the base. |
 | `CLIENT_INTEGRITY_MISMATCH`, `CLIENT_DIGEST_MISMATCH` | npm tarball bytes disagree with registry/lock integrity or the client SHA-256 pin. | Verify the published client and update the exact package, lock and Docker pins; rebuild. |
-| `HTTP_FAILED`, `HTTP_STATUS`, `HTTP_TIMEOUT`, `HTTP_BODY_TOO_LARGE`, `METADATA_INVALID` | A required public lookup failed or its answer could not be validated. | Restore GitHub/npm access or wait for service/rate-limit recovery, then retry. Do not bypass validation or accept unverified bytes. |
+| `GITHUB_CREDENTIAL_MISSING` | GitHub refused anonymous access and no `gh` sign-in was found, including a failed, empty or deadline-expired lookup. | Sign `gh` in to GitHub as above and check `gh auth status`, or retry after the anonymous allowance resets. |
+| `GITHUB_CREDENTIAL_INVALID` | The `gh` sign-in gave an unusable credential. | Sign `gh` in to GitHub again. |
+| `GITHUB_CREDENTIAL_REJECTED` | GitHub refused the `gh` sign-in with HTTP 401. | Sign `gh` in to GitHub again and check `gh auth status`. |
+| `HTTP_FAILED`, `HTTP_STATUS`, `HTTP_TIMEOUT`, `HTTP_BODY_TOO_LARGE`, `METADATA_INVALID` | A required lookup failed or its answer could not be validated; signed-in HTTP 403/429 remains `HTTP_STATUS`. | Restore GitHub/npm access or wait for service/rate-limit recovery, then retry. Do not bypass validation or accept unverified bytes. |
 | `BASE_RECORD_READ_FAILED`, `BASE_RECORD_INVALID`, `BASE_RECORD_MISMATCH` | The cached, appearing or just-built base has missing, unreadable, malformed or mismatched provenance. | Restore Docker access if needed and rebuild the pinned base through `scripts/ci-base-build.sh`; rerun only once it matches the tree. |
+
+The `signed-in` diagnostic marker means the latest check had entered signed-in
+access; it can also accompany a later validation or npm failure and does not
+mean npm received the credential. All existing provenance and pin checks
+remain strict under either access mode.
 
 On each AD release, CI stays blocked until the updated pins and base are
 ready. Follow [the base bump procedure](#when-to-bump-the-base-image-version);

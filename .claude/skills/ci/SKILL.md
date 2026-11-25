@@ -816,15 +816,20 @@ The test image is built `FROM` the base image `cscb-ci-base:v11`, the one
 `docker/Dockerfile.test`'s `FROM` line names. Every admission first checks the
 runtime/client pins against GitHub Latest and npm `latest`, verifies release
 commit/digests and package/lock consistency, and validates a present base's
-release record by immutable image ID. Stale pins, digest mismatch, failed
-lookup and mismatched cached base produce **FAIL**, with no override,
+release record by immutable image ID.
+
+Stale pins, digest mismatch,
+unresolved lookup and mismatched cached base produce **FAIL**, with no override,
 warning or offline path, including selective/candidate runs. Appearing and
 just-built bases must also pass before the test image builds.
 
-Use the [strict-check failure codes and recovery](../../../docker/README.md#strict-latest-agent-director-check):
+Anonymous GitHub 403/429 can use the existing `gh` sign-in fallback. Use the
+[strict-check failure codes, sign-in setup and recovery](../../../docker/README.md#strict-latest-agent-director-check):
 update/commit pins and rebuild the base for drift, or restore lookup access
 and retry later for service failures. A present mismatched base is not
-silently rebuilt. The base is built once per host. When
+silently rebuilt.
+
+The base is built once per host. When
 it is missing, the runner checks its build prerequisites before the
 admission lock, without changing anything, and refuses when one fails:
 
