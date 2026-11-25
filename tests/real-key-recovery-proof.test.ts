@@ -277,6 +277,57 @@ describe('real key recovery proof', () => {
     expect(proveReset(f)).toMatchObject({ session: 'native-session', stages: [10000, 30000, 30000] })
   })
 
+  // Seq 6 from job j20261125220539-f3c8f7, including the refused attempt
+  // before the successful not-now retry. Times retain the recorded spacing.
+  function refusedResetFixture() {
+    const sent = (attempt: number, at: number, send_kind: string) => ({
+      kind: 'sent', seq: 6, part: 1, attempt, session_id: 'native-session', send_kind, at,
+    })
+    const journal: any[] = [sent(1, 351155, 'text'), sent(2, 361742, 'enter'),
+      sent(3, 371810, 'retype'), sent(4, 402396, 'enter'), sent(5, 432466, 'retype'),
+      sent(6, 434635, 'enter'), sent(7, 444711, 'retype'), sent(8, 475322, 'enter'),
+      sent(9, 505396, 'retype'), { kind: 'refused', seq: 6, attempt: 9, at: 505441 },
+      sent(10, 510456, 'retype'), { kind: 'delivered', seq: 6, part: 1, at: 512107 }]
+    const calls = [key(434650, 'enter'), key(444730, 'text'), key(445250, 'enter'),
+      key(475340, 'enter'), key(505415, 'text'), key(510475, 'text'), key(511040, 'enter')]
+      .map((call, n) => ({ ...call, pid: String(n + 1) }))
+    return { journal, calls,
+      faults: [{ at: 444736, pid: '2', words: ['send-keys', 'no_enter', 'swallow'] }],
+      waiting: [{ key: 'control', session_id: 'native-session', at: 434614 }] }
+  }
+  function proveRefusedReset(f: ReturnType<typeof refusedResetFixture>) {
+    return assertResetKeyRecovery(f.journal, f.calls, f.faults, f.waiting, 6, instance)
+  }
+  test('reset proof accepts a refused retype followed by its typed retry', () => {
+    const proof = proveRefusedReset(refusedResetFixture())
+    expect(proof).toMatchObject({ session: 'native-session', stages: [10061, 30072, 35116],
+      sends: [{ kind: 'enter', at: 434635 }, { kind: 'retype', at: 444711 },
+        { kind: 'enter', at: 475322 }, { kind: 'retype', at: 510456 }] })
+  })
+  test.each([
+    ['missing stage', (f: ReturnType<typeof refusedResetFixture>) => { f.journal.splice(7, 1) }],
+    ['wrong kind', (f: ReturnType<typeof refusedResetFixture>) => { f.journal[7].send_kind = 'retype' }],
+    ['extra non-refused send', (f: ReturnType<typeof refusedResetFixture>) => { f.journal.splice(9, 1) }],
+    ['refusal for another attempt', (f: ReturnType<typeof refusedResetFixture>) => { f.journal[9].attempt = 99 }],
+    ['refusal for another seq', (f: ReturnType<typeof refusedResetFixture>) => { f.journal[9].seq = 99 }],
+    ['refusal for another part', (f: ReturnType<typeof refusedResetFixture>) => { f.journal[9].part = 2 }],
+  ] as const)('reset refused-send control rejects %s', (_, mutate) => {
+    const f = refusedResetFixture(); mutate(f)
+    expect(() => proveRefusedReset(f)).toThrow('reset requires the durable Enter/text/Enter/text recovery sequence')
+  })
+
+  test('reset proof rejects using the refused shim text as the final recovery stage', () => {
+    const f = refusedResetFixture()
+    f.journal.splice(10, 1); f.calls.splice(5, 2)
+    expect(() => proveRefusedReset(f)).toThrow('reset requires the durable Enter/text/Enter/text recovery sequence')
+  })
+
+  test('reset proof rejects a refused-only second retype without a typed retry', () => {
+    const f = refusedResetFixture()
+    f.journal.splice(10, 1); f.calls.splice(4, 3)
+    expect(() => proveRefusedReset(f)).toThrow('reset requires the durable Enter/text/Enter/text recovery sequence')
+  })
+
   test('reset oracle accepts the production executor recovery sequence after an interrupted growing episode', async () => {
     const h = await makeEngineHarness({ keys: ['control'] })
     try {

@@ -203,11 +203,20 @@ export function assertFirstLaunchWaiting(waiting: LaunchObservation[], sent: { s
   return observations[0]!
 }
 
+/** Journal intents whose keys were not definitely refused by AD. Refusals
+ * identify their own seq/attempt; current journals omit part on refusals. */
+function typedSends(journal: readonly any[], seq: number): any[] {
+  return journal.filter(record => record.kind === 'sent' && record.seq === seq
+    && !journal.some(refusal => refusal.kind === 'refused' && refusal.seq === record.seq
+      && record.attempt !== undefined && refusal.attempt === record.attempt
+      && (refusal.part === undefined || refusal.part === record.part)))
+}
+
 /** Restart resets the first receipt/retry wait to 10s. The next retype has
  * two 30s waits, separated by its durable guarded Enter recovery. Checking
  * those stages distinguishes a reset from retaining the old 60s/120s slot. */
 export function assertResetKeyRecovery(journal: any[], calls: KeyCall[], faults: KeyCall[], waiting: LaunchObservation[], seq: number, instance: string) {
-  const sent = journal.filter(record => record.kind === 'sent' && record.seq === seq)
+  const sent = typedSends(journal, seq)
   const observed = waiting.filter(row => 'cscb_' + row.key === instance && row.session_id === sent.at(-1)?.session_id
     && row.at <= sent.at(-1)?.at).at(-1)
   check(observed, 'reset lacks an AD first-waiting observation')
