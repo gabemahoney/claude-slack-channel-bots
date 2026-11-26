@@ -30,7 +30,13 @@ export interface DeliveryStatus {
   reconnectDeferred: boolean
   partialReceipt?: PartialReceiptEvidence
 }
+export type DeliveryTextRefusal =
+  | { readonly kind: 'not_started'; readonly facts: Extract<SubmissionUnconfirmedFacts, { kind: 'not_started' }> }
+  | { readonly kind: 'not-interactive' | 'row-absent' | 'invalid-flags' }
 export type DeliveryEngineEvent =
+  | { type: 'input-target-changed'; key: string; seq: number; part: number }
+  | { type: 'input-refused'; key: string; seq: number; part: number; refusal: DeliveryTextRefusal }
+  | { type: 'input-call-succeeded'; key: string; seq: number; part: number }
   | { type: 'launch-observed'; key: string; sessionId: string; at: number }
   | { type: 'launch-first-waiting'; key: string; sessionId: string; at: number }
   | { type: 'transcript-reference'; key: string; instanceId: string; sessionId: string; path: string; at: number }
@@ -529,6 +535,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     const row = s.row!
     const facts = submissionUnconfirmedFactsOf(error, textCall ? 'text' : 'enter')
     if (facts) {
+      if (textCall && facts.kind === 'not_started') emit({ type: 'input-refused', key, seq: s.e.target[0], part: s.e.target[1], refusal: { kind: 'not_started', facts } })
       let savedUncertainty = false
       if (facts.kind !== 'not_started') {
         const [seq, part] = s.e.target
@@ -559,6 +566,13 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       if (!textCall) s.deadlines.enterDelay = s.deadlines.notNow
       s.e.request = 'none'
       return
+    }
+    if (textCall) {
+      const kind = isAdErrorInstance(error, ErrSpawnNotInteractive) ? 'not-interactive'
+        : isAdErrorInstance(error, ErrSpawnNotFound) ? 'row-absent'
+        : isAdErrorInstance(error, ErrInvalidFlags) ? 'invalid-flags' : undefined
+      // Report before InvalidFlags' existing version re-check can stop us.
+      if (kind) emit({ type: 'input-refused', key, seq: s.e.target[0], part: s.e.target[1], refusal: { kind } })
     }
     await deps.onKeyError?.(key, error, row)
     if (isAdErrorInstance(error, ErrInvalidFlags) && !deps.onKeyError) await classifyWithInvalidFlagsRecheck(error)
@@ -608,6 +622,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           if (isCoveredRow(s.row) || hasUnresolvedCoveredCustody(coveredHead)) {
             if (!coveredHead.fixed) { await deps.prepare(key, coveredHead); return }
             const part = coveredHead.fixed.parts.findIndex((_, i) => !coveredHead.records.some(r => r.kind === 'delivered' && r.part === i + 1)) + 1
+            if (s.e.target[0] !== coveredHead.accepted.seq || s.e.target[1] !== part) emit({ type: 'input-target-changed', key, seq: coveredHead.accepted.seq, part })
             s.e.target = [coveredHead.accepted.seq, part]
             if (life.owner(key) === 'free') s.lease = life.acquire(key, 'delivery')
             let coveredAction: Awaited<ReturnType<typeof covered.step>>
@@ -633,6 +648,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
         const observedItem = head
         const observedPart = part
         if (head && (s.lastSeq !== head.accepted.seq || s.lastPart !== part)) {
+          emit({ type: 'input-target-changed', key, seq: head.accepted.seq, part })
           // Retype spacing belongs to the FIFO item, spanning its parts.
           if (s.lastSeq !== head.accepted.seq) s.retryStep = 0
           s.lastSeq = head.accepted.seq; s.lastPart = part; s.lastRetypeEvent = undefined; s.e.target = pair; s.notNowStep = 0
@@ -732,6 +748,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           const retype = (effectiveSends(head!, part).length > 0 || head!.unknownSend)
           const kind = action === 'recordRecoveryEnter' ? 'enter' : retype ? 'retype' : 'text'
           const sent: SentRecord = { v: 1, kind: 'sent', seq: pair[0], part, attempt: head!.nextAttempt, send_kind: kind, at: clock.now(), session_id: s.row!.session_id, transcript_path: s.receipt?.path ?? '', transcript_size: s.receipt?.size ?? 0 }
+          if (s.e.target[0] !== pair[0] || s.e.target[1] !== part) emit({ type: 'input-target-changed', key, seq: pair[0], part })
           s.e.target = pair; s.e.attempt = sent.attempt
           queueWrite(s, sent, () => {
             s.e.phase = kind === 'enter' ? 'recovery-enter' : 'text'; s.e.request = 'none'
@@ -744,6 +761,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           try {
             const params: SendKeysParams = { instance_id: deps.instanceId(key), text: head!.fixed!.parts[part - 1], no_enter: true }
             await ad(key, s, 'send-keys', client => client.sendKeys(params))
+            emit({ type: 'input-call-succeeded', key, seq: pair[0], part })
             if (part === 1 && effectiveSends(head!, part).at(-1)?.send_kind === 'text' && !typed.has(`${key}:${pair[0]}`)) { typed.add(`${key}:${pair[0]}`); emit({ type: 'first-typed', key, seq: pair[0], part }) }
             s.dialogMaybeOpen = false
             s.notNowStep = 0; s.deadlines.notNow = 0; s.e.phase = 'enter'; s.deadlines.enterDelay = clock.now() + ms('ENTER_DELAY_MS', ENTER_DELAY_MS)
@@ -757,6 +775,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           const recovery = s.e.phase === 'recovery-enter'
           try {
             await ad(key, s, 'send-keys', client => client.sendKeys({ instance_id: deps.instanceId(key), key: 'Enter' }))
+            emit({ type: 'input-call-succeeded', key, seq: pair[0], part })
             // The durable intent precedes keys. A restart or any refused or
             // uncertain recovery retries Enter before it can append text.
             if (recovery) s.e.recoveryAttempt = s.e.attempt

@@ -32,12 +32,238 @@ import { buildTagParts } from '../src/tag-wrapper.ts'
 import { makeQueuedAckHarness } from './test-helpers/queued-ack.ts'
 import { handleInterject } from '../src/interject.ts'
 import { createPersonaUpPredicate } from '../src/persona-start.ts'
+import { buildAdInputOutcomeLine } from '../src/ad-input-notices.ts'
+import { classifyAdError, describeAdFailureForLog, submissionUnconfirmedFactsOf } from '../src/ad-error-class.ts'
+import { handleDeliveryKeyError, reconnectTransientLine } from '../src/session-manager.ts'
+import { NOT_NOW_RETRY_MS } from '../src/delivery-constants.ts'
+import { errSubmissionUnconfirmed, errSpawnNotInteractive, errSpawnNotFound, errInvalidFlags, errSendKeysWhileRelayed, errPaneChanged, errDialogMaybeOpen, cannedBusyResult } from './test-helpers/agent-director-stub.ts'
+import { makeRecoveryHarness } from './test-helpers/recovery-harness.ts'
+import { PHASE1_RC_VERSION, DEV_PLACEHOLDER_VERSION } from './test-helpers/agent-director-versions.ts'
 const runs: DeliveryNoticeHarness[] = []
 async function run(options: Parameters<typeof makeDeliveryNoticeHarness>[0] = {}) { const h = await makeDeliveryNoticeHarness(options); runs.push(h); return h }
 afterEach(async () => { for (const r of runs.splice(0)) { try {
   const path = join(r.root, 'queue')
   assertNoLeak({ logs: r.logs, posts: r.h.allPosts(), lines: r.rig.lines, queue: existsSync(path) ? writtenFile(path) : undefined })
 } finally { await r.cleanup() } } })
+
+describe('delivery text refusal diagnostics retain work (b.2hb)', () => {
+  const noInput = { outcome: 'not_started', keys_sent: false, submission_confirmed: false, enter_may_have_been_sent: false }
+  const refusals = [
+    ['not_started', () => errSubmissionUnconfirmed(noInput)],
+    ['ErrSpawnNotInteractive', () => errSpawnNotInteractive('send-keys')],
+    ['ErrSpawnNotFound', errSpawnNotFound],
+    ['ErrInvalidFlags', () => errInvalidFlags('send-keys')],
+  ] as const
+
+  async function fixture(options: { version?: string; constants?: NonNullable<Parameters<typeof makeEngineHarness>[0]>['constants'] } = {}) {
+    const recovery = makeRecoveryHarness({ personas: [{ name: 'alpha' }, { name: 'beta' }] })
+    const recheck = recovery.recheckAnswers(options.version ?? PHASE1_RC_VERSION)
+    let report: DeliveryNoticeHarness | undefined
+    const custody: unknown[] = []
+    const beforeKeyError: string[][] = []
+    const e = await makeEngineHarness({ keys: ['alpha', 'beta'], constants: options.constants,
+      onEvent: event => report?.reporting.engineEvent(event),
+      onKeyError: async (...args) => {
+        beforeKeyError.push(report?.logs.filter(line => line.startsWith('[slack] delivery:')) ?? [])
+        await handleDeliveryKeyError(...args)
+      },
+      onSubmissionUnconfirmed: (...args) => { custody.push(args) },
+    })
+    report = await makeDeliveryNoticeHarness({ queue: e.queue })
+    const r = report
+    return { e, r, recovery, recheck, custody, beforeKeyError,
+      lines: () => r.logs.filter(line => line.startsWith('[slack] delivery:')),
+      async cleanup() {
+        try { assertNoLeak({ logs: r.logs, posts: r.h.allPosts(), custody, recovery: recovery.captured() }) }
+        finally { try { await e.cleanup() } finally { try { await r.cleanup() } finally { recovery.cleanup() } } }
+      },
+    }
+  }
+
+  test.each(refusals)('%s text logs once and still saves refused and delivers on retry', async (label, error) => {
+    const f = await fixture()
+    try {
+      const body = 'private delivery body excluded from refusal diagnostics'
+      await f.e.accept(body)
+      let failed = false
+      f.e.p().keyHook = params => { if (params.no_enter && !failed) { failed = true; return error() }; return undefined }
+      await f.e.tick()
+      expect(f.e.records().filter(r => r.kind === 'refused')).toHaveLength(1)
+      expect(f.e.queue.openCount('alpha')).toBe(1)
+      expect(f.e.lifecycle.inputHeld('alpha')).toBe(false)
+      expect(f.custody).toEqual([])
+      expect(f.r.h.allPosts()).toEqual({ alpha: [], beta: [] })
+      if (label === 'ErrInvalidFlags') {
+        expect(f.recheck.resolves).toHaveLength(1)
+        expect(f.beforeKeyError[0]).toHaveLength(1)
+      }
+      // Assert behavior before the missing-line assertion, so the baseline's
+      // only failure is the absent diagnostic rather than an incomplete retry.
+      await f.e.until(() => f.e.queue.openCount('alpha') === 0)
+      expect(f.e.textCalls()).toHaveLength(2)
+      expect(f.e.records().filter(r => r.kind === 'delivered')).toHaveLength(1)
+      expect(f.lines()).toHaveLength(1)
+      if (label === 'not_started') expect(f.lines()).toEqual([buildAdInputOutcomeLine({ personaRef: 'alpha', site: 'delivery', facts: submissionUnconfirmedFactsOf(error(), 'text')! })])
+      else {
+        expect(f.lines()[0]).toContain(`outcome=refused step=text next=${label === 'ErrInvalidFlags' ? 'version-recheck' : 'read-before-retry'}`)
+        expect(f.lines()[0]).toContain(`class=${label === 'ErrInvalidFlags' ? 'UNCLASSIFIED' : 'STATE'} name=${label}`)
+      }
+      expect(f.lines().join('\n')).not.toMatch(/private delivery|item=|part=|dead session/)
+    } finally { await f.cleanup() }
+  })
+
+  test.each(refusals)('%s repeats at not-now deadlines without flooding lines or suppressing retries', async (_label, error) => {
+    const f = await fixture()
+    try {
+      await f.e.accept()
+      f.e.p().keyHook = params => params.no_enter ? error() : undefined
+      await f.e.tick()
+      for (let n = 0; n < 3; n++) {
+        const before = f.e.textCalls().length
+        const due = f.e.textCalls().at(-1)!.at + NOT_NOW_RETRY_MS[n]!
+        await f.e.advance(due - f.e.clock.now() - 1)
+        expect(f.e.textCalls()).toHaveLength(before)
+        await f.e.until(() => f.e.textCalls().length === before + 1)
+      }
+      expect(f.e.records().filter(r => r.kind === 'refused')).toHaveLength(4)
+      f.e.p().keyHook = undefined
+      await f.e.until(() => f.e.queue.openCount('alpha') === 0)
+      expect(f.e.textCalls()).toHaveLength(5)
+      expect(f.lines()).toHaveLength(1)
+      expect(f.custody).toEqual([])
+      expect(f.r.h.allPosts()).toEqual({ alpha: [], beta: [] })
+    } finally { await f.cleanup() }
+  })
+
+  test.each([
+    ['ErrSendKeysWhileRelayed', errSendKeysWhileRelayed],
+    ['ErrPaneChanged', errPaneChanged],
+    ['ErrDialogMaybeOpen', errDialogMaybeOpen],
+  ] as const)('%s keeps its existing delivery text class line byte-identical', async (_label, makeError) => {
+    const f = await fixture(), error = makeError()
+    try {
+      await f.e.accept()
+      f.e.p().keyHook = params => params.no_enter ? error : undefined
+      await f.e.tick()
+      const expected = reconnectTransientLine('persona=alpha', describeAdFailureForLog(error), classifyAdError(error).errorClass)
+      expect(f.recovery.errors.filter(line => line === expected)).toEqual([expected])
+      expect(f.lines()).toEqual([])
+      expect(f.e.records().filter(r => r.kind === 'refused')).toHaveLength(1)
+    } finally { await f.cleanup() }
+  })
+
+  test('alternating refusals at repeated five-second deadlines claim each kind only once', async () => {
+    const f = await fixture({ constants: { NOT_NOW_RETRY_MS: [NOT_NOW_RETRY_MS[0]] } })
+    try {
+      await f.e.accept()
+      let attempt = 0
+      f.e.p().keyHook = params => params.no_enter ? refusals[attempt++ % 2]![1]() : undefined
+      await f.e.tick()
+      for (let n = 1; n < 6; n++) await f.e.advance(NOT_NOW_RETRY_MS[0])
+      expect(f.e.textCalls()).toHaveLength(6)
+      expect(f.e.records().filter(r => r.kind === 'refused')).toHaveLength(6)
+      expect(f.lines()).toHaveLength(2)
+      await f.e.accept('sibling', 'beta')
+      f.e.p('beta').keyHook = params => params.no_enter ? refusals[0][1]() : undefined
+      await f.e.tick('beta')
+      expect(f.lines()).toHaveLength(3)
+      expect(f.lines().filter(line => line.includes('delivery: beta '))).toHaveLength(1)
+      expect(f.r.h.allPosts()).toEqual({ alpha: [], beta: [] })
+    } finally { await f.cleanup() }
+  })
+
+  test('successful text clears the refusal mark without claiming delivery, so a later refused retype logs again', async () => {
+    const f = await fixture()
+    try {
+      await f.e.accept()
+      f.e.p().autoReceipt = false
+      let textCalls = 0
+      f.e.p().keyHook = params => params.no_enter && ++textCalls !== 2 ? errSpawnNotFound() : undefined
+      await f.e.tick()
+      await f.e.until(() => f.e.textCalls().length === 2)
+      expect(f.e.queue.openCount('alpha')).toBe(1)
+      expect(f.e.records().filter(r => r.kind === 'delivered')).toEqual([])
+      await f.e.until(() => f.e.textCalls().length === 3)
+      expect(f.lines()).toHaveLength(2)
+      f.e.p().keyHook = undefined; f.e.p().autoReceipt = true
+      await f.e.until(() => f.e.queue.openCount('alpha') === 0)
+      await f.e.accept('next item')
+      f.e.p().keyHook = params => params.no_enter ? errSpawnNotFound() : undefined
+      await f.e.tick()
+      expect(f.lines()).toHaveLength(3)
+    } finally { await f.cleanup() }
+  })
+
+  test.each(['legacy', 'covered'] as const)('an intervening released Memory Hold delivered through %s resets a later item refusal episode without changing delivery', async transport => {
+    const f = await fixture()
+    try {
+      const held = await noticeHold(f.r)
+      const later = await f.e.accept('later item')
+      let refusals = 0
+      f.e.p().keyHook = params => params.no_enter && params.text === 'later item' && refusals++ < 2 ? errSpawnNotFound() : undefined
+      await f.e.tick()
+      expect(f.e.records().filter(r => r.kind === 'refused' && r.seq === later.accepted.seq)).toHaveLength(1)
+      expect(f.e.queue.item('alpha', held.accepted.seq)?.delivered).toBe(false)
+      let coveredCalls = 0
+      if (transport === 'covered') {
+        f.e.p().row.busy_send = 'covered'
+        const client = f.e.client(), rawSend = client.sendKeys.bind(client)
+        client.sendKeys = async params => {
+          if (!params.send_mode) return rawSend(params)
+          coveredCalls++
+          f.e.p().row.busy_send = 'not_covered'
+          return cannedBusyResult({ class: 'delivered_confirmed', final: true, reason: 'confirmed', wait: null })
+        }
+      }
+      await f.e.queue.resolveHolds('alpha', [{ seq: held.accepted.seq, outcome: 'released', at: f.e.clock.now() }])
+      await f.e.preparation.recover()
+      await f.e.until(() => f.e.records().filter(r => r.kind === 'refused' && r.seq === later.accepted.seq).length === 2)
+      const records = f.e.records()
+      const refusedAt = records.flatMap((r, n) => r.kind === 'refused' && r.seq === later.accepted.seq ? [n] : [])
+      const heldDeliveredAt = records.findIndex(r => r.kind === 'delivered' && r.seq === held.accepted.seq)
+      expect(refusedAt).toHaveLength(2)
+      expect(heldDeliveredAt).toBeGreaterThan(refusedAt[0]!)
+      expect(heldDeliveredAt).toBeLessThan(refusedAt[1]!)
+      expect(f.e.queue.item('alpha', held.accepted.seq)?.delivered).toBe(true)
+      expect(f.e.queue.item('alpha', later.accepted.seq)?.delivered).toBe(false)
+      f.e.p().keyHook = undefined
+      await f.e.until(() => f.e.queue.openCount('alpha') === 0)
+      expect(f.e.textCalls().filter(c => c.params.text === 'later item')).toHaveLength(3)
+      expect(f.e.events.flatMap(e => e.type === 'item-delivered' ? [e.seq] : [])).toEqual([held.accepted.seq, later.accepted.seq])
+      expect(f.e.records().filter(r => r.kind === 'refused' && r.seq === later.accepted.seq)).toHaveLength(2)
+      expect(coveredCalls).toBe(transport === 'covered' ? 1 : 0)
+      // The baseline reaches this assertion after both durable refusals and
+      // both receipt-backed deliveries, but retains the old log-only mark.
+      expect(f.lines().filter(line => line.includes('name=ErrSpawnNotFound'))).toHaveLength(2)
+    } finally { await f.cleanup() }
+  })
+
+  test('InvalidFlags logs before the version re-check that decides to stop', async () => {
+    const f = await fixture({ version: DEV_PLACEHOLDER_VERSION })
+    try {
+      await f.e.accept()
+      f.e.p().keyHook = params => params.no_enter ? errInvalidFlags('send-keys') : undefined
+      await f.e.tick()
+      expect(f.beforeKeyError[0]).toEqual(f.lines())
+      expect(f.lines()).toHaveLength(1)
+      expect(f.recheck.resolves).toHaveLength(1)
+      expect(f.recheck.stops).toHaveLength(1)
+    } finally { await f.cleanup() }
+  })
+
+  test.each(refusals)('%s Enter stays outside this text-only diagnostic change', async (_label, error) => {
+    const f = await fixture()
+    try {
+      await f.e.accept()
+      f.e.p().keyHook = params => params.key === 'Enter' ? error() : undefined
+      await f.e.tick(); await f.e.advance(ENTER_DELAY_MS)
+      expect(f.e.keyCalls().filter(c => c.params.key === 'Enter')).toHaveLength(1)
+      expect(f.e.records().filter(r => r.kind === 'refused')).toEqual([])
+      expect(f.lines()).toEqual([])
+      expect(f.recovery.errors.filter(line => line.startsWith('[slack] reconnectMcp:'))).toEqual([])
+    } finally { await f.cleanup() }
+  })
+})
 
 describe('b.6cg abandonment reporting', () => {
   async function abandon(r: DeliveryNoticeHarness, item: QueueItem) {

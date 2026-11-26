@@ -10,7 +10,8 @@ import { errCallTimeout, errInstanceIdCollision, errSubmissionUnconfirmed, errTm
 import { installRecoverySubmissionInputServices, makeRecoveryHarness, personaOf, personaRow } from './test-helpers/recovery-harness.ts'
 import { makeInputHoldFixture } from './test-helpers/ad-input-holds.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
-import { buildAdInputHoldNotice } from '../src/ad-input-notices.ts'
+import { buildAdInputHoldNotice, buildAdInputOutcomeLine } from '../src/ad-input-notices.ts'
+import { submissionUnconfirmedFactsOf } from '../src/ad-error-class.ts'
 import { errTmuxUnresponsive } from './test-helpers/agent-director-stub.ts'
 import { makeQueue } from './test-helpers/delivery-queue.ts'
 import ts from 'typescript'
@@ -116,6 +117,7 @@ describe('reconnect native submission refusal', () => {
     expect((await f.run()).outcome).toBe('transient')
     expect(f.getsAfterError()).toBe(1)
     const timeline = f.timeline.length
+    expect(f.h.errors.filter(line => line.startsWith('[slack] reconnect:'))).toEqual([buildAdInputOutcomeLine({ personaRef: `persona=${f.key}`, site: 'reconnect', facts: submissionUnconfirmedFactsOf(errSubmissionUnconfirmed(noInput), 'text')!, state: 'waiting' })])
     f.row.state = 'working'; await f.run()
     expect(f.h.stub.calls.sendKeysCalls).toHaveLength(1)
     f.row.state = 'waiting'
@@ -128,6 +130,7 @@ describe('reconnect native submission refusal', () => {
   test('validated not_started Enter retains its successful text and never retypes it', async () => {
     const f = fixture('enter', noInput)
     expect((await f.run()).outcome).toBe('transient')
+    expect(f.h.errors.filter(line => line.startsWith('[slack] reconnect:'))).toEqual([buildAdInputOutcomeLine({ personaRef: `persona=${f.key}`, site: 'reconnect', facts: submissionUnconfirmedFactsOf(errSubmissionUnconfirmed(noInput), 'enter')!, state: 'waiting' })])
     expect((await f.run()).outcome).toBe('ok')
     expect(f.h.stub.calls.sendKeysCalls.map(p => p.text ?? p.key)).toEqual([command, 'Enter', 'Enter'])
     expect(f.life().reconnectInput(f.key)).toBeUndefined()

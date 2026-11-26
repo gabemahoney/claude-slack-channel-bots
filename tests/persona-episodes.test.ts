@@ -205,6 +205,7 @@ import {
   PERSONA_EPISODE_DEFAULT_MARK,
   PERSONA_EPISODE_KINDS,
   PERSONA_EPISODE_KIND_CONFLICT,
+  PERSONA_EPISODE_KIND_DELIVERY_INPUT_REFUSED,
   PERSONA_EPISODE_KIND_KILL_FAILURE,
   PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY,
   PERSONA_EPISODE_KIND_STUCK_LAUNCH,
@@ -494,6 +495,74 @@ describe('budgeted loss reference through episodes and the real notifier', () =>
       h.cleanup()
       rmSync(baseDir, { recursive: true, force: true })
     }
+  })
+})
+
+describe('delivery input refusal log-only episode adapter', () => {
+  const kinds = ['not_started', 'not-interactive', 'row-absent', 'invalid-flags'] as const
+  afterEach(() => {
+    expect(posts).toEqual([])
+    expect(lines).toEqual([])
+    expect(clock.pendingCount()).toBe(0)
+    episodes.close()
+  })
+
+  test('four bounded marks survive alternating refusals and are isolated by persona and item/part', () => {
+    const refused = episodes.deliveryInputRefusals
+    for (const kind of kinds) expect(refused.begin('alpha', 1, 1, kind)).toBe(true)
+    for (const kind of [...kinds].reverse()) expect(refused.begin('alpha', 1, 1, kind)).toBe(false)
+    expect(refused.begin('beta', 1, 1, kinds[0])).toBe(true)
+    expect(refused.begin('alpha', 1, 2, kinds[0])).toBe(true)
+    expect(refused.begin('alpha', 2, 1, kinds[0])).toBe(true)
+    expect(refused.begin('alpha', 2, 1, kinds[0])).toBe(false)
+    expect(refused.begin('beta', 1, 1, kinds[0])).toBe(false)
+  })
+
+  test('retarget ends only a different case without claiming marks, including a target that never refuses', () => {
+    const refused = episodes.deliveryInputRefusals
+    expect(refused.begin('alpha', 2, 1, kinds[0])).toBe(true)
+    expect(refused.begin('beta', 2, 1, kinds[0])).toBe(true)
+    refused.retarget('alpha', 2, 1)
+    expect(refused.begin('alpha', 2, 1, kinds[0])).toBe(false)
+    refused.retarget('alpha', 1, 1)
+    expect(episodes.view('alpha', PERSONA_EPISODE_KIND_DELIVERY_INPUT_REFUSED)).toBeUndefined()
+    refused.retarget('alpha', 3, 1)
+    expect(episodes.view('alpha', PERSONA_EPISODE_KIND_DELIVERY_INPUT_REFUSED)).toBeUndefined()
+    expect(refused.begin('alpha', 2, 1, kinds[0])).toBe(true)
+    refused.retarget('alpha', 2, 2)
+    expect(episodes.view('alpha', PERSONA_EPISODE_KIND_DELIVERY_INPUT_REFUSED)).toBeUndefined()
+    expect(refused.begin('alpha', 2, 2, kinds[0])).toBe(true)
+    refused.end('alpha', 1); refused.end('alpha', 2, 1)
+    expect(refused.begin('alpha', 2, 2, kinds[0])).toBe(false)
+    expect(refused.begin('beta', 2, 1, kinds[0])).toBe(false)
+    episodes.close()
+    refused.retarget('alpha', 9, 1)
+    expect(episodes.view('alpha', PERSONA_EPISODE_KIND_DELIVERY_INPUT_REFUSED)).toBeUndefined()
+  })
+
+  test.each(['success', 'delivery', 'abandonment', 'forget', 'forgetAll', 'reporter-forget'] as const)('%s clears matching marks without clearing another persona or an unrelated item', ending => {
+    const refused = episodes.deliveryInputRefusals
+    expect(refused.begin('alpha', 12, 2, kinds[0])).toBe(true)
+    expect(refused.begin('beta', 12, 2, kinds[0])).toBe(true)
+    refused.end('alpha', 1); refused.end('alpha', 12, 1)
+    expect(refused.begin('alpha', 12, 2, kinds[0])).toBe(false)
+    if (ending === 'success') refused.end('alpha', 12, 2)
+    else if (ending === 'delivery' || ending === 'abandonment') refused.end('alpha', 12)
+    else if (ending === 'forget') episodes.forget('alpha')
+    else if (ending === 'forgetAll') episodes.forgetAll()
+    else refused.end('alpha')
+    expect(refused.begin('alpha', 12, 2, kinds[0])).toBe(true)
+    expect(refused.begin('beta', 12, 2, kinds[0])).toBe(ending === 'forgetAll')
+  })
+
+  test('close refuses every later mark, while a fresh server registry may report the retained item again', () => {
+    expect(episodes.deliveryInputRefusals.begin('alpha', 1, 1, kinds[0])).toBe(true)
+    episodes.close()
+    episodes.deliveryInputRefusals.end('alpha')
+    expect(episodes.deliveryInputRefusals.begin('alpha', 1, 1, kinds[0])).toBe(false)
+    const fresh = createPersonaEpisodes({ clock, log: line => lines.push(line), sink: (_key, text) => { posts.push({ key: _key, text }) } })
+    try { expect(fresh.deliveryInputRefusals.begin('alpha', 1, 1, kinds[0])).toBe(true) }
+    finally { fresh.close() }
   })
 })
 

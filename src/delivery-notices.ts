@@ -5,6 +5,7 @@ import { buildMessageAbandonedLine } from './persona-diagnostics.ts'
 import { correctPostedNotice, type OriginalConversationPoster, type NoticeCorrectionOutcome } from './notice-correction.ts'
 import type { DeliveryEngineEvent, DeliveryReason, DeliveryStatus } from './delivery-engine.ts'
 import type { PersonaEpisodes } from './persona-episodes.ts'
+import { buildAdInputOutcomeLine, buildAdDeliveryRefusalLine } from './ad-input-notices.ts'
 import { CONFLICT_NOTICE_HUMAN_ONLY_LINE } from './conflict-latch.ts'
 import { DELIVERY_STUCK_AFTER_MS } from './delivery-constants.ts'
 import { escapeSlackControlCharacters } from './slack-text-escape.ts'
@@ -265,6 +266,23 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
   }
   function engineEvent(event: DeliveryEngineEvent): void {
     const key = event.key
+    if (event.type === 'input-target-changed') {
+      deps.episodes.deliveryInputRefusals.retarget(key, event.seq, event.part)
+      return
+    }
+    if (event.type === 'input-call-succeeded') {
+      deps.episodes.deliveryInputRefusals.end(key, event.seq, event.part)
+      return
+    }
+    if (event.type === 'input-refused') {
+      const { refusal } = event
+      if (deps.episodes.deliveryInputRefusals.begin(key, event.seq, event.part, refusal.kind)) {
+        deps.log(refusal.kind === 'not_started'
+          ? buildAdInputOutcomeLine({ personaRef: key, site: 'delivery', facts: refusal.facts })
+          : buildAdDeliveryRefusalLine(key, refusal.kind))
+      }
+      return
+    }
     if (event.type === 'launch-observed' || event.type === 'launch-first-waiting') {
       deps.log(`[slack] delivery-${event.type}: ${JSON.stringify({ key, session_id: event.sessionId, at: event.at })}`)
       return
@@ -279,6 +297,7 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
     const identity = deliveryIdentity(item.accepted), id = `${key}:${event.seq}`
     if (event.type === 'item-abandoned') {
       if (!item.abandoned || abandoned.has(id)) return
+      deps.episodes.deliveryInputRefusals.end(key, event.seq)
       abandoned.add(id); recoveredQueued.delete(id)
       protect(() => deps.log(buildMessageAbandonedLine(ref(key), item.accepted, event.at)))
       const head = heads.get(key), reported = head === undefined ? undefined : deps.queue.item(key, head)
@@ -291,6 +310,7 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
     if (item.abandoned) return
     if (event.type === 'item-delivered') {
       if (!item.delivered || completed.has(id)) return
+      deps.episodes.deliveryInputRefusals.end(key, event.seq)
       completed.add(id)
       receivedItem(key, item)
       log(MESSAGE_DELIVERED, key, identity, `at=${event.at} wait_ms=${event.waitMs}`)
@@ -328,6 +348,7 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
     deps.episodes.post(key, 'delivery-stuck', buildDeliveryStuckNotice(ref(key), key, status.count, status.ageMs, reason, status.retypeCount + 1, !!status.partialReceipt))
   }
   return { received: (key: string, item: QueueItem, mode: 'live' | 'recovered' = 'live') => protect(() => receivedItem(key, item, mode)), holdStored: (key: string) => protect(() => holdStored(key)), reconcileQueued: (key: string) => protect(() => reconcileQueued(key)), queueEvent: (event: QueueEvent) => protect(() => queueEvent(event)), engineEvent: (event: DeliveryEngineEvent) => protect(() => engineEvent(event)), startupFindings, forget(key: string) {
+    deps.episodes.deliveryInputRefusals.end(key)
     for (const warning of storageWarnings.get(key) ?? []) warning.dispose()
     for (const dispose of originalPosts.get(key) ?? []) dispose()
     failures.delete(key); unwritable.delete(key); heads.delete(key)

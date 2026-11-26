@@ -15,6 +15,7 @@ import { appendTranscript, codexPromptEntry, endedTurn, promptEntry, replyEntry,
 
 export async function makeEngineHarness(options: { onInfo?(key: string, message: string): void; keys?: string[]; constants?: DeliveryEngineDeps['constants']; stateDir?: string; queue?: DeliveryQueue; queueFs?: DeliveryQueueOptions['fs']; configuredAgent?: 'claude' | 'codex'; clientFor?: DeliveryEngineDeps['clientFor']; isUp?: DeliveryEngineDeps['isUp']; onRow?: DeliveryEngineDeps['onRow']; inspectUpgrade?: DeliveryEngineDeps['inspectUpgrade']; refreshTranscript?: DeliveryEngineDeps['refreshTranscript']; onEvent?: DeliveryEngineDeps['onEvent']; onCoveredBlocked?: DeliveryEngineDeps['onCoveredBlocked']
   onSubmissionUnconfirmed?: DeliveryEngineDeps['onSubmissionUnconfirmed']
+  onKeyError?: DeliveryEngineDeps['onKeyError']
   receiptReader?: DeliveryEngineDeps['receiptReader']
   inputHolds?: DeliveryEngineDeps['inputHolds']
   /** Preparation's Slack client and name lookup, withdrawal time, log, persona and part limit; `clientFor` above is the engine's AD client. */
@@ -89,7 +90,7 @@ export async function makeEngineHarness(options: { onInfo?(key: string, message:
       isRestartPendingOrActive: key => personas.get(key)?.state.restartPending ?? false, scheduleRestart: (key, cwd) => restarts.push({ key, cwd }),
       reconnect: async (key, _client, beforeCall) => { beforeCall(); calls.push({ key, verb: 'reconnect', at: clock.now(), params: {} }) },
       onInfo: options.onInfo, onCoveredBlocked: options.onCoveredBlocked, onSubmissionUnconfirmed: options.onSubmissionUnconfirmed, onRow: options.onRow, inspectUpgrade: options.inspectUpgrade, refreshTranscript: options.refreshTranscript, onEvent: event => { events.push(event); options.onEvent?.(event) }, onError: (_key, error) => errors.push(error),
-      onKeyError: async (_key, error) => { errors.push(error) },
+      onKeyError: options.onKeyError ?? (async (_key, error) => { errors.push(error) }),
     })
   }
   build()

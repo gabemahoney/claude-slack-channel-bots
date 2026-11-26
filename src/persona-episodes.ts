@@ -41,6 +41,10 @@
  *   `end` clears only that channel's mark when its stamp reads decided, and
  *   closes the episode when no marks remain. Neither calls the notice sink.
  *   The shared `forget`, `forgetAll` and `close` clear these marks too.
+ * - `deliveryInputRefusals` claims log-only marks for the delivery reporter:
+ *   case `seq:part`, at most four text refusal kinds, until successful input,
+ *   matching completion/abandonment or central cleanup. A reported target
+ *   change closes a different case even without a refusal, claiming nothing.
  * - `teardownWindowState(key)` reads the injected teardown query (
  * ; production: the persona notifier's `teardownWindowState`).
  *
@@ -337,6 +341,7 @@ import {
   type KillFailureAlertContext,
 } from './kill-failure-alert.ts'
 import type { KillRetryAlert } from './kill-retry.ts'
+import type { DeliveryTextRefusal } from './delivery-engine.ts'
 import { describeThrownValue, isSafeIdentifier } from './persona-connection-errors.ts'
 import { SYSTEM_PERSONA_CONNECTION_CLOCK, type PersonaConnectionClock } from './persona-connections.ts'
 import { personaInstanceId, personaTmuxSessionName, quotedPersonaSessionName } from './persona-identity.ts'
@@ -481,6 +486,8 @@ export const PERSONA_EPISODE_KIND_STUCK_LAUNCH = 'stuck-launch'
 
 /** Log-only intake diagnostic, with a separate mark for each undecided channel. */
 export const PERSONA_EPISODE_KIND_THREAD_STAMP_UNDECIDED = 'thread-stamp-undecided'
+/** Log-only delivery text refusals, at most one mark per kind for an item/part. */
+export const PERSONA_EPISODE_KIND_DELIVERY_INPUT_REFUSED = 'delivery-input-refused'
 
 /** First append/creation failure until every kept fact is saved; Thread Memory
  * reporting opens notice-only append failures silently. A silent outage that
@@ -523,6 +530,7 @@ export const PERSONA_EPISODE_KINDS = [
   PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY,
   PERSONA_EPISODE_KIND_STUCK_LAUNCH,
   PERSONA_EPISODE_KIND_THREAD_STAMP_UNDECIDED,
+  PERSONA_EPISODE_KIND_DELIVERY_INPUT_REFUSED,
   PERSONA_EPISODE_KIND_THREAD_MEMORY_NOT_SAVED,
   PERSONA_EPISODE_KIND_THREAD_MEMORY_UNREADABLE,
   PERSONA_EPISODE_KIND_THREAD_MEMORY_JOINS_LOST,
@@ -607,6 +615,15 @@ export interface ThreadStampUndecidedEpisodes {
   end(key: string, channel: string): void
 }
 
+export interface DeliveryInputRefusalEpisodes {
+  /** A different reported target ends the old case without opening one or claiming a mark. */
+  retarget(key: string, seq: number, part: number): void
+  /** Another item/part replaces the case. Claim before logging; never post to Slack. */
+  begin(key: string, seq: number, part: number, kind: DeliveryTextRefusal['kind']): boolean
+  /** End only the matching item/part; omitted identity is persona cleanup. */
+  end(key: string, seq?: number, part?: number): void
+}
+
 /** The latches of one server. */
 export interface PersonaEpisodes {
   /** Read-only shutdown gate for event consumers that also emit log-only diagnostics. */
@@ -615,6 +632,7 @@ export interface PersonaEpisodes {
   readonly clock: PersonaEpisodesClock
   /** Channel-scoped log marks owned here, cleared by forget, forgetAll and close. */
   readonly threadStampUndecided: ThreadStampUndecidedEpisodes
+  readonly deliveryInputRefusals: DeliveryInputRefusalEpisodes
   /**
    * Open the persona's episode of this kind, or keep the open one. A case
    * that differs from the open episode's begins a new episode; no case, or
@@ -797,6 +815,26 @@ export function createPersonaEpisodes(deps: PersonaEpisodesDeps): PersonaEpisode
 
   const episodes: PersonaEpisodes = {
     clock,
+
+    deliveryInputRefusals: {
+      retarget(key, seq, part) {
+        const kind = PERSONA_EPISODE_KIND_DELIVERY_INPUT_REFUSED, current = open(key, kind)
+        if (current && current.caseLabel !== `${seq}:${part}`) episodes.end(key, kind)
+      },
+      begin(key, seq, part, mark) {
+        const kind = PERSONA_EPISODE_KIND_DELIVERY_INPUT_REFUSED
+        if (episodes.begin(key, kind, `${seq}:${part}`) === 'closed') return false
+        const current = open(key, kind)!
+        if (current.posted.has(mark)) return false
+        current.posted.add(mark)
+        return true
+      },
+      end(key, seq, part) {
+        const kind = PERSONA_EPISODE_KIND_DELIVERY_INPUT_REFUSED, current = open(key, kind)
+        if (!current || seq !== undefined && (part === undefined ? !current.caseLabel?.startsWith(`${seq}:`) : current.caseLabel !== `${seq}:${part}`)) return
+        episodes.end(key, kind)
+      },
+    },
 
     threadStampUndecided: {
       begin(key, channel) {

@@ -10,9 +10,30 @@ import { escapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeNotifierHarness } from './test-helpers/persona-notifier.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
+import { buildAdDeliveryRefusalLine, buildAdInputOutcomeLine } from '../src/ad-input-notices.ts'
+import { submissionUnconfirmedFactsOf } from '../src/ad-error-class.ts'
+import { errSubmissionUnconfirmed } from './test-helpers/agent-director-stub.ts'
 
 const cleanups: Array<() => void | Promise<void>> = []
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup() })
+
+test.each([
+  ['not-interactive', 'read-before-retry', 'STATE', 'ErrSpawnNotInteractive', ' for existing row recheck and guarded retry'],
+  ['row-absent', 'read-before-retry', 'STATE', 'ErrSpawnNotFound', ' for existing row recheck and guarded retry'],
+  ['invalid-flags', 'version-recheck', 'UNCLASSIFIED', 'ErrInvalidFlags', '; existing version recheck and retry handling follow'],
+] as const)('%s delivery refusal has one literal metadata-only line', (kind, next, cls, name, ending) => {
+  const line = buildAdDeliveryRefusalLine('alpha', kind)
+  expect(line).toBe(`[slack] delivery: alpha outcome=refused step=text next=${next} class=${cls} name=${name} — AD refused this text call; delivery retained${ending}`)
+  expect(line).not.toMatch(/no input attempted|dead session|item=|part=/)
+  assertNoLeak(line)
+})
+
+test('validated not_started retains the existing outcome builder wording without stale state', () => {
+  const facts = submissionUnconfirmedFactsOf(errSubmissionUnconfirmed({ outcome: 'not_started', keys_sent: false, submission_confirmed: false, enter_may_have_been_sent: false }), 'text')!
+  const line = buildAdInputOutcomeLine({ personaRef: 'alpha', site: 'delivery', facts })
+  expect(line).toBe('[slack] delivery: alpha outcome=not_started step=text next=read-before-retry — no input attempted for this call; read AD before retry')
+  assertNoLeak(line)
+})
 
 test('hold notice pins the human release procedure and delivery-only review procedure', async () => {
   const n = await import('../src/ad-input-notices.ts')

@@ -1,4 +1,5 @@
 import type { SubmissionUnconfirmedFacts } from './ad-error-class.ts'
+import type { DeliveryTextRefusal } from './delivery-engine.ts'
 import { CONFLICT_NOTICE_HUMAN_ONLY_LINE } from './conflict-latch.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import { escapeSlackControlCharacters } from './slack-text-escape.ts'
@@ -17,4 +18,10 @@ export function buildAdInputOutcomeLine(input: { readonly personaRef: string; re
 }
 export function buildAdInputHoldClearedLine(personaRef: string, reason: 'new-launch' | 'operator'): string {
   return `[slack] input hold cleared: ${renderLogMessageText(personaRef)} reason=${reason}`
+}
+/** Definite delivery text refusals; never an input-custody or dead-session verdict. */
+export function buildAdDeliveryRefusalLine(personaRef: string, kind: Exclude<DeliveryTextRefusal['kind'], 'not_started'>): string {
+  const invalid = kind === 'invalid-flags'
+  const name = invalid ? 'ErrInvalidFlags' : kind === 'not-interactive' ? 'ErrSpawnNotInteractive' : 'ErrSpawnNotFound'
+  return `[slack] delivery: ${renderLogMessageText(personaRef)} outcome=refused step=text next=${invalid ? 'version-recheck' : 'read-before-retry'} class=${invalid ? 'UNCLASSIFIED' : 'STATE'} name=${name} — AD refused this text call; delivery retained${invalid ? '; existing version recheck and retry handling follow' : ' for existing row recheck and guarded retry'}`
 }

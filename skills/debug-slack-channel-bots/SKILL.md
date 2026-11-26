@@ -2063,6 +2063,32 @@ Outcome lines use `[slack] reconnect:` or `[slack] delivery:`
 with `outcome`, `step`, `next` and, when available, validated AD `state`.
 They contain metadata only, with no message/draft text or raw error details.
 Only validated `not_started` says `no input attempted for this call`.
+For a delivery text call, its line omits `state` rather than repeating a
+state read before the refusal. These text refusals also have log-only lines:
+
+| Line | Meaning, cause and next step |
+|---|---|
+| `[slack] delivery: <key> outcome=not_started step=text next=read-before-retry — no input attempted for this call; read AD before retry` | AD supplied validated no-input facts for this text call. Delivery is retained; CSCB reads AD before a guarded retry. |
+| `[slack] delivery: <key> outcome=refused step=text next=read-before-retry class=STATE name=ErrSpawnNotInteractive — AD refused this text call; delivery retained for existing row recheck and guarded retry` | AD would not accept this text call as interactive. CSCB retains the item and rechecks AD before acting; the refusal itself gives no dead-session verdict. |
+| `[slack] delivery: <key> outcome=refused step=text next=read-before-retry class=STATE name=ErrSpawnNotFound — AD refused this text call; delivery retained for existing row recheck and guarded retry` | AD refused the text call because its instance lookup failed. The item remains queued; the existing AD recheck and guarded retry decide what follows. |
+| `[slack] delivery: <key> outcome=refused step=text next=version-recheck class=UNCLASSIFIED name=ErrInvalidFlags — AD refused this text call; delivery retained; existing version recheck and retry handling follow` | AD rejected the call's flags. CSCB logs before its one immediate version re-check, which may stop the server; otherwise existing retry handling continues with the item retained. See [Found while the server was running](#found-while-the-server-was-running). |
+
+Here `<key>` is the persona key. All four lines contain metadata only: no
+message, draft or raw error details. They are delivery-text diagnostics,
+distinct from reconnect's [dead-session lines](#a-row-that-reads-working-while-the-instance-sits-idle).
+They add no warning that automatic resend is paused.
+
+For each persona and queued item/part, each of these four refusal kinds logs
+once during an unsuccessful-input episode, including when kinds alternate.
+Retries still run with their existing backoff and save each definite text
+refusal. A reported target change to another item/part resets the episode,
+even if the intervening target never refuses. That change logs nothing and
+claims no refusal mark. Successful input for that part, delivery or
+abandonment of that item, or persona cleanup also resets the episode. Server
+shutdown clears it; a fresh server run may log the first refusal again.
+These lines cover text calls only; a refused Enter retains the preceding
+text under the existing delivery rules.
+
 `[slack] input hold cleared: … reason=new-launch` reports release by an
 observed new launch; it says nothing about delivery of a queued message.
 
@@ -3229,6 +3255,11 @@ outcomes use the `[slack] reconnect:` diagnostic described above; other
 failures use the `reconnectMcp:` lines below. A transient refusal may retry
 after its blocker clears and all guards pass. An outage still posts its own
 notice: see [agent-director refuses a persona: it is retried on its own](#agent-director-refuses-a-persona-it-is-retried-on-its-own).
+
+Delivery text refusals use the separate `[slack] delivery:` lines in
+[Uncertain input and retained delivery](#uncertain-input-and-retained-delivery).
+Those retained-item diagnostics do not carry the reconnect table's
+`dead session (row-not-interactive)` or `dead session (row-absent)` verdicts.
 
 | Line | Meaning |
 |---|---|
