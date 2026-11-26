@@ -39,14 +39,19 @@ FMK_TEXTS="${SCENARIO_FIXTURES}/fmk-texts.ts"
 # Diagnostic stream only: reuse the shim decoder and recorded process windows.
 # NUL framing carries raw values to the redactor on stdin, never in argv.
 pn_evidence_rows() {
-    local lines=() i role time kind pid ppid verb id rejected
+    local lines=() i role time kind pid ppid verb id rejected line byte_end=0 end_field
+    local LC_ALL=C # original byte offsets, never redacted character counts
     _scenario_record_load "${SCENARIO_CSCB_RECORD}"
     # shellcheck disable=SC2031 # shared shim path; sourced setup assigns it in the caller too
-    [[ ! -f "${SCENARIO_AD_SHIM_LOG}" ]] || mapfile -t lines < "${SCENARIO_AD_SHIM_LOG}"
+    [[ ! -f "${SCENARIO_AD_SHIM_LOG}" ]] || mapfile lines < "${SCENARIO_AD_SHIM_LOG}"
     for i in "${!lines[@]}"; do
+        byte_end=$(( byte_end + ${#lines[i]} ))
+        end_field=""
+        [[ "${lines[i]}" != *$'\n' ]] || end_field="${byte_end}"
+        line="${lines[i]%$'\n'}"
         (( i + 1 >= PN_EVIDENCE_FROM && i + 1 <= PN_EVIDENCE_TO )) || continue
         role=other time="" kind="" pid="" ppid="" verb="" id="" rejected=""
-        if _scenario_split_line "${lines[i]}"; then
+        if _scenario_split_line "${line}"; then
             time="$(_scenario_us_text "${_L_US}")" kind="${_L_KIND}" pid="${_L_PID}" ppid="${_L_PPID}"
             _scenario_role_at "${_L_PPID}" "${_L_US}" && role=cscb
             if [[ "${_L_KIND}" == call ]] && _scenario_decode_words; then
@@ -54,12 +59,12 @@ pn_evidence_rows() {
                 _scenario_ad_id
                 verb="${_L_VERB}" id="${_L_ID}"
             elif [[ "${_L_KIND}" == call ]]; then
-                rejected="${lines[i]}"
+                rejected="${line}"
             fi
         else
-            rejected="${lines[i]}"
+            rejected="${line}"
         fi
-        printf '%s\0' "$(( i + 1 ))" "${time}" "${kind}" "${pid}" "${ppid}" "${verb}" "${id}" "${role}" "${rejected}"
+        printf '%s\0' "$(( i + 1 ))" "${time}" "${kind}" "${pid}" "${ppid}" "${verb}" "${id}" "${role}" "${rejected}" "${end_field}"
     done
 }
 
@@ -73,7 +78,8 @@ latch_failure_evidence() {
     local -A recorded_dirs=()
     local PN_EVIDENCE_FROM=1 PN_EVIDENCE_TO
     local LATCH_EVIDENCE_OUTPUT="$1"
-    export LATCH_EVIDENCE_OUTPUT SCENARIO_FIXTURES
+    # shellcheck disable=SC2031 # the caller-selected path, as in pn_evidence_rows
+    export LATCH_EVIDENCE_OUTPUT SCENARIO_FIXTURES SCENARIO_AD_ROOT SCENARIO_AD_SHIM_LOG
     # shellcheck disable=SC2031 # shared shim path, as in pn_evidence_rows
     [[ ! -f "${SCENARIO_AD_SHIM_LOG}" ]] || mapfile -t shim_lines < "${SCENARIO_AD_SHIM_LOG}"
     PN_EVIDENCE_TO="${#shim_lines[@]}"
@@ -89,7 +95,9 @@ latch_failure_evidence() {
                 printf '%s\0' entry "${record_name}" "${record_key}" "${latch_values[${record_key}]}"
             done
         done
-        printf '%s\0' scalar LATCH_PID "" "${LATCH_PID:-}" scalar LATCH_LIFE_MARK "" "${LATCH_LIFE_MARK}" scalar INTERVAL_US "" "${INTERVAL_US:-}"
+        for record_name in LATCH_PID LATCH_LIFE_MARK INTERVAL_US RELABEL_EVENTS_MARK RELABEL_EVENTS_MS RELABEL_CALLERS_MARK; do
+            printf '%s\0' scalar "${record_name}" "" "${!record_name:-}"
+        done
         for log_dir in ${_SCENARIO_STATE_DIRS[@]+"${_SCENARIO_STATE_DIRS[@]}"} "${SLACK_STATE_DIR:-}"; do
             [[ -n "${log_dir}" && -z "${recorded_dirs[${log_dir}]:-}" ]] || continue
             recorded_dirs[${log_dir}]=1
@@ -107,7 +115,8 @@ latch_failure_evidence() {
             const { redactSlackLogText } = await import(pkg + "/src/slack-log-redaction.ts");
             const rejected = value => fixtureEvidenceRow({ rejected: value }, redactSlackLogText).rejected;
             const safe = (value, pattern) => value == null || value === "" ? null :
-                pattern.test(value) && redactSlackLogText(value) === value ? value : rejected(value);
+                typeof value === "string" && pattern.test(value) && redactSlackLogText(value) === value ? value :
+                    rejected(typeof value === "string" ? value : JSON.stringify(value));
             const words = values => ({ test: value => values.split(" ").includes(value) });
             const integer = /^[0-9]+$/, stamp = /^[0-9]+\.[0-9]{6}$/, keyPattern = /^[a-z0-9_]{1,59}$/, idPattern = /^cscb_[a-z0-9_]{1,59}$/;
             const verbs = words("help spawn status get get-many send-keys read-pane kill decide get-permission record-pane-answer resume sweep find-missing expire make-template list list-subagents pause version hook");
@@ -133,7 +142,7 @@ latch_failure_evidence() {
                     } catch { console.error("latch-evidence: server log unavailable"); }
                     continue;
                 }
-                if (!words("LATCH_MARK LATCH_US LATCH_SET_US PERSONA_ID LATCH_PID LATCH_LIFE_MARK INTERVAL_US").test(name)) continue;
+                if (!words("LATCH_MARK LATCH_US LATCH_SET_US PERSONA_ID LATCH_PID LATCH_LIFE_MARK INTERVAL_US RELABEL_EVENTS_MARK RELABEL_EVENTS_MS RELABEL_CALLERS_MARK").test(name)) continue;
                 if (kind === "array") records[name] = {};
                 else if (kind === "unset") records[name] = null;
                 else if (kind === "scalar") records[name] = safe(value, integer);
@@ -142,13 +151,48 @@ latch_failure_evidence() {
             write("latch-records.json", JSON.stringify(records) + "\n");
             write("server-logs.json", JSON.stringify(servers) + "\n");
             const rows = [];
-            for (; i + 8 < fields.length; i += 9) {
-                const [line, time, kind, pid, ppid, verb, id, role, invalid] = fields.slice(i, i + 9);
-                rows.push({ line: safe(line, integer), time: safe(time, stamp), kind: safe(kind, words("call stop")),
+            for (; i + 9 < fields.length; i += 10) {
+                const [line, time, kind, pid, ppid, verb, id, role, invalid, byteEnd] = fields.slice(i, i + 10);
+                rows.push({ line: safe(line, integer), byte_end: safe(byteEnd, integer), time: safe(time, stamp), kind: safe(kind, words("call fault stop")),
                     pid: safe(pid, integer), ppid: safe(ppid, integer), verb: safe(verb, verbs),
                     id: safe(id, idPattern), role: safe(role, words("cscb other")), ...(invalid ? { invalid: rejected(invalid) } : {}) });
             }
             write("agent-director-shim.jsonl", rows.map(row => JSON.stringify(row) + "\n").join(""));
+            // Independent, best-effort projections; never copy raw event
+            // parameters or malformed completion text into kept evidence.
+            const project = (path, name, decode) => {
+                try {
+                    const root = realpathSync(process.env.SCENARIO_ROOT), real = realpathSync(path);
+                    if (!real.startsWith(root + sep) || !statSync(real).isFile()) throw new Error();
+                    const lines = readFileSync(real, "utf8").split("\n"), projected = [];
+                    for (const [i, line] of lines.entries()) {
+                        if (!line && i === lines.length - 1) continue;
+                        const row = decode(line, String(i + 1), i < lines.length - 1);
+                        if (row) projected.push(row);
+                    }
+                    write(name, projected.map(row => JSON.stringify(row) + "\n").join(""));
+                } catch { write(name, JSON.stringify({ unavailable: true }) + "\n"); }
+            };
+            project(process.env.SCENARIO_AD_SHIM_LOG + ".ends", "agent-director-shim.ends.jsonl", (text, line, complete) => {
+                const parts = text.split("\t");
+                if (!complete || parts.length !== 6 || parts[0] !== "end-v1" ||
+                    !/^[0-9]{1,12}\.[0-9]{6}$/.test(parts[1]) || !/^[1-9][0-9]{0,17}$/.test(parts[2]) ||
+                    !/^[1-9][0-9]{0,9}$/.test(parts[3]) || !/^[0-9]{1,10}$/.test(parts[4]) ||
+                    !/^[0-9]{1,12}\.[0-9]{6}$/.test(parts[5])) return { line, invalid: rejected(text), complete };
+                return { line, kind: "end-v1", end_upper: parts[1], byte_end: parts[2], pid: parts[3], ppid: parts[4], start: parts[5], complete };
+            });
+            const events = words("ad.find_missing.tick ad.spawn.state_transition ad.resume.observed ad.resume.moved_to_pending ad.resume.restored ad.spawn.reused ad.spawn.reuse_restored");
+            const states = words("pending waiting working ask_user check_permission ended missing");
+            const ids = new Set(Object.values(records.PERSONA_ID ?? {}).filter(id => idPattern.test(id)));
+            project(process.env.SCENARIO_AD_ROOT + "/ad-trail.jsonl", "ad-trail.jsonl", (text, line) => {
+                let row;
+                try { row = JSON.parse(text); } catch { return { line, invalid: rejected(text) }; }
+                if (!row || typeof row !== "object" || !ids.has(row.instance_id) || !events.test(row.event)) return null;
+                return { line, event: safe(row.event, events), instance_id: safe(row.instance_id, idPattern),
+                    source: safe(row.source, words("ad_recovery ad_find_missing ad_hook ad_resume ad_spawn ad_spawn_store ad_polling hook")),
+                    prior_state: safe(row.prior_state, states), new_state: safe(row.new_state, states),
+                    ts: safe(row.ts, /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z$/) };
+            });
         } catch { console.error("latch-evidence: unavailable"); }
     '
 }
@@ -184,7 +228,7 @@ pn_failure_evidence() {
             const emit = value => console.error("panegone-evidence: " + JSON.stringify(value));
             const fields = readFileSync(0, "utf8").split("\0");
             const rows = [];
-            for (let i = 0; i + 8 < fields.length; i += 9) {
+            for (let i = 0; i + 9 < fields.length; i += 10) {
                 const [line, time, kind, pid, ppid, verb, id, role, invalid] = fields.slice(i, i + 9);
                 rows.push({ line: safe(line, integer), time: safe(time, stamp), kind: safe(kind, words("call stop")),
                     pid: safe(pid, integer), ppid: safe(ppid, integer), verb: safe(verb, verbs),
@@ -2112,7 +2156,7 @@ p2_clearing_schedule() {
 # [harness] the find-missing loop started (LOOP_MARK). Its calls are the
 # harness's, never CSCB's.
 p2_relabel_events() {
-    local step="part 2: the relabelled legs' events" key n out
+    local step="part 2: the relabelled legs' events" key n out retained_pid
     local -A want=()
     for key in "${P2_RELABEL_KEYS[@]}"; do
         n="$(count_log "${STILL_LINE[${key}]}")"
@@ -2130,11 +2174,55 @@ p2_relabel_events() {
     for key in "${P2_RELABEL_KEYS[@]}"; do
         free_snapshot "${key}" "${want[${key}]}"
     done
-    # The agent-director shim's mark right before the events: from here to
-    # each leg's MISSING_MARK, every find-missing is checked (no CSCB one; the
-    # loop's marked the rows).
+    # Keep the event mark for the legacy window and diagnostics. From 0.18.0
+    # a CSCB call already in flight here can mark a row after the respawn.
     RELABEL_EVENTS_MARK="$(ad_shim_mark)"
-    if ad_release_at_least 0.18.0; then RELABEL_EVENTS_MS="$(date +%s%3N)"; fi
+    if ad_release_at_least 0.18.0; then
+        RELABEL_EVENTS_MS="$(date +%s%3N)"
+        require_ci_image relabel_callers_mark
+        require_scenario_home relabel_callers_mark
+        # The shim logs its own PID and execs AD in this container's PID
+        # namespace. Exclude only a prefix whose call PIDs are all absent
+        # BEFORE either worker ends. Keep reused/zombie PIDs and probe errors.
+        # Unlike pid_alive, this deliberately does not discard zombies.
+        # shellcheck disable=SC2031 # the caller-selected log, as in shim_verb_rows
+        out="$(python3 -I - "${SCENARIO_AD_SHIM_LOG}" "${RELABEL_EVENTS_MARK}" <<'PY'
+import errno, os, sys
+try:
+    with open(sys.argv[1], "rb") as stream:
+        lines = stream.read().split(b"\n")[:-1]
+    mark = int(sys.argv[2])
+    if not 0 <= mark <= len(lines):
+        raise ValueError()
+    bound = mark
+    for position, line in enumerate(lines[:mark], 1):
+        fields = line.split(b"\t")
+        if fields[0] != b"call":
+            continue
+        if len(fields) != 6 or not fields[2].isdigit() or int(fields[2]) <= 0:
+            raise ValueError()
+        try:
+            os.kill(int(fields[2]), 0)
+        except OSError as error:
+            if error.errno == errno.ESRCH:
+                continue
+        bound = position - 1
+        break
+    retained_pid = int(lines[bound].split(b"\t")[2]) if bound < mark else 0
+    print(bound, retained_pid, sep="\t")
+except (OSError, ValueError, OverflowError):
+    sys.exit("relabel caller probe unavailable")
+PY
+)" || fail "${step}: cannot bound the calls in flight before the events"
+        IFS=$'\t' read -r RELABEL_CALLERS_MARK retained_pid <<< "${out}"
+        printf '%s: %s: relabel probe: RELABEL_EVENTS_MARK=%s RELABEL_CALLERS_MARK=%s widened_by=%s RELABEL_EVENTS_MS=%s' \
+            "${TEST_NAME}" "${step}" "${RELABEL_EVENTS_MARK}" "${RELABEL_CALLERS_MARK}" \
+            "$(( RELABEL_EVENTS_MARK - RELABEL_CALLERS_MARK ))" "${RELABEL_EVENTS_MS}"
+        if (( RELABEL_CALLERS_MARK < RELABEL_EVENTS_MARK )); then
+            printf ' first_retained_line=%s first_retained_pid=%s' "$(( RELABEL_CALLERS_MARK + 1 ))" "${retained_pid}"
+        fi
+        printf '\n'
+    fi
     EVENT_TMUX_MARK[${R1_KEY}]="$(tmux_shim_mark)"
     out="$(respawn_worker_pane "${SEED_PANE[${R1_KEY}]}" sleep 86400)" || exit 1
     EVENT_TMUX_MARK[${R2_KEY}]="$(tmux_shim_mark)"
@@ -2771,18 +2859,18 @@ check_launch_start() {
     ad_trail_events ad.find_missing.tick "${id}" | sed "s/^/${TEST_NAME}: ${step}: [recorded] trail: /" || true
 }
 
-# check_relabel_marked <key>: from the legs' events (RELABEL_EVENTS_MARK) to
-# the harness read that showed the leg's row `missing` (MISSING_MARK), a
-# window holding only still-latched rounds: no CSCB find-missing in it, and
-# the harness's loop marked the row (at least one of its find-missing lines
-# in it); every find-missing line in it is logged with whose it was.
+# check_relabel_marked <key>: from 0.18.0, attribute the post-event missing
+# tick to every eligible CSCB/loop call, including calls in flight before
+# RELABEL_EVENTS_MARK. The PID probe excludes only a proven-ended prefix;
+# inside that window the helper's paired ends and ambiguity rule still apply.
+# Earlier releases keep the event-to-MISSING_MARK find-missing window below.
 check_relabel_marked() {
     local key="$1" step="part 2: $1's row marked missing" fm pos ppid role marked="" loop=0
     if ad_release_at_least 0.18.0; then
         local tick caller time verb
         tick="$(ad_missing_tick "${PERSONA_ID[${key}]}" "${RELABEL_EVENTS_MS}")" \
             || fail "${step}: no missing tick after the relabel events"
-        caller="$(ad_mark_caller "${tick}" "${RELABEL_EVENTS_MARK}")" \
+        caller="$(ad_mark_caller "${tick}" "${RELABEL_CALLERS_MARK}")" \
             || fail "${step}: no unambiguous eligible caller made the mark"
         while IFS=$'\t' read -r pos time ppid verb role; do
             [[ "${role}" == cscb || "${ppid}" == "${FIND_MISSING_LOOP_PID}" ]] \

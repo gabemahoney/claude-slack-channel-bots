@@ -71,7 +71,7 @@ function probe(calls: string[], labels: Record<string, string> = { service: 'csc
   ].join('\n')
   try {
     const result = spawnSync('bash', ['-c', script], {
-      env: hostSafeChildEnv(root, { tools: ['bash', 'jq', 'date', 'wc', 'tr', 'awk'] }), encoding: 'utf8', timeout: 10000,
+      env: hostSafeChildEnv(root, { tools: ['bash', 'jq', 'date', 'wc', 'tr', 'awk', 'python3'] }), encoding: 'utf8', timeout: 10000,
     })
     expect(result.error).toBeUndefined()
     expect(result.signal).toBeNull()
@@ -210,6 +210,187 @@ const endOf = (calls: string[], index: number, us: number) => {
   return ['end-v1', `1700000000.${String(us).padStart(6, '0')}`,
     Buffer.byteLength(calls.slice(0, index + 1).join('\n') + '\n'), fields[2], fields[3], fields[1]].join('\t') + '\n'
 }
+
+// Exercise the real event schedule and checker. Only process existence and
+// scenario actions are synthetic; the probe's Python and attribution run as-is.
+function relabelProbe(calls: string[], mark: number, alive: Record<string, string>, options: {
+  source?: string, ends?: (calls: string[]) => string, ticks?: number[], legacy?: boolean,
+} = {}) {
+  const tick = (ms: number) => JSON.stringify({ event: 'ad.find_missing.tick', instance_id: 'cscb_relabelone',
+    prior_state: 'waiting', new_state: 'missing', source: options.source ?? 'ad_recovery', ts: new Date(ms).toISOString() })
+  const fakePidSource = [
+    'import errno, os, sys', `states = ${JSON.stringify(alive)}`,
+    'def probe_pid(pid, signal):', '    assert signal == 0', '    state = states.get(str(pid), "dead")',
+    '    if state == "dead": raise ProcessLookupError(errno.ESRCH, "absent")',
+    '    if state == "unknown": raise PermissionError(errno.EPERM, "unavailable")',
+    '    assert state in ("alive", "zombie", "reused")',
+    'os.kill = probe_pid', 'exec(compile(sys.stdin.read(), "relabel-probe", "exec"))',
+  ].join('\n')
+  return probe(calls, undefined, [], undefined, false, { ends: options.ends, check: [
+    declaration('ad_missing_tick'), pnDeclaration('p2_relabel_events'), pnDeclaration('check_relabel_marked'),
+    '_scenario_role_at() { [[ "$1" == 42 || "$1" == 43 || "$1" == 199810 ]]; }',
+    'TEST_NAME=test-23 R1_KEY=relabelone R2_KEY=relabeltwo FIND_MISSING_LOOP_PID=216977 FIND_MISSING_LOOP_INTERVAL_S=30',
+    'P2_RELABEL_KEYS=(relabelone relabeltwo)',
+    'declare -A PERSONA_ID=([relabelone]=cscb_relabelone [relabeltwo]=cscb_relabeltwo)',
+    'declare -A STILL_LINE=([relabelone]=one [relabeltwo]=two) PERSONA_NAMED=([relabeltwo]=two)',
+    'declare -A SEED_PANE=([relabelone]=pane) SEED_SID=([relabelone]=one [relabeltwo]=two) EVENT_TMUX_MARK=()',
+    'declare -A MISSING_MARK=([relabelone]=999)',
+    `ad_release_at_least() { return ${options.legacy ? 1 : 0}; }`,
+    `ad_shim_mark() { echo ${mark}; }; tmux_shim_mark() { echo 0; }`,
+    'count_log() { echo "${ROUND_READY:-0}"; }; wait_rounds() { ROUND_READY=1; }; free_snapshot() { :; }',
+    'respawn_worker_pane() { echo "pane 216937"; }; end_session() { :; }; has_session_id() { :; }',
+    'find_missing_loop_runs() { echo 0; }; run_find_missing_loop() { :; }',
+    'date() { if [[ "$*" == +%s%3N ]]; then echo 1795629214320; else command date "$@"; fi; }',
+    `python3() { [[ "$1" == -I && "$2" == - ]] || exit 90; shift 2; command python3 -I -c ${quote(fakePidSource)} "$@"; }`,
+    `ad_trail_events() { printf '%s\n' ${(options.ticks ?? [1795629214350]).map(ms => quote(tick(ms))).join(' ')}; }`,
+    ...(options.legacy ? [
+      'check_no_cscb_find_missing() { [[ "$2" == 758 && "$3" == 999 ]] || exit 91; }',
+      `shim_verb_rows() { printf '759\t1795629214.390305\t216977\t-\n'; }`,
+    ] : []),
+    'p2_relabel_events', 'echo "relabel bound=${RELABEL_CALLERS_MARK:-unset}"', 'check_relabel_marked relabelone',
+  ].join('\n') })
+}
+
+// Times, invocation PIDs and parents are the kept job's records 751–760.
+// The unretained argv, tick, ends and prefix are explicitly synthetic.
+const relabelCalls = () => [
+  ...Array.from({ length: 750 }, () => 'call\t1795629200.000000\t10\t199810\tparent\tversion'),
+  ...[
+    ['1795629213.297158', 216797, 199810, 'list --label service=cscb'],
+    ['1795629213.899532', 216820, 199810, 'status --instance-id cscb_badname'],
+    ['1795629214.072224', 216830, 199810, 'status --instance-id cscb_relabelone'],
+    ['1795629214.099212', 216835, 199810, 'status --instance-id cscb_relabeltwo'],
+    ['1795629214.125388', 216840, 199810, 'status --instance-id cscb_nostart'],
+    ['1795629214.133279', 216846, 199810, 'get --instance-id cscb_nostart'],
+    ['1795629214.140210', 216859, 199810, 'resume --instance-id cscb_nostart'],
+    ['1795629214.296983', 216914, 199810, 'list --label service=cscb'],
+    ['1795629214.390305', 216986, 216977, 'find-missing'],
+    ['1795629215.297420', 217065, 199810, 'list --label service=cscb'],
+  ].map(([time, pid, parent, args]) => `call\t${time}\t${pid}\t${parent}\tparent\t${args}`),
+]
+const relabelEnd = (calls: string[], index: number, time: string) => {
+  const fields = calls[index]!.split('\t')
+  return ['end-v1', time, Buffer.byteLength(calls.slice(0, index + 1).join('\n') + '\n'),
+    fields[2], fields[3], fields[1]].join('\t') + '\n'
+}
+const relabelCall = (pid: number, parent: number, verb: string, time = '1795629214.296983') =>
+  `call\t${time}\t${pid}\t${parent}\tparent\t${verb}`
+
+function expectRelabelDiagnostic(stdout: string, mark: number, bound: number, firstPid?: number) {
+  const prefix = "test-23: part 2: the relabelled legs' events: relabel probe: "
+  const first = firstPid === undefined ? '' : ` first_retained_line=${bound + 1} first_retained_pid=${firstPid}`
+  expect(stdout.split('\n').filter(line => line.startsWith(prefix))).toEqual([
+    `${prefix}RELABEL_EVENTS_MARK=${mark} RELABEL_CALLERS_MARK=${bound} widened_by=${mark - bound} RELABEL_EVENTS_MS=1795629214320${first}`,
+  ])
+}
+
+test.each([false, true])('relabel regression: recorded pre-mark list 758 still in flight (late end=%p)', late => {
+  const result = relabelProbe(relabelCalls(), 758, { 216914: 'alive' }, {
+    ...(late ? { ends: (calls: string[]) => relabelEnd(calls, 757, '1795629214.360000') } : {}),
+  })
+  expect(result.status, result.stderr).toBe(0)
+  expect(result.stdout).toContain('relabel bound=757')
+  expectRelabelDiagnostic(result.stdout, 758, 757, 216914)
+  expect(result.stdout).toContain("marked by cscb's list (parent 199810, shim line 758, 1795629214.296983)")
+})
+
+test('relabel control: paired early end excludes the same pre-mark list despite a reused PID', () => {
+  const result = relabelProbe(relabelCalls(), 758, { 216914: 'reused' },
+    { ends: calls => relabelEnd(calls, 757, '1795629214.349999') })
+  expect(result.status).toBe(1)
+  expect(result.stderr).toContain('no unambiguous eligible caller made the mark')
+})
+
+test.each(['alive', 'zombie', 'reused', 'unknown'])('relabel probe retains a pre-mark %s PID', state => {
+  const result = relabelProbe([relabelCall(100, 42, 'list')], 1, { 100: state })
+  expect(result.status, result.stderr).toBe(0)
+  expect(result.stdout).toContain('relabel bound=0')
+  expectRelabelDiagnostic(result.stdout, 1, 0, 100)
+  expect(result.stdout).toContain("marked by cscb's list")
+})
+
+test('relabel probe excludes an absent PID without requiring observer evidence', () => {
+  const result = relabelProbe([relabelCall(100, 42, 'list')], 1, {})
+  expect(result.status).toBe(1)
+  expect(result.stdout).toContain('relabel bound=1')
+  expectRelabelDiagnostic(result.stdout, 1, 1)
+})
+
+test('relabel probe is bounded by the event mark and finishes before either worker ends', () => {
+  const body = pnDeclaration('p2_relabel_events')
+  const mark = body.indexOf('RELABEL_EVENTS_MARK="$(ad_shim_mark)"')
+  const stamp = body.indexOf('RELABEL_EVENTS_MS="$(date +%s%3N)"')
+  const probe = body.indexOf('out="$(python3')
+  expect(mark).toBeGreaterThan(0)
+  expect(stamp).toBeGreaterThan(mark)
+  expect(probe).toBeGreaterThan(stamp)
+  expect(probe).toBeLessThan(body.indexOf('out="$(respawn_worker_pane'))
+  expect(probe).toBeLessThan(body.indexOf('end_session "${SEED_SID[${R2_KEY}]}"'))
+})
+
+test('relabel refuses an invalid PID rather than probing a process group or running the events', () => {
+  const result = relabelProbe([relabelCall(0, 42, 'list')], 1, {})
+  expect(result.status).toBe(1)
+  expect(result.stderr).toContain('cannot bound the calls in flight')
+  expect(result.stdout).not.toContain('the harness respawned')
+})
+
+test('relabel retains the owner rule for a sole foreign call after the bound', () => {
+  const result = relabelProbe([relabelCall(100, 98, 'list')], 0, {})
+  expect(result.status).toBe(1)
+  expect(result.stderr).toContain('belongs to neither CSCB nor the harness loop')
+})
+
+test('relabel retains same-source ambiguity across the event mark', () => {
+  const result = relabelProbe([relabelCall(100, 98, 'get --instance-id cscb_relabelone'), relabelCall(101, 42, 'list')], 1, { 100: 'alive' })
+  expect(result.status).toBe(1)
+  expect(result.stderr).toContain('ambiguous mark')
+})
+
+test.each(['ad_find_missing', 'ad_recovery'])('relabel preserves the post-mark %s pass beside an early-ended same-source call', tickSource => {
+  const verb = tickSource === 'ad_find_missing' ? 'find-missing' : 'list'
+  const result = relabelProbe([relabelCall(100, 42, verb), relabelCall(101, tickSource === 'ad_find_missing' ? 216977 : 42, verb)],
+    1, { 100: 'alive' }, { source: tickSource, ends: calls => relabelEnd(calls, 0, '1795629214.349999') })
+  expect(result.status, result.stderr).toBe(0)
+  expect(result.stdout).toContain(`shim line 2,`)
+  expect(result.stdout).not.toContain('shim line 1,')
+})
+
+test.each([false, true])('relabel excludes dead Part 1 find-missing before the bound (late end=%p)', late => {
+  const calls = [relabelCall(100, 98, 'find-missing'), relabelCall(101, 42, 'list'), relabelCall(102, 216977, 'find-missing')]
+  const result = relabelProbe(calls, 2, { 101: 'alive' }, { source: 'ad_find_missing',
+    ...(late ? { ends: (lines: string[]) => relabelEnd(lines, 0, '1795629214.360000') } : {}) })
+  expect(result.status, result.stderr).toBe(0)
+  expect(result.stdout).toContain('relabel bound=1')
+  expect(result.stdout).toContain("marked by other's find-missing (parent 216977, shim line 3,")
+})
+
+test('relabel still rejects a dead harness call inside the widened bound without end proof', () => {
+  const calls = [relabelCall(100, 42, 'sweep'), relabelCall(101, 98, 'find-missing'), relabelCall(102, 216977, 'find-missing')]
+  const result = relabelProbe(calls, 2, { 100: 'alive' }, { source: 'ad_find_missing',
+    ends: lines => relabelEnd(lines, 0, '1795629214.349999') })
+  expect(result.status).toBe(1)
+  expect(result.stderr).toContain('ambiguous mark')
+})
+
+test('relabel ignores ticks before the unchanged event timestamp', () => {
+  const calls = [relabelCall(100, 42, 'list')]
+  const result = relabelProbe(calls, 0, {}, { ticks: [1795629214319, 1795629214350] })
+  expect(result.status, result.stderr).toBe(0)
+  expectRelabelDiagnostic(result.stdout, 0, 0)
+  const onlyOld = relabelProbe(calls, 0, {}, { ticks: [1795629214319] })
+  expect(onlyOld.status).toBe(1)
+  expect(onlyOld.stderr).toContain('no missing tick after the relabel events')
+})
+
+test('relabel legacy branch keeps the original event-mark window and no native probe', () => {
+  const result = relabelProbe(relabelCalls(), 758, {}, { legacy: true })
+  expect(result.status, result.stderr).toBe(0)
+  expect(result.stdout).toContain('relabel bound=unset')
+  expect(result.stdout).not.toContain('relabel probe:')
+  expect(result.stdout).toContain('marked missing by the harness\'s loop')
+})
+
 const pnEndCalls = (parent = 42) => [call(1000, 42, 'status --instance-id row'),
   call(2000, 42, 'read-pane --instance-id row --n-lines 1'), call(6000, parent, 'list --state waiting'),
   call(20200, 42, 'status --instance-id row')]
@@ -360,7 +541,7 @@ function consumerCheck(name: string) {
     return [...setup, 'ID_B=row EDIT_MS_P=1700000000000 MARK_P=0 STEP=fixture',
       script.slice(start, script.indexOf('\n    sleep "${SETTLE_S}"', start)), 'fi'].join('\n')
   }
-  return [...setup, 'RELABEL_EVENTS_MS=1700000000000 RELABEL_EVENTS_MARK=0 FIND_MISSING_LOOP_PID=99',
+  return [...setup, 'RELABEL_EVENTS_MS=1700000000000 RELABEL_EVENTS_MARK=0 RELABEL_CALLERS_MARK=0 FIND_MISSING_LOOP_PID=99',
     'declare -A PERSONA_ID=([fixture]=row)', fn('check_relabel_marked'), 'check_relabel_marked fixture'].join('\n')
 }
 

@@ -409,7 +409,7 @@ function run(root: string, body: string[]) {
     ...body,
   ].join('\n')], {
     env: hostSafeChildEnv(root, { tools: ['bash', 'awk', 'date', 'tail', 'cut', 'wc', 'tr', 'grep', 'sed', 'head', 'bun', 'rm'], extras: {
-      SCENARIO_ROOT: join(root, 'scenario'), SCENARIO_AD_SHIM_LOG: join(root, 'scenario', 'shim'),
+      SCENARIO_ROOT: join(root, 'scenario'), SCENARIO_AD_ROOT: join(root, 'scenario'), SCENARIO_AD_SHIM_LOG: join(root, 'scenario', 'shim'),
       SCENARIO_CSCB_RECORD: join(root, 'scenario', 'roles'), SCENARIO_FMK: '0',
       SCENARIO_FIXTURES: join(integration, 'fixtures'), CSCB_PKG_DIR: join(import.meta.dir, '..'),
       LATCH_EVIDENCE_DIR: join(root, 'results'),
@@ -520,17 +520,27 @@ test.each(['failure', 'pass', 'missing-shim'] as const)('test 23 Part 2 %s keeps
   const results = join(root, 'results')
   const secret = fakeToken(BOT_TOKEN_PREFIX, 'latch-evidence')
   try {
-    writeFileSync(join(root, 'scenario', 'shim'), [shim('99.990000', 'resume'), shim('100.016000', 'get'), secret,
+    const first = shim('99.990000', 'resume') + ' --label note=🙂'
+    const byteEnd = String(Buffer.byteLength(first + '\n' + shim('100.016000', 'get') + '\n'))
+    writeFileSync(join(root, 'scenario', 'shim'), [first, shim('100.016000', 'get'), secret,
       `call\t100.020000\t100\t42\tparent\tget --instance-id ${secret}`].join('\n') + '\n')
+    writeFileSync(join(root, 'scenario', 'shim.ends'), `end-v1\t100.019999\t${byteEnd}\t100\t42\t100.016000\n${secret}\nend-v1\tpartial`)
+    const trail = { event: 'ad.find_missing.tick', instance_id: 'cscb_otherstore', source: 'ad_recovery',
+      prior_state: 'waiting', new_state: 'missing', ts: '1970-01-01T00:01:40.020Z', extra: secret }
+    writeFileSync(join(root, 'scenario', 'ad-trail.jsonl'), [JSON.stringify(trail), secret,
+      JSON.stringify({ ...trail, source: secret, prior_state: sentinelInMessage('latch-trail') })].join('\n') + '\n')
     writeFileSync(join(root, 'scenario', 'server.log'), `first ${sentinelInMessage('latch-evidence')}\n`)
     writeFileSync(join(root, 'scenario', 'server.log.1'), 'rotated latch line\n')
     mkdirSync(join(root, 'scenario', 'second'))
     writeFileSync(join(root, 'scenario', 'second', 'server.log'), 'second latch line\n')
-    if (mode === 'missing-shim') rmSync(join(root, 'scenario', 'shim'))
+    if (mode === 'missing-shim') {
+      for (const name of ['shim', 'shim.ends', 'ad-trail.jsonl']) rmSync(join(root, 'scenario', name))
+    }
     const result = run(root, [
       ...['_scenario_cleanup', 'on_failure'].map(name => declaration(scenario, name)),
       ...['pn_evidence_rows', 'latch_failure_evidence', 'pn_failure_evidence'].map(name => declaration(script, name)),
       'TEST_NAME=fixture SCENARIO_LOG_TAIL_LINES=0 LATCH_LIFE_MARK=0 LATCH_PID=42 INTERVAL_US=45000000',
+      'RELABEL_EVENTS_MARK=3 RELABEL_EVENTS_MS=100010 RELABEL_CALLERS_MARK=1',
       'SLACK_STATE_DIR="$SCENARIO_ROOT"; _scenario_stop_dir() { :; }',
       '_SCENARIO_BEFORE_CLEANUP_HOOKS=(); _SCENARIO_SERVER_PIDS=(); _SCENARIO_TRACKED_PIDS=(); _SCENARIO_EXIT_HOOKS=(); _SCENARIO_FAILURE_HOOKS=()',
       '_SCENARIO_STATE_DIRS=("$SCENARIO_ROOT" "$SCENARIO_ROOT/second")',
@@ -548,6 +558,7 @@ test.each(['failure', 'pass', 'missing-shim'] as const)('test 23 Part 2 %s keeps
       expect(existsSync(join(results, 'latch-records.json'))).toBe(true)
       const records = JSON.parse(readFileSync(join(results, 'latch-records.json'), 'utf8'))
       expect(records).toMatchObject({ LATCH_MARK: { otherstore: '2' }, LATCH_US: { otherstore: '99990000' }, LATCH_SET_US: { otherstore: '100000000' } })
+      expect(records).toMatchObject({ RELABEL_EVENTS_MARK: '3', RELABEL_EVENTS_MS: '100010', RELABEL_CALLERS_MARK: '1' })
       expect(records.LATCH_US.unsafe).toMatch(/^invalid:sha256:[a-f0-9]{64}:bytes:[0-9]+$/)
       expect(records.PERSONA_ID.unsafe).toMatch(/^invalid:sha256:[a-f0-9]{64}:bytes:[0-9]+$/)
       expect(readFileSync(join(results, 'server-1.log'), 'utf8')).toContain('<redacted-token> <redacted-url>')
@@ -556,9 +567,26 @@ test.each(['failure', 'pass', 'missing-shim'] as const)('test 23 Part 2 %s keeps
       const rows = readFileSync(join(results, 'agent-director-shim.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
       if (mode === 'failure') {
         expect(rows[1]).toMatchObject({ line: '2', time: '100.016000', verb: 'get', id: 'cscb_otherstore', ppid: '42', role: 'cscb' })
+        expect(rows[1].byte_end).toBe(byteEnd)
         expect(rows[2].invalid).toMatch(/^invalid:sha256:[a-f0-9]{64}:bytes:[0-9]+$/)
         expect(rows[3].id).toMatch(/^invalid:sha256:[a-f0-9]{64}:bytes:[0-9]+$/)
       } else expect(rows).toEqual([])
+      const readRows = (name: string) => readFileSync(join(results, name), 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+      const ends = readRows('agent-director-shim.ends.jsonl'), ticks = readRows('ad-trail.jsonl')
+      if (mode === 'failure') {
+        expect(ends[0]).toEqual({ line: '1', kind: 'end-v1', end_upper: '100.019999', byte_end: byteEnd,
+          pid: '100', ppid: '42', start: '100.016000', complete: true })
+        expect(ends[1]).toMatchObject({ line: '2', invalid: expect.stringMatching(/^invalid:sha256:/), complete: true })
+        expect(ends[2]).toMatchObject({ line: '3', invalid: expect.stringMatching(/^invalid:sha256:/), complete: false })
+        expect(ticks[0]).toEqual({ line: '1', event: trail.event, instance_id: trail.instance_id, source: trail.source,
+          prior_state: trail.prior_state, new_state: trail.new_state, ts: trail.ts })
+        expect(ticks[1]).toMatchObject({ line: '2', invalid: expect.stringMatching(/^invalid:sha256:/) })
+        expect(ticks[2].source).toMatch(/^invalid:sha256:/)
+        expect(ticks[2].prior_state).toMatch(/^invalid:sha256:/)
+      } else {
+        expect(ends).toEqual([{ unavailable: true }])
+        expect(ticks).toEqual([{ unavailable: true }])
+      }
       assertNoLeak(writtenFile(results))
     }
     expect(result.stderr).not.toContain('panegone-evidence:')
